@@ -1,0 +1,97 @@
+name: Ημερήσια Αναφορά (Daily Report)
+
+# Runs once daily. Only workflow that writes to main branch.
+# Pulls ping/terminus data committed to ping-artifacts branch by local_poller.py,
+# merges into DB, reconstructs trips, computes rotation slots, commits once.
+
+on:
+  schedule:
+    - cron: "20 0 * * *"    # 00:20 UTC = ~03:20 Athens time (EEST)
+  workflow_dispatch:
+    inputs:
+      service_date:
+        description: "Ημερομηνία (YYYY-MM-DD). Κενό = χθες UTC."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  compute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Checkout ping-artifacts branch into /tmp/artifacts
+        run: |
+          git fetch origin ping-artifacts:ping-artifacts 2>/dev/null || echo "ping-artifacts branch not yet created"
+          if git show-ref --quiet refs/heads/ping-artifacts; then
+            git worktree add /tmp/artifacts ping-artifacts
+            echo "Artifacts branch checked out"
+            find /tmp/artifacts/artifacts -name "*.jsonl" 2>/dev/null | wc -l || echo "0 jsonl files found"
+          else
+            mkdir -p /tmp/artifacts
+            echo "No ping-artifacts branch yet — first run?"
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Merge artifacts into DB
+        run: python scripts/merge_ping_artifacts.py /tmp/artifacts/artifacts || true
+
+      - name: Sync schedules
+        run: python scripts/sync_schedules.py
+        continue-on-error: true
+
+      - name: Compute daily report
+        run: |
+          DATE="${{ inputs.service_date }}"
+          if [ -n "$DATE" ]; then
+            python scripts/compute_daily_report.py "$DATE"
+          else
+            python scripts/compute_daily_report.py
+          fi
+
+      - name: Generate site data
+        run: python scripts/generate_site_data.py
+
+      - name: Commit and push to main
+        run: |
+          git config user.name  "athensbus-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add db/athensbus.db docs/data/
+          if git diff --cached --quiet; then
+            echo "Δεν υπάρχουν αλλαγές."
+          else
+            git commit -m "ημερήσια αναφορά: $(date -u +'%Y-%m-%d')"
+            git push origin main
+          fi
+
+      - name: Clean up processed artifacts from ping-artifacts branch
+        run: |
+          if git show-ref --quiet refs/heads/ping-artifacts; then
+            cd /tmp/artifacts
+            git config user.name  "athensbus-bot"
+            git config user.email "actions@users.noreply.github.com"
+            # Remove artifacts older than 2 days
+            find artifacts/ -name "*.jsonl" -mtime +2 -delete 2>/dev/null || true
+            git add -A
+            if git diff --cached --quiet; then
+              echo "Τίποτα να καθαριστεί."
+            else
+              git commit -m "cleanup: παλιά αρχεία ping"
+              git push origin ping-artifacts
+            fi
+          fi

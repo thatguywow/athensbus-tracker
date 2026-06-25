@@ -1,0 +1,15 @@
+name: Τοπική Δημοσκόπηση (Info Only)
+
+# polling is handled by local_poller.py running on your machine.
+# This workflow is kept for documentation only and does nothing active.
+# See README for setup instructions.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  info:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "Η δημοσκόπηση γίνεται τοπικά μέσω του local_poller.py"
+          echo "Δείτε README.md για οδηγίες εγκατάστασης."

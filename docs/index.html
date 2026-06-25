@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="el">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Παρακολούθηση Λεωφορείων Αθήνας</title>
+<meta name="description" content="Ημερήσια στατιστικά δρομολογίων λεωφορείων ΟΑΣΑ — πραγματικά έναντι προγραμματισμένων.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo+Expanded:wght@600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --navy:#0E1B2C; --navy2:#16273D; --paper:#F5F3EE; --paper-dim:#C9C5BA;
+    --blue:#2B6CB0; --blue-bright:#5B9FE3; --amber:#E08E45;
+    --teal:#3FA796; --slate:#7A8699; --red:#D9685E;
+    --line:rgba(245,243,238,0.14); --line-s:rgba(245,243,238,0.28);
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{background:var(--navy);color:var(--paper);font-family:'Inter',system-ui,sans-serif;line-height:1.5;}
+  .mono{font-family:'IBM Plex Mono',monospace;}
+
+  /* ── board ── */
+  .board{background:var(--navy2);border-bottom:1px solid var(--line-s);padding:1.5rem 1.5rem 1.25rem;}
+  .board-inner{max-width:1280px;margin:0 auto;}
+  .board-top{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:.5rem 1.5rem;margin-bottom:1.25rem;}
+  .brand-mark{font-family:'Archivo Expanded',sans-serif;font-weight:700;font-size:1.4rem;letter-spacing:.01em;}
+  .brand-mark span{color:var(--amber);}
+  .brand-sub{color:var(--slate);font-size:.82rem;}
+  .updated{font-size:.78rem;color:var(--slate);text-align:right;}
+  .updated .mono{color:var(--paper-dim);}
+  .stat-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:1px;background:var(--line);}
+  .stat{background:var(--navy2);padding:.9rem 1.1rem;}
+  .stat-label{font-size:.68rem;text-transform:uppercase;letter-spacing:.07em;color:var(--slate);margin-bottom:.3rem;}
+  .stat-value{font-family:'IBM Plex Mono',monospace;font-size:1.65rem;font-weight:600;line-height:1;}
+  .stat-value.good{color:var(--teal);} .stat-value.warn{color:var(--amber);} .stat-value.bad{color:var(--red);}
+
+  /* ── nav tabs ── */
+  main{max-width:1280px;margin:0 auto;padding:1.5rem 1.5rem 4rem;}
+  .tabs{display:flex;gap:0;border-bottom:1px solid var(--line-s);margin-bottom:1.5rem;flex-wrap:wrap;}
+  .tab{padding:.55rem 1.1rem;font-size:.85rem;cursor:pointer;border-bottom:2px solid transparent;
+       color:var(--slate);transition:color .12s,border-color .12s;}
+  .tab:hover{color:var(--paper);}
+  .tab.active{color:var(--blue-bright);border-bottom-color:var(--blue-bright);}
+  .tab-panel{display:none;} .tab-panel.active{display:block;}
+
+  /* ── controls ── */
+  .panel-head{display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;margin-bottom:.9rem;}
+  .panel-title{font-family:'Archivo Expanded',sans-serif;font-weight:600;font-size:1rem;}
+  .controls{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;}
+  input[type="search"],select{background:var(--navy2);border:1px solid var(--line-s);color:var(--paper);
+    padding:.45rem .7rem;border-radius:4px;font-family:'Inter',sans-serif;font-size:.85rem;}
+  input[type="search"]::placeholder{color:var(--slate);}
+  input[type="search"]{min-width:200px;}
+
+  /* ── route grid ── */
+  .route-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:.7rem;margin-bottom:2rem;}
+  .route-card{background:var(--navy2);border:1px solid var(--line);border-radius:6px;
+    padding:.9rem 1rem 1rem;cursor:pointer;transition:border-color .12s;}
+  .route-card:hover{border-color:var(--line-s);}
+  .route-card.expanded{border-color:var(--blue-bright);}
+  .route-top{display:flex;justify-content:space-between;align-items:flex-start;gap:.5rem;margin-bottom:.5rem;}
+  .route-line-code{font-family:'Archivo Expanded',sans-serif;font-weight:700;font-size:1rem;
+    background:var(--blue);color:#fff;padding:.06rem .4rem;border-radius:3px;}
+  .route-dir{font-size:.7rem;color:var(--slate);text-transform:uppercase;letter-spacing:.05em;}
+  .route-name{font-size:.83rem;color:var(--paper-dim);margin-bottom:.65rem;min-height:2.2em;}
+  .route-pct{font-family:'IBM Plex Mono',monospace;font-size:1.55rem;font-weight:600;line-height:1;}
+  .route-meta{font-size:.73rem;color:var(--slate);margin-top:.18rem;}
+  .bar-track{height:5px;background:rgba(245,243,238,0.1);border-radius:3px;overflow:hidden;margin-top:.6rem;}
+  .bar-fill{height:100%;border-radius:3px;}
+  .route-detail{margin-top:.8rem;padding-top:.7rem;border-top:1px solid var(--line);display:none;}
+  .route-card.expanded .route-detail{display:block;}
+  .route-detail canvas{width:100%!important;}
+  .detail-meta{font-size:.75rem;color:var(--slate);margin-top:.5rem;display:grid;grid-template-columns:1fr 1fr;gap:.25rem;}
+  .detail-meta span{color:var(--paper-dim);}
+
+  /* ── vehicle table ── */
+  .vehicle-table{width:100%;border-collapse:collapse;font-size:.83rem;}
+  .vehicle-table th{background:var(--navy2);color:var(--slate);padding:.5rem .75rem;
+    text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;
+    border-bottom:1px solid var(--line-s);}
+  .vehicle-table td{padding:.45rem .75rem;border-bottom:1px solid var(--line);}
+  .vehicle-table tr:hover td{background:rgba(91,159,227,.05);}
+  .veh-no{font-family:'IBM Plex Mono',monospace;font-weight:600;color:var(--blue-bright);}
+  .slot-pill{display:inline-block;background:rgba(63,167,150,.18);color:var(--teal);
+    font-size:.68rem;padding:.1rem .4rem;border-radius:3px;font-family:'IBM Plex Mono',monospace;}
+  .late{color:var(--amber);} .early{color:var(--teal);}
+
+  /* ── handoffs ── */
+  .handoff-list{display:flex;flex-direction:column;gap:.4rem;}
+  .handoff-row{display:grid;grid-template-columns:5rem 1fr 2.5rem 1fr 6rem 5rem;
+    gap:.6rem;align-items:center;padding:.4rem .7rem;background:var(--navy2);
+    border:1px solid var(--line);border-radius:4px;font-size:.8rem;}
+  .handoff-arrow{color:var(--amber);text-align:center;font-size:1rem;}
+
+  /* ── health ── */
+  .health-list{display:flex;flex-direction:column;gap:.35rem;}
+  .health-row{display:grid;grid-template-columns:9rem 6rem 1fr 5rem;gap:.7rem;
+    align-items:center;padding:.4rem .7rem;background:var(--navy2);
+    border:1px solid var(--line);border-radius:4px;font-family:'IBM Plex Mono',monospace;font-size:.76rem;}
+  .health-row .job{color:var(--paper);} .health-row .time{color:var(--slate);}
+  .health-row .detail{color:var(--paper-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .pill{font-family:'Inter',sans-serif;font-size:.68rem;font-weight:600;padding:.12rem .45rem;
+    border-radius:3px;text-align:center;text-transform:uppercase;letter-spacing:.03em;}
+  .pill.success{background:rgba(63,167,150,.18);color:var(--teal);}
+  .pill.partial{background:rgba(224,142,69,.18);color:var(--amber);}
+  .pill.error{background:rgba(217,104,94,.18);color:var(--red);}
+  .pill.running{background:rgba(91,159,227,.18);color:var(--blue-bright);}
+
+  .empty-state{color:var(--slate);font-size:.88rem;padding:2rem 1rem;text-align:center;
+    border:1px dashed var(--line-s);border-radius:6px;}
+
+  footer{max-width:1280px;margin:0 auto;padding:0 1.5rem 3rem;color:var(--slate);font-size:.76rem;}
+  footer a{color:var(--slate);}
+
+  @media(max-width:560px){
+    .board{padding:1rem;} main{padding:1.2rem 1rem 3rem;}
+    .stat-value{font-size:1.3rem;}
+    .health-row,.handoff-row{grid-template-columns:1fr;gap:.2rem;}
+  }
+</style>
+</head>
+<body>
+
+<div class="board">
+  <div class="board-inner">
+    <div class="board-top">
+      <div>
+        <div class="brand-mark">ΑΘΗΝΑ <span>ΛΕΩΦΟΡΕΙΑ</span></div>
+        <div class="brand-sub">ανεπίσημο · δεδομένα ΟΑΣΑ Telematics</div>
+      </div>
+      <div class="updated">
+        τελευταία ενημέρωση <span class="mono" id="last-updated">—</span>
+      </div>
+    </div>
+    <div class="stat-row">
+      <div class="stat"><div class="stat-label">Τελευταία Ημέρα</div><div class="stat-value mono" id="stat-date">—</div></div>
+      <div class="stat"><div class="stat-label">Εκτέλεση Συστήματος</div><div class="stat-value mono" id="stat-completion">—</div></div>
+      <div class="stat"><div class="stat-label">Πραγματικά Δρομολόγια</div><div class="stat-value mono" id="stat-actual">—</div></div>
+      <div class="stat"><div class="stat-label">Προγραμματισμένα</div><div class="stat-value mono" id="stat-scheduled">—</div></div>
+      <div class="stat"><div class="stat-label">Ενεργές Διαδρομές</div><div class="stat-value mono" id="stat-routes">—</div></div>
+      <div class="stat"><div class="stat-label">Αλλαγές Βάρδιας</div><div class="stat-value mono" id="stat-handoffs">—</div></div>
+    </div>
+  </div>
+</div>
+
+<main>
+  <div class="tabs">
+    <div class="tab active" data-tab="routes">Διαδρομές</div>
+    <div class="tab" data-tab="vehicles">Οχήματα</div>
+    <div class="tab" data-tab="handoffs">Αλλαγές Βάρδιας</div>
+    <div class="tab" data-tab="health">Κατάσταση Pipeline</div>
+  </div>
+
+  <!-- Routes tab -->
+  <div class="tab-panel active" id="tab-routes">
+    <div class="panel-head">
+      <div class="panel-title">Διαδρομές <span id="route-count-label" style="color:var(--slate);font-weight:400;font-size:.85rem;font-family:'Inter',sans-serif;"></span></div>
+      <div class="controls">
+        <input type="search" id="search" placeholder="Αναζήτηση γραμμής ή διαδρομής…">
+        <select id="sort">
+          <option value="completion_asc">Χαμηλότερη εκτέλεση πρώτα</option>
+          <option value="completion_desc">Υψηλότερη εκτέλεση πρώτα</option>
+          <option value="line">Αριθμός γραμμής</option>
+        </select>
+      </div>
+    </div>
+    <div class="route-grid" id="route-grid"><div class="empty-state">Φόρτωση…</div></div>
+  </div>
+
+  <!-- Vehicles tab -->
+  <div class="tab-panel" id="tab-vehicles">
+    <div class="panel-head">
+      <div class="panel-title">Οχήματα Ημέρας</div>
+      <div class="controls">
+        <input type="search" id="veh-search" placeholder="Αναζήτηση αριθμού οχήματος…">
+      </div>
+    </div>
+    <div id="vehicle-table-wrap"><div class="empty-state">Φόρτωση…</div></div>
+  </div>
+
+  <!-- Handoffs tab -->
+  <div class="tab-panel" id="tab-handoffs">
+    <div class="panel-head">
+      <div class="panel-title">Αλλαγές Βάρδιας</div>
+    </div>
+    <div class="handoff-list" id="handoff-list"><div class="empty-state">Φόρτωση…</div></div>
+  </div>
+
+  <!-- Health tab -->
+  <div class="tab-panel" id="tab-health">
+    <div class="panel-head">
+      <div class="panel-title">Κατάσταση Pipeline <span style="color:var(--slate);font-weight:400;font-size:.82rem;font-family:'Inter',sans-serif;">τελευταίες 12 εκτελέσεις</span></div>
+    </div>
+    <div class="health-list" id="health-list"><div class="empty-state">Φόρτωση…</div></div>
+  </div>
+</main>
+
+<footer>
+  Δεδομένα από το δημόσιο API ΟΑΣΑ Telematics. Οι χρόνοι διέλευσης στάσεων είναι εκτιμήσεις
+  (γραμμική παρεμβολή μεταξύ GPS pings ανά 5 λεπτά) εκτός από τους τερματικούς σταθμούς όπου
+  χρησιμοποιούνται οι προβλέψεις του ίδιου του ΟΑΣΑ. Τα ακατέργαστα δεδομένα θέσης διατηρούνται
+  30 ημέρες· τα ημερήσια στατιστικά διατηρούνται επ' αόριστον.
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="assets/dashboard.js"></script>
+</body>
+</html>

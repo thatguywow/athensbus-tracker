@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.db-wal
+*.db-shm
+*.xlsx
+*.csv
+.DS_Store
+.vscode/
+local_poller.log
+run_poller.bat
+secrets.bat
+*.txt
+GitHub Personal Access Token*
