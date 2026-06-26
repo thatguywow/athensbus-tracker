@@ -176,6 +176,7 @@ def generate_for_date(conn, service_date: str):
         ) actual ON actual.route_code=st.route_code
                 AND actual.scheduled_departure=st.departure_time
         WHERE st.schedule_date=? AND actual.scheduled_departure IS NULL
+        GROUP BY st.route_code, st.departure_time
         ORDER BY r.line_code, st.route_code, st.departure_time
     """, (service_date, service_date)).fetchall():
         dist_rows.append({
@@ -214,6 +215,7 @@ def generate_for_date(conn, service_date: str):
         LEFT JOIN routes r ON r.route_code=st.route_code
         LEFT JOIN lines l ON l.line_code=r.line_code
         WHERE st.schedule_date=?
+        GROUP BY st.route_code, st.departure_time
         ORDER BY r.line_code, st.route_code, st.departure_time
     """, (service_date,)).fetchall():
         slot_rows.append({

@@ -96,7 +96,21 @@ def main():
                         continue
                     entries = sched.get(direction_key) or []
                     times = extract_departure_times(entries)
+
+                    # Clear today's existing rows for this route so a re-sync
+                    # produces a clean schedule (no stale duplicates).
+                    conn.execute(
+                        "DELETE FROM scheduled_trips WHERE route_code=? AND schedule_date=?",
+                        (route["route_code"], today)
+                    )
+
+                    # Deduplicate by departure_time — OASA sometimes returns the
+                    # same departure twice with different sdd_codes (08:25, 08:25).
+                    seen_times = set()
                     for sdd_code, dep_time in times:
+                        if dep_time in seen_times:
+                            continue
+                        seen_times.add(dep_time)
                         conn.execute(
                             """
                             INSERT INTO scheduled_trips

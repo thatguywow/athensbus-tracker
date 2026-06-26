@@ -40,9 +40,11 @@ log = logging.getLogger("trip_reconstruction")
 TRIP_GAP_MINUTES        = 25
 MAX_MATCH_DISTANCE_M    = 400
 MAX_LATERAL_DISTANCE_M  = 250
-MIN_TRIP_DURATION_MINS  = 8     # minimum realistic trip length
-MIN_ROUTE_COVERAGE_PCT  = 0.25  # must cover at least 25% of route stops
-MIN_MOVEMENT_M          = 200   # must move at least 200m from origin to count as departed
+MIN_TRIP_DURATION_MINS  = 10    # absolute minimum realistic trip length
+MIN_PROGRESS_SPAN       = 0.50  # must traverse at least 50% of the route start→end
+MIN_MOVEMENT_M          = 200   # must move at least 200m to count as departed
+PROGRESS_RESET_PEAK     = 0.60  # progress must reach this before a reset counts
+PROGRESS_RESET_LOW      = 0.30  # ...then drop below this = new trip starting
 
 
 def haversine_m(lat1, lng1, lat2, lng2) -> float:
@@ -59,6 +61,7 @@ def parse_iso(ts: str) -> datetime:
 
 
 def split_into_trips(pings: list[dict]) -> list[list[dict]]:
+    """Split a vehicle's pings into segments on large time gaps only."""
     if not pings:
         return []
     trips = [[pings[0]]]
@@ -69,6 +72,122 @@ def split_into_trips(pings: list[dict]) -> list[list[dict]]:
         else:
             trips[-1].append(cur)
     return trips
+
+
+def compute_progress(ping: dict, stops: list[dict]) -> tuple[float | None, float | None]:
+    """
+    Returns (progress_fraction, distance_to_nearest_stop_m).
+    progress_fraction: 0.0 at origin, 1.0 at terminus, based on which stop
+    (in route order) the ping is physically nearest to.
+    """
+    best_order = best_dist = None
+    for s in stops:
+        if s["lat"] is None or s["lng"] is None:
+            continue
+        d = haversine_m(ping["lat"], ping["lng"], s["lat"], s["lng"])
+        if best_dist is None or d < best_dist:
+            best_dist = d
+            best_order = s["stop_order"]
+    if best_order is None:
+        return None, None
+    orders = [s["stop_order"] for s in stops]
+    lo, hi = min(orders), max(orders)
+    span = hi - lo
+    progress = (best_order - lo) / span if span > 0 else 0.0
+    return progress, best_dist
+
+
+def segment_into_trips(pings: list[dict], stops: list[dict]) -> list[list[dict]]:
+    """
+    Split a vehicle's pings into individual trips using BOTH:
+      1. Large time gaps (>TRIP_GAP_MINUTES)
+      2. Route-progress resets (bus reaches near-terminus then jumps back to
+         near-origin = it started a new trip)
+
+    This correctly separates back-to-back trips (origin→terminus→origin→terminus)
+    that have no time gap between them, which simple time-gap splitting misses.
+    """
+    time_segments = split_into_trips(pings)
+
+    if not stops or len(stops) < 4:
+        return time_segments
+
+    result = []
+    for seg in time_segments:
+        current = []
+        peak_progress = 0.0
+        for p in seg:
+            prog, _ = compute_progress(p, stops)
+            if prog is None:
+                current.append(p)
+                continue
+            # Detect a reset: we climbed near the terminus, now back near origin
+            if peak_progress >= PROGRESS_RESET_PEAK and prog <= PROGRESS_RESET_LOW:
+                if current:
+                    result.append(current)
+                current = [p]
+                peak_progress = prog
+            else:
+                current.append(p)
+                peak_progress = max(peak_progress, prog)
+        if current:
+            result.append(current)
+    return result
+
+
+def estimate_endpoints_by_progress(trip_pings: list[dict],
+                                   stops: list[dict]) -> tuple[str | None, str | None]:
+    """
+    Estimate origin-departure and terminus-arrival times by extrapolating
+    the bus's OWN observed speed (route-progress per minute) to the endpoints.
+
+    This is the key fix for sparse data: if a bus was only caught mid-route
+    (e.g. we first saw it at 50% progress at 20:45), the actual origin
+    departure was earlier. Using the rate of progress between pings, we
+    extrapolate backward to progress=0 (departure) and forward to
+    progress=1 (arrival).
+
+    Assumes roughly constant speed — good enough for ±1-3 min on urban routes,
+    far better than using the first/last ping time when endpoints weren't seen.
+
+    Returns (departure_iso, arrival_iso) or (None, None) if it can't compute.
+    """
+    if not stops or len(stops) < 4 or len(trip_pings) < 2:
+        return None, None
+
+    pts = []  # (minutes_since_first_ping, progress)
+    t0 = parse_iso(trip_pings[0]["ts_utc"])
+    for p in trip_pings:
+        prog, dist = compute_progress(p, stops)
+        if prog is not None and dist is not None and dist <= MAX_MATCH_DISTANCE_M * 2:
+            mins = (parse_iso(p["ts_utc"]) - t0).total_seconds() / 60
+            pts.append((mins, prog))
+
+    if len(pts) < 2:
+        return None, None
+
+    # Linear least-squares fit: progress = a + b * minutes
+    n = len(pts)
+    sum_x = sum(x for x, _ in pts)
+    sum_y = sum(y for _, y in pts)
+    sum_xy = sum(x*y for x, y in pts)
+    sum_xx = sum(x*x for x, _ in pts)
+    denom = n * sum_xx - sum_x * sum_x
+    if abs(denom) < 1e-9:
+        return None, None
+    b = (n * sum_xy - sum_x * sum_y) / denom   # progress per minute
+    a = (sum_y - b * sum_x) / n                 # progress at first ping
+
+    if b <= 1e-6:
+        return None, None  # not moving forward — can't extrapolate
+
+    # Solve for minutes where progress = 0 (departure) and progress = 1 (arrival)
+    mins_at_origin   = (0.0 - a) / b
+    mins_at_terminus = (1.0 - a) / b
+
+    departure = (t0 + timedelta(minutes=mins_at_origin)).isoformat()
+    arrival   = (t0 + timedelta(minutes=mins_at_terminus)).isoformat()
+    return departure, arrival
 
 
 def estimate_departure_time(trip_pings: list[dict],
@@ -156,34 +275,44 @@ def estimate_arrival_time(trip_pings: list[dict],
 def is_valid_trip(trip_pings: list[dict], stops: list[dict],
                   started_at: str, ended_at: str) -> bool:
     """
-    Returns True if this ping sequence represents a real completed trip.
-    Filters out GPS fragments, stationary buses, and sparse-poll artifacts.
+    Returns True only if this ping sequence represents a real completed trip.
+
+    The key check is ROUTE-PROGRESS SPAN: the bus must have physically
+    traversed at least MIN_PROGRESS_SPAN (50%) of the route from its lowest
+    to highest progress point. This kills fragments like a bus caught only
+    at the tail end of a route (high stop-coverage but tiny span) and the
+    sparse-polling "9-minute trip" artifact, while still accepting real trips
+    even if we missed the exact endpoints.
     """
-    # Duration check
+    # Absolute duration floor
     try:
-        duration_mins = (
-            parse_iso(ended_at) - parse_iso(started_at)
-        ).total_seconds() / 60
+        duration_mins = (parse_iso(ended_at) - parse_iso(started_at)).total_seconds()/60
         if duration_mins < MIN_TRIP_DURATION_MINS:
             return False
     except Exception:
         return False
 
-    # Movement check — did the bus actually move significantly?
+    # Movement floor
     if len(trip_pings) >= 2:
         max_dist = 0.0
         first = trip_pings[0]
         for p in trip_pings[1:]:
-            d = haversine_m(first["lat"], first["lng"], p["lat"], p["lng"])
-            max_dist = max(max_dist, d)
+            max_dist = max(max_dist, haversine_m(
+                first["lat"], first["lng"], p["lat"], p["lng"]))
         if max_dist < MIN_MOVEMENT_M:
             return False
 
-    # Route coverage check — did it cover enough of the route?
+    # Route-progress span — the decisive check
     if stops and len(stops) >= 4:
-        matched = match_stops_to_trip(trip_pings, stops)
-        coverage = len(matched) / len(stops)
-        if coverage < MIN_ROUTE_COVERAGE_PCT:
+        progresses = []
+        for p in trip_pings:
+            prog, dist = compute_progress(p, stops)
+            if prog is not None and dist is not None and dist <= MAX_MATCH_DISTANCE_M * 2:
+                progresses.append(prog)
+        if not progresses:
+            return False
+        span = max(progresses) - min(progresses)
+        if span < MIN_PROGRESS_SPAN:
             return False
 
     return True
@@ -388,7 +517,7 @@ def reconstruct_route_day(conn, route_code: str, service_date: str,
 
     for vehicle_no, pings in by_vehicle.items():
         distinct_vehicles.add(vehicle_no)
-        for trip_pings in split_into_trips(pings):
+        for trip_pings in segment_into_trips(pings, stops):
             if len(trip_pings) < 2:
                 continue
 
@@ -411,9 +540,42 @@ def reconstruct_route_day(conn, route_code: str, service_date: str,
                 trip_pings, term_lat, term_lng
             )
 
-            # Priority: observed (OASA API) > GPS interpolated > raw ping
-            started_at       = obs_origin   or gps_departure
-            terminus_arrived = obs_terminus or gps_arrival
+            # Progress-rate extrapolation: estimates endpoints from the bus's
+            # own observed speed. Critical for sparse data where the bus was
+            # only caught mid-route and never seen at the origin/terminus.
+            extrap_departure, extrap_arrival = estimate_endpoints_by_progress(
+                trip_pings, stops
+            )
+
+            # Was the bus actually seen near the origin / terminus?
+            first_prog, _ = compute_progress(trip_pings[0], stops) if stops else (None, None)
+            last_prog, _  = compute_progress(trip_pings[-1], stops) if stops else (None, None)
+            seen_near_origin   = first_prog is not None and first_prog <= 0.15
+            seen_near_terminus = last_prog  is not None and last_prog  >= 0.85
+
+            # Priority for DEPARTURE:
+            #   1. getStopArrivals observation (most accurate)
+            #   2. GPS interpolation IF bus was seen near origin
+            #   3. progress extrapolation (bus caught mid-route)
+            #   4. raw first ping
+            if obs_origin:
+                started_at = obs_origin
+            elif seen_near_origin:
+                started_at = gps_departure
+            elif extrap_departure:
+                started_at = extrap_departure
+            else:
+                started_at = gps_departure
+
+            # Priority for ARRIVAL (same logic, mirrored)
+            if obs_terminus:
+                terminus_arrived = obs_terminus
+            elif seen_near_terminus:
+                terminus_arrived = gps_arrival
+            elif extrap_arrival:
+                terminus_arrived = extrap_arrival
+            else:
+                terminus_arrived = gps_arrival
 
             # Validate this is a real trip
             if not is_valid_trip(trip_pings, stops, started_at, terminus_arrived):
