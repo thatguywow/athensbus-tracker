@@ -132,25 +132,33 @@ function renderVehicles(data, filter){
     (v.vehicle_no||"").toLowerCase().includes(filter.toLowerCase())||
     (v.line_id||v.line_code||"").toLowerCase().includes(filter.toLowerCase())
   );
-  // Deduplicate: one row per (vehicle_no, line_id, route_name)
-  const seen = new Set();
-  const deduped = rows.filter(v=>{
-    const k = v.vehicle_no+"||"+(v.line_id||v.line_code||"")+"||"+(v.route_name||"");
-    if(seen.has(k)) return false;
-    seen.add(k); return true;
+
+  // Deduplicate: one row per (vehicle_no, line_id)
+  // Prefer outbound (Εξερχόμενη) route name, fall back to whatever is available
+  const byKey = {};
+  rows.forEach(v=>{
+    const k = v.vehicle_no+"||"+(v.line_id||v.line_code||"");
+    if(!byKey[k]){
+      byKey[k] = v;
+    } else if(v.direction==="Εξερχόμενη"){
+      // Prefer outbound entry for the route name
+      byKey[k] = v;
+    }
   });
+  const deduped = Object.values(byKey)
+    .sort((a,b)=>parseInt(a.vehicle_no||0)-parseInt(b.vehicle_no||0));
+
   if(!deduped.length){
     wrap.innerHTML='<div class="empty-state">Δεν βρέθηκαν οχήματα.</div>'; return;
   }
   let html='<table class="data-table"><thead><tr>'+
-    '<th>Αριθμός Οχήματος</th><th>Γραμμή</th><th>Διαδρομή</th><th>Κατεύθυνση</th>'+
+    '<th>Αριθμός Οχήματος</th><th>Γραμμή</th><th>Διαδρομή</th>'+
     '</tr></thead><tbody>';
   deduped.forEach(v=>{
     html+='<tr>'+
       '<td><span class="veh-no">'+v.vehicle_no+'</span></td>'+
       '<td class="mono">'+(v.line_id||v.line_code||"—")+'</td>'+
       '<td>'+(v.route_name||"")+'</td>'+
-      '<td>'+(v.direction||"")+'</td>'+
       '</tr>';
   });
   wrap.innerHTML=html+'</tbody></table>';
