@@ -23,18 +23,40 @@ GitHub (αποθήκευση + hosting):
 
 ---
 
-## Εγκατάσταση (μία φορά)
+## Εγκατάσταση (μία φορά ανά υπολογιστή)
 
 ### 1. Python
 Κατέβασε από python.org/downloads (3.12+). Κατά την εγκατάσταση: ✓ "Add Python to PATH"
 
-### 2. Δημιούργησε δημόσιο GitHub repository
+### 2. Δημιούργησε ή κάνε clone το repository
+
+**Πρώτη φορά (νέο repo):**
 ```
 git init
-git remote add origin https://github.com/yourusername/athensbus-tracker.git
+git remote add origin https://github.com/thatguywow/athensbus-tracker.git
 ```
 
-### 3. GitHub Settings
+**Σε νέο υπολογιστή (repo ήδη υπάρχει):**
+```
+git clone https://github.com/thatguywow/athensbus-tracker.git
+cd athensbus-tracker
+pip install -r requirements.txt
+```
+
+### 2β. Ρύθμιση GitHub token για push
+Απαραίτητο ανά υπολογιστή ώστε το `run_hourly.bat` να μπορεί να κάνει push αυτόματα:
+```
+git remote set-url origin https://thatguywow:ghp_yourtoken@github.com/thatguywow/athensbus-tracker.git
+git config --global credential.helper store
+```
+Αντικατέστησε το `ghp_yourtoken` με το Personal Access Token σου:
+GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic) → Generate new token
+- Expiration: No expiration
+- Scope: ✓ repo
+
+Χρειάζεται μόνο **μία φορά ανά υπολογιστή**. Μετά κάθε push γίνεται αυτόματα.
+
+### 3. GitHub Settings (μία φορά μόνο)
 - **Settings → Actions → General → Workflow permissions → Read and write** ✓
 - **Settings → Pages → Source → GitHub Actions** ✓
 
@@ -50,9 +72,8 @@ git push -u origin main
 ```
 
 ### 5. Εκκίνηση
-Άνοιξε **δύο** terminal παράθυρα:
-- Παράθυρο 1: `run_poller.bat` (τρέχει πάντα)
-- Παράθυρο 2: task scheduler ή manual `run_hourly.bat` κάθε ώρα
+- `run_poller.bat` — άνοιξέ το και άσε το ανοιχτό
+- `run_hourly.bat` — βάλε το στο Task Scheduler (δες παρακάτω)
 
 ---
 
@@ -64,10 +85,29 @@ git push -u origin main
 
 ### run_hourly.bat (κάθε ώρα)
 1. Win+S → "Task Scheduler" → Create Basic Task
-2. Name: "Athens Bus Hourly"
-3. Trigger: Daily → Repeat every 1 hour
+2. Name: `Athens Bus Hourly`
+3. Trigger: Daily → Repeat every **1 hour** → for duration: **Indefinitely**
 4. Action: Start a program → `D:\athensbus-tracker\run_hourly.bat`
-5. Finish
+5. Start in: `D:\athensbus-tracker`
+6. Finish
+
+---
+
+## Μεταφορά σε νέο υπολογιστή
+
+Αν αλλάξεις υπολογιστή ή θες να τρέχει σε server:
+
+```
+git clone https://github.com/thatguywow/athensbus-tracker.git
+cd athensbus-tracker
+pip install -r requirements.txt
+git remote set-url origin https://thatguywow:ghp_yourtoken@github.com/thatguywow/athensbus-tracker.git
+git config --global credential.helper store
+```
+
+Μετά στημένο Task Scheduler (ίδια βήματα παραπάνω) και τελείωσες.
+
+> ⚠️ Μην τρέχεις `run_poller.bat` και `run_hourly.bat` σε **δύο υπολογιστές ταυτόχρονα** — θα προκύψουν git conflicts. Σταμάτα τα bat στον παλιό υπολογιστή πριν ξεκινήσεις στον νέο.
 
 ---
 
