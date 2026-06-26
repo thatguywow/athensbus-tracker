@@ -80,7 +80,7 @@ def git_commit_and_push() -> bool:
             return True
 
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        run(["git", "commit", "-m", f"ωριαία ενημέρωση: {stamp}"])
+        run(["git", "commit", "-m", f"hourly update: {stamp}"])
         success = run(["git", "push", "origin", "main"])
         if success:
             log.info("Pushed to GitHub successfully.")
