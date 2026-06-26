@@ -1,8 +1,9 @@
 @echo off
+chcp 65001 >nul
 cd /d D:\athensbus-tracker
 echo ============================================
-echo  ΑΘΗΝΑ ΛΕΩΦΟΡΕΙΑ - Live Poller
-echo  Τρεχει συνεχως. Κλεισε το παραθυρο για να σταματησει.
+echo  ATHENS BUS - Live Poller
+echo  Running continuously. Close window to stop.
 echo ============================================
 echo.
 
