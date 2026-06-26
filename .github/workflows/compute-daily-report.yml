@@ -1,0 +1,20 @@
+name: Ημερήσια Αναφορά (τοπικά)
+
+# THIS WORKFLOW IS DISABLED — compute runs locally via run_hourly.bat
+# Kept for documentation purposes only.
+# All data collection and processing happens on the local machine.
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: "This workflow is informational only. Run run_hourly.bat locally instead."
+        required: false
+
+jobs:
+  info:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "All processing runs locally via run_hourly.bat"
+          echo "See README.md for setup instructions."

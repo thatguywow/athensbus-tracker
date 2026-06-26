@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="el">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Παρακολούθηση Λεωφορείων Αθήνας</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo+Expanded:wght@600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --navy:#0E1B2C; --navy2:#16273D; --paper:#F5F3EE; --paper-dim:#C9C5BA;
+    --blue:#2B6CB0; --blue-bright:#5B9FE3; --amber:#E08E45;
+    --teal:#3FA796; --slate:#7A8699; --red:#D9685E;
+    --line:rgba(245,243,238,0.14); --line-s:rgba(245,243,238,0.28);
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{background:var(--navy);color:var(--paper);font-family:'Inter',system-ui,sans-serif;line-height:1.5;}
+
+  /* ── board ── */
+  .board{background:var(--navy2);border-bottom:1px solid var(--line-s);padding:1.5rem 1.5rem 1.25rem;}
+  .board-inner{max-width:1280px;margin:0 auto;}
+  .board-top{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem 1.5rem;margin-bottom:1.25rem;}
+  .brand-mark{font-family:'Archivo Expanded',sans-serif;font-weight:700;font-size:1.4rem;}
+  .brand-mark span{color:var(--amber);}
+  .brand-sub{color:var(--slate);font-size:.82rem;}
+  .board-right{display:flex;align-items:center;gap:1rem;flex-wrap:wrap;}
+  .updated{font-size:.78rem;color:var(--slate);}
+  .updated .mono{color:var(--paper-dim);font-family:'IBM Plex Mono',monospace;}
+
+  /* Date picker */
+  .date-picker{display:flex;align-items:center;gap:.5rem;}
+  .date-picker label{font-size:.78rem;color:var(--slate);}
+  .date-picker select{
+    background:var(--navy);border:1px solid var(--line-s);color:var(--paper);
+    padding:.35rem .6rem;border-radius:4px;font-family:'Inter',sans-serif;font-size:.82rem;
+  }
+
+  .stat-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:1px;background:var(--line);}
+  .stat{background:var(--navy2);padding:.9rem 1.1rem;}
+  .stat-label{font-size:.68rem;text-transform:uppercase;letter-spacing:.07em;color:var(--slate);margin-bottom:.3rem;}
+  .stat-value{font-family:'IBM Plex Mono',monospace;font-size:1.55rem;font-weight:600;line-height:1;}
+  .stat-value.good{color:var(--teal);} .stat-value.warn{color:var(--amber);} .stat-value.bad{color:var(--red);}
+
+  /* ── main ── */
+  main{max-width:1280px;margin:0 auto;padding:1.5rem 1.5rem 4rem;}
+  .tabs{display:flex;gap:0;border-bottom:1px solid var(--line-s);margin-bottom:1.5rem;}
+  .tab{padding:.55rem 1.2rem;font-size:.88rem;cursor:pointer;border-bottom:2px solid transparent;color:var(--slate);}
+  .tab:hover{color:var(--paper);}
+  .tab.active{color:var(--blue-bright);border-bottom-color:var(--blue-bright);}
+  .tab-panel{display:none;} .tab-panel.active{display:block;}
+
+  .panel-head{display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;margin-bottom:.9rem;}
+  .panel-title{font-family:'Archivo Expanded',sans-serif;font-weight:600;font-size:1rem;}
+  .controls{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;}
+  input[type="search"],select.ctrl{
+    background:var(--navy2);border:1px solid var(--line-s);color:var(--paper);
+    padding:.45rem .7rem;border-radius:4px;font-family:'Inter',sans-serif;font-size:.85rem;
+  }
+  input[type="search"]::placeholder{color:var(--slate);}
+  input[type="search"]{min-width:180px;}
+
+  /* ── tables ── */
+  .data-table{width:100%;border-collapse:collapse;font-size:.83rem;}
+  .data-table th{background:var(--navy2);color:var(--slate);padding:.5rem .75rem;
+    text-align:left;font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;
+    border-bottom:1px solid var(--line-s);position:sticky;top:0;z-index:1;}
+  .data-table td{padding:.45rem .75rem;border-bottom:1px solid var(--line);}
+  .data-table tr:hover td{background:rgba(91,159,227,.04);}
+  .data-table tr.missed-row td{opacity:.5;}
+
+  .veh-no{font-family:'IBM Plex Mono',monospace;font-weight:600;color:var(--blue-bright);}
+  .mono{font-family:'IBM Plex Mono',monospace;}
+  .slot-pill{display:inline-block;background:rgba(63,167,150,.18);color:var(--teal);
+    font-size:.68rem;padding:.1rem .4rem;border-radius:3px;font-family:'IBM Plex Mono',monospace;}
+  .slot-unknown{background:rgba(122,134,153,.15);color:var(--slate);}
+  .late{color:var(--amber);} .early{color:var(--teal);} .missed{color:var(--red);}
+
+  /* ── health ── */
+  .health-list{display:flex;flex-direction:column;gap:.35rem;}
+  .health-row{display:grid;grid-template-columns:9rem 6rem 1fr 5rem;gap:.7rem;
+    align-items:center;padding:.4rem .7rem;background:var(--navy2);
+    border:1px solid var(--line);border-radius:4px;
+    font-family:'IBM Plex Mono',monospace;font-size:.76rem;}
+  .health-row .job{color:var(--paper);} .health-row .htime{color:var(--slate);}
+  .health-row .detail{color:var(--paper-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .pill{font-family:'Inter',sans-serif;font-size:.68rem;font-weight:600;
+    padding:.12rem .45rem;border-radius:3px;text-align:center;text-transform:uppercase;}
+  .pill.success{background:rgba(63,167,150,.18);color:var(--teal);}
+  .pill.partial{background:rgba(224,142,69,.18);color:var(--amber);}
+  .pill.error{background:rgba(217,104,94,.18);color:var(--red);}
+  .pill.running{background:rgba(91,159,227,.18);color:var(--blue-bright);}
+
+  .empty-state{color:var(--slate);font-size:.88rem;padding:2rem 1rem;text-align:center;
+    border:1px dashed var(--line-s);border-radius:6px;}
+  .summary-bar{font-size:.83rem;color:var(--slate);margin-bottom:.75rem;}
+  .summary-bar span{color:var(--paper);}
+
+  footer{max-width:1280px;margin:0 auto;padding:0 1.5rem 3rem;color:var(--slate);font-size:.76rem;}
+
+  @media(max-width:600px){
+    .board{padding:1rem;} main{padding:1.2rem 1rem 3rem;}
+    .stat-value{font-size:1.25rem;}
+    .health-row{grid-template-columns:1fr;gap:.2rem;}
+  }
+</style>
+</head>
+<body>
+
+<div class="board">
+  <div class="board-inner">
+    <div class="board-top">
+      <div>
+        <div class="brand-mark">ΑΘΗΝΑ <span>ΛΕΩΦΟΡΕΙΑ</span></div>
+        <div class="brand-sub">ανεπίσημο · δεδομένα ΟΑΣΑ Telematics</div>
+      </div>
+      <div class="board-right">
+        <div class="date-picker">
+          <label>Ημέρα:</label>
+          <select id="date-select"><option value="">Φόρτωση...</option></select>
+        </div>
+        <div class="updated">ενημέρωση <span class="mono" id="last-updated">—</span></div>
+      </div>
+    </div>
+    <div class="stat-row">
+      <div class="stat"><div class="stat-label">Ημερομηνία</div><div class="stat-value mono" id="stat-date">—</div></div>
+      <div class="stat"><div class="stat-label">Εκτέλεση</div><div class="stat-value mono" id="stat-completion">—</div></div>
+      <div class="stat"><div class="stat-label">Πραγματικά</div><div class="stat-value mono" id="stat-actual">—</div></div>
+      <div class="stat"><div class="stat-label">Προγρ/να</div><div class="stat-value mono" id="stat-scheduled">—</div></div>
+      <div class="stat"><div class="stat-label">Διαδρομές</div><div class="stat-value mono" id="stat-routes">—</div></div>
+    </div>
+  </div>
+</div>
+
+<main>
+  <div class="tabs">
+    <div class="tab active" data-tab="vehicles">Οχήματα</div>
+    <div class="tab" data-tab="schedule">Κατανομή Δρομολογίων</div>
+    <div class="tab" data-tab="kartelakia">Καρτελάκια</div>
+    <div class="tab" data-tab="health">Pipeline</div>
+  </div>
+
+  <!-- Οχήματα -->
+  <div class="tab-panel active" id="tab-vehicles">
+    <div class="panel-head">
+      <div class="panel-title">Οχήματα Ημέρας</div>
+      <div class="controls">
+        <input type="search" id="veh-search" placeholder="Αναζήτηση αριθμού ή γραμμής…">
+      </div>
+    </div>
+    <div id="vehicle-table-wrap"><div class="empty-state">Φόρτωση…</div></div>
+  </div>
+
+  <!-- Κατανομή Δρομολογίων -->
+  <div class="tab-panel" id="tab-schedule">
+    <div class="panel-head">
+      <div class="panel-title">Κατανομή Δρομολογίων</div>
+      <div class="controls">
+        <select class="ctrl" id="sched-line-select"><option value="">— Γραμμή —</option></select>
+        <select class="ctrl" id="sched-route-select" style="display:none"><option value="">— Διαδρομή —</option></select>
+      </div>
+    </div>
+    <div id="schedule-table-wrap"><div class="empty-state">Επιλέξτε γραμμή.</div></div>
+  </div>
+
+  <!-- Καρτελάκια -->
+  <div class="tab-panel" id="tab-kartelakia">
+    <div class="panel-head">
+      <div class="panel-title">Καρτελάκια</div>
+      <div class="controls">
+        <select class="ctrl" id="kart-line-select"><option value="">— Γραμμή —</option></select>
+        <select class="ctrl" id="kart-route-select" style="display:none"><option value="">— Διαδρομή —</option></select>
+      </div>
+    </div>
+    <div id="kartelakia-wrap"><div class="empty-state">Επιλέξτε γραμμή.</div></div>
+  </div>
+
+  <!-- Pipeline -->
+  <div class="tab-panel" id="tab-health">
+    <div class="panel-head"><div class="panel-title">Κατάσταση Pipeline</div></div>
+    <div class="health-list" id="health-list"><div class="empty-state">Φόρτωση…</div></div>
+  </div>
+</main>
+
+<footer>
+  Δεδομένα από το δημόσιο API ΟΑΣΑ Telematics. Χρόνοι στάσεων: γραμμική παρεμβολή μεταξύ GPS pings ανά 5 λεπτά.
+  Τερματικοί σταθμοί: προβλέψεις ΟΑΣΑ getStopArrivals. Ακατέργαστα δεδομένα: 30 ημέρες · Στατιστικά: επ' αόριστον.
+</footer>
+
+<script src="assets/dashboard.js"></script>
+</body>
+</html>

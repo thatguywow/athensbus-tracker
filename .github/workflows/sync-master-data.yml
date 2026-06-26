@@ -1,0 +1,14 @@
+name: Συγχρονισμός Βασικών Δεδομένων (πληροφοριακό)
+
+# THIS WORKFLOW IS DISABLED — master data sync runs locally via first_time_setup.bat
+# Kept for documentation purposes only.
+# OASA blocks GitHub Actions IPs so this must run locally anyway.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  info:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Master data sync runs locally via first_time_setup.bat — see README.md"

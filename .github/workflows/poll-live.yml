@@ -1,0 +1,13 @@
+name: Τοπική Δημοσκόπηση (πληροφοριακό)
+
+# THIS WORKFLOW IS DISABLED — polling runs locally via run_poller.bat
+# Kept for documentation purposes only.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  info:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Polling runs locally via run_poller.bat — see README.md"
