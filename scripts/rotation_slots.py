@@ -1,36 +1,45 @@
 """
-rotation_slots.py — infers bus rotation patterns and assigns trips to slots.
+rotation_slots.py — infers bus rotation patterns (καρτελάκια) and assigns
+trips to slots, with maximum accuracy.
 
-IMPROVED ALGORITHM:
+METHODOLOGY
+===========
 
-Phase 1 — Observe full cycles:
-  Track each vehicle's trips in order. A "cycle" is complete when a vehicle
-  returns to the origin after a trip. The time between a vehicle's consecutive
-  departures = its cycle time. Across all vehicles, headway = min gap between
-  any two different vehicles' departures. slot_count = cycle_time / headway.
+A "καρτελάκι" (slot) is a POSITION in the rotation sequence, independent of
+which physical vehicle fills it. For a line with N active vehicles there are
+N slots. The Nth scheduled departure of the day belongs to slot
+((N-1) mod slot_count) + 1. This pattern is STABLE day-to-day; only the
+vehicle number filling each slot changes.
 
-Phase 2 — Assign slot numbers:
-  Sort all observed departures by time. Departure[0] = slot 1,
-  departure[1] = slot 2, ..., departure[slot_count] = slot 1 again.
-  This naturally handles any number of vehicles/slots.
+1. SLOT COUNT (persistent, accumulated across days)
+   slot_count = round(cycle_time / headway)
+   - headway: median gap between consecutive scheduled departures
+   - cycle_time: median time for ONE vehicle to return for its next departure,
+     measured from same-vehicle consecutive departures, ACCUMULATED across days
+     in the route_rotation table. More days → more samples → higher accuracy.
+   - confidence_days tracks how many days confirmed the count; it locks in.
 
-Phase 3 — Build persistent slot definitions:
-  Store which scheduled times belong to which slot. This persists across days
-  and only needs updating when the schedule changes (summer/winter timetable).
+2. SLOT GRID (stable, ordinal — delay-immune)
+   Each scheduled departure (sorted by time) gets slot ((i) mod slot_count)+1.
+   Because this is based on the theoretical schedule POSITION, not actual
+   arrival times, it is immune to delays and missing vehicles. A missing bus
+   simply leaves its slot unfilled that day; the pattern is unchanged.
 
-DELAY HANDLING:
-  Matching window = ±(headway × 0.6). A bus running late still matches its
-  original slot rather than slipping to the next one.
+3. TRIP → SLOT ASSIGNMENT (order-preserving DP alignment)
+   Actual trips are matched to scheduled departures using a dynamic-programming
+   sequence alignment that PRESERVES ORDER and minimises total time deviation,
+   allowing scheduled slots to be skipped (missing bus). This correctly handles
+   the dangerous case of a uniformly-late set of buses without reordering them,
+   unlike independent nearest-time matching.
 
-HANDOFF DETECTION:
-  Only records handoffs when gap between outgoing vehicle's last trip and
-  incoming vehicle's first trip in the same slot > MIN_HANDOFF_GAP_MINS (10).
-  This filters out normal circular rotation where a different vehicle
-  naturally picks up the next scheduled departure.
+4. HANDOFFS
+   Recorded only when a slot's vehicle changes with a gap > MIN_HANDOFF_GAP_MINS,
+   filtering normal circular rotation from real shift changes.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import statistics
 from datetime import datetime, timedelta
@@ -40,6 +49,8 @@ import db
 log = logging.getLogger("rotation_slots")
 
 MIN_HANDOFF_GAP_MINS = 10
+MAX_CYCLE_SAMPLES    = 200   # rolling window of cycle observations
+DEVIATION_PENALTY    = 25    # minutes; cost ceiling for matching a trip to a slot
 
 
 def _time_to_mins(t: str) -> float:
@@ -56,79 +67,110 @@ def _iso_to_mins_since_midnight(iso: str) -> float:
     return dt.hour*60 + dt.minute + dt.second/60
 
 
-def infer_rotation(conn, route_code: str, service_date: str,
-                   computed_at: str) -> dict | None:
-    """
-    Infer rotation pattern from OBSERVED vehicle cycles, not just schedule stats.
-    Falls back to schedule-based headway if not enough observed data.
-    """
-    # Get all trips for this route today, ordered by departure
+# ── Phase 1: slot count (persistent, accumulated) ────────────────────────────
+
+def observe_cycle_times(conn, route_code: str, service_date: str) -> list[float]:
+    """Measure cycle time from same-vehicle consecutive departures today."""
     trip_rows = conn.execute("""
-        SELECT vehicle_no, started_at, ended_at FROM trips
+        SELECT vehicle_no, started_at FROM trips
         WHERE route_code=? AND service_date=?
-        ORDER BY started_at
+        ORDER BY vehicle_no, started_at
     """, (route_code, service_date)).fetchall()
 
-    if not trip_rows:
-        return None
-
-    # Build per-vehicle trip sequences
     by_vehicle: dict[str, list] = {}
     for r in trip_rows:
-        by_vehicle.setdefault(r["vehicle_no"], []).append(r)
+        by_vehicle.setdefault(r["vehicle_no"], []).append(r["started_at"])
 
-    # Estimate cycle time from vehicles that made multiple trips
-    cycle_times = []
-    for veh, trips in by_vehicle.items():
-        if len(trips) >= 2:
-            for i in range(len(trips)-1):
-                try:
-                    t1 = datetime.fromisoformat(trips[i]["started_at"])
-                    t2 = datetime.fromisoformat(trips[i+1]["started_at"])
-                    gap = (t2 - t1).total_seconds() / 60
-                    if 15 < gap < 240:  # sanity: 15min-4hr cycle
-                        cycle_times.append(gap)
-                except Exception:
-                    pass
+    cycles = []
+    for veh, deps in by_vehicle.items():
+        for i in range(len(deps)-1):
+            try:
+                gap = (datetime.fromisoformat(deps[i+1]) -
+                       datetime.fromisoformat(deps[i])).total_seconds()/60
+                if 15 < gap < 240:   # sane cycle bounds
+                    cycles.append(round(gap, 1))
+            except Exception:
+                pass
+    return cycles
 
-    # Estimate headway from schedule
+
+def measure_headway(conn, route_code: str, service_date: str) -> float | None:
     sched_rows = conn.execute("""
         SELECT departure_time FROM scheduled_trips
         WHERE route_code=? AND schedule_date=? AND departure_time IS NOT NULL
         ORDER BY departure_time
     """, (route_code, service_date)).fetchall()
-
     if len(sched_rows) < 2:
         return None
+    times = [_time_to_mins(r["departure_time"]) for r in sched_rows]
+    gaps = [times[i+1]-times[i] for i in range(len(times)-1)
+            if 0 < times[i+1]-times[i] < 60]
+    return statistics.median(gaps) if gaps else None
 
-    times_mins = [_time_to_mins(r["departure_time"]) for r in sched_rows]
-    gaps = [times_mins[i+1]-times_mins[i]
-            for i in range(len(times_mins)-1)
-            if times_mins[i+1] > times_mins[i] and times_mins[i+1]-times_mins[i] < 60]
 
-    if not gaps:
+def update_route_rotation(conn, route_code: str, service_date: str,
+                          computed_at: str) -> dict | None:
+    """
+    Update the persistent route_rotation record with today's observations,
+    returning the current best estimate of slot_count, headway, cycle.
+    """
+    headway = measure_headway(conn, route_code, service_date)
+    if headway is None or headway <= 0:
         return None
 
-    headway = statistics.median(gaps)
+    today_cycles = observe_cycle_times(conn, route_code, service_date)
 
-    # Use observed cycle time if available, else estimate from route data
-    if cycle_times:
-        cycle_mins = round(statistics.median(cycle_times), 1)
+    row = conn.execute(
+        "SELECT * FROM route_rotation WHERE route_code=?", (route_code,)
+    ).fetchone()
+
+    if row:
+        samples = json.loads(row["cycle_samples"] or "[]")
     else:
-        # Fallback: estimate from trip durations × 2 + 5min turnaround
-        durations = []
-        for r in trip_rows:
-            try:
-                d = (datetime.fromisoformat(r["ended_at"]) -
-                     datetime.fromisoformat(r["started_at"])).total_seconds()/60
-                if 5 < d < 180:
-                    durations.append(d)
-            except Exception:
-                pass
-        cycle_mins = round(statistics.median(durations)*2 + 5, 1) if durations else round(headway*3, 1)
+        samples = []
+
+    samples.extend(today_cycles)
+    samples = samples[-MAX_CYCLE_SAMPLES:]   # keep rolling window
+
+    # Cycle estimate: median of accumulated samples, or fallback from durations
+    if samples:
+        cycle_mins = round(statistics.median(samples), 1)
+    elif row and row["median_cycle_mins"]:
+        cycle_mins = row["median_cycle_mins"]
+    else:
+        # Fallback: median trip duration × 2 + 5min turnaround
+        durs = conn.execute("""
+            SELECT (strftime('%s',ended_at)-strftime('%s',started_at))/60.0 d
+            FROM trips WHERE route_code=? AND service_date=?
+              AND ended_at IS NOT NULL
+        """, (route_code, service_date)).fetchall()
+        dvals = [r["d"] for r in durs if r["d"] and 5 < r["d"] < 180]
+        cycle_mins = round(statistics.median(dvals)*2 + 5, 1) if dvals else headway*3
 
     slot_count = max(1, round(cycle_mins / headway))
 
+    # Confidence: increment if today's count agrees with stored count
+    if row and row["slot_count"] == slot_count:
+        confidence = (row["confidence_days"] or 1) + 1
+    else:
+        confidence = 1
+
+    conn.execute("""
+        INSERT INTO route_rotation
+            (route_code, slot_count, median_cycle_mins, median_headway_mins,
+             confidence_days, cycle_samples, last_updated)
+        VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(route_code) DO UPDATE SET
+            slot_count=excluded.slot_count,
+            median_cycle_mins=excluded.median_cycle_mins,
+            median_headway_mins=excluded.median_headway_mins,
+            confidence_days=excluded.confidence_days,
+            cycle_samples=excluded.cycle_samples,
+            last_updated=excluded.last_updated
+    """, (route_code, slot_count, cycle_mins, round(headway,2),
+          confidence, json.dumps(samples), computed_at))
+
+    # Also store per-day pattern for reference
     conn.execute("""
         INSERT INTO rotation_patterns
             (route_code, service_date, slot_count, headway_mins, cycle_mins, computed_at)
@@ -138,66 +180,138 @@ def infer_rotation(conn, route_code: str, service_date: str,
             cycle_mins=excluded.cycle_mins, computed_at=excluded.computed_at
     """, (route_code, service_date, slot_count, round(headway,2), cycle_mins, computed_at))
 
-    return {"route_code": route_code, "slot_count": slot_count,
-            "headway_mins": round(headway,2), "cycle_mins": cycle_mins}
+    return {"slot_count": slot_count, "headway_mins": round(headway,2),
+            "cycle_mins": cycle_mins, "confidence_days": confidence}
 
 
-def assign_slots(conn, route_code: str, service_date: str,
-                 computed_at: str) -> dict:
+# ── Phase 2: stable ordinal slot grid ────────────────────────────────────────
+
+def build_slot_grid(conn, route_code: str, service_date: str,
+                    slot_count: int) -> list[dict]:
     """
-    Assign each observed trip to a rotation slot.
-    Uses the natural ordering of observed departures within each headway cycle.
+    Assign each scheduled departure (sorted by time) to a slot, ordinally.
+    Returns [{departure_time, slot_number}, ...] — the stable καρτελάκι pattern.
     """
-    pattern = conn.execute("""
-        SELECT slot_count, headway_mins FROM rotation_patterns
-        WHERE route_code=? AND service_date=?
-    """, (route_code, service_date)).fetchone()
-
-    if not pattern:
-        return {"assigned": 0, "handoffs": 0}
-
-    slot_count  = pattern["slot_count"]
-    headway     = pattern["headway_mins"]
-    match_window = headway * 0.6
-
     sched_rows = conn.execute("""
-        SELECT id, departure_time FROM scheduled_trips
+        SELECT departure_time FROM scheduled_trips
         WHERE route_code=? AND schedule_date=? AND departure_time IS NOT NULL
+        GROUP BY departure_time
         ORDER BY departure_time
     """, (route_code, service_date)).fetchall()
 
-    if not sched_rows:
+    grid = []
+    for i, r in enumerate(sched_rows):
+        grid.append({
+            "departure_time": r["departure_time"],
+            "slot_number":    (i % slot_count) + 1,
+        })
+    return grid
+
+
+# ── Phase 3: order-preserving DP alignment ───────────────────────────────────
+
+def align_trips_to_slots(actual_deps: list[float],
+                         scheduled: list[float]) -> list[int | None]:
+    """
+    Order-preserving alignment of actual departures to scheduled departures.
+
+    actual_deps: minutes-since-midnight of each actual trip (sorted)
+    scheduled:   minutes-since-midnight of each scheduled departure (sorted)
+
+    Returns, for each actual departure, the INDEX into `scheduled` it was
+    assigned to (or None if it matched nothing within tolerance).
+
+    Uses DP minimising total |actual - scheduled| while preserving order and
+    allowing scheduled slots to be skipped (a missing bus). This is robust to
+    uniform lateness: a whole batch of late buses still maps to their own
+    slots rather than each slipping to the next.
+    """
+    n, m = len(actual_deps), len(scheduled)
+    if n == 0 or m == 0:
+        return [None]*n
+
+    INF = float("inf")
+    # dp[i][j] = min cost aligning first i actuals using first j scheduled
+    dp = [[INF]*(m+1) for _ in range(n+1)]
+    back = [[None]*(m+1) for _ in range(n+1)]
+    dp[0][0] = 0.0
+    for j in range(m+1):
+        dp[0][j] = 0.0   # leftover scheduled slots are free (unfilled)
+
+    for i in range(1, n+1):
+        for j in range(1, m+1):
+            # Option A: skip scheduled slot j-1 (no bus served it)
+            if dp[i][j-1] < dp[i][j]:
+                dp[i][j] = dp[i][j-1]
+                back[i][j] = ("skip_sched", i, j-1)
+            # Option B: match actual i-1 to scheduled j-1
+            cost = abs(actual_deps[i-1] - scheduled[j-1])
+            if cost <= DEVIATION_PENALTY:
+                c = dp[i-1][j-1] + cost
+                if c < dp[i][j]:
+                    dp[i][j] = c
+                    back[i][j] = ("match", i-1, j-1)
+            # Option C: actual i-1 matches nothing (penalty)
+            c = dp[i-1][j] + DEVIATION_PENALTY
+            if c < dp[i][j]:
+                dp[i][j] = c
+                back[i][j] = ("skip_actual", i-1, j)
+
+    # Backtrack
+    assign = [None]*n
+    i, j = n, m
+    # find best j at row n
+    best_j, best_val = m, dp[n][m]
+    for jj in range(m+1):
+        if dp[n][jj] < best_val:
+            best_val, best_j = dp[n][jj], jj
+    j = best_j
+    while i > 0 and j > 0:
+        step = back[i][j]
+        if step is None:
+            i -= 1
+            continue
+        kind = step[0]
+        if kind == "match":
+            assign[step[1]] = step[2]
+            i, j = step[1], step[2]
+        elif kind == "skip_sched":
+            j = step[2]
+        else:  # skip_actual
+            i = step[1]
+    return assign
+
+
+def assign_slots(conn, route_code: str, service_date: str,
+                 slot_count: int, computed_at: str) -> dict:
+    grid = build_slot_grid(conn, route_code, service_date, slot_count)
+    if not grid:
         return {"assigned": 0, "handoffs": 0}
 
-    # Assign slot numbers to scheduled departures
-    sched_slot = {row["id"]: (i % slot_count) + 1
-                  for i, row in enumerate(sched_rows)}
+    sched_mins = [_time_to_mins(g["departure_time"]) for g in grid]
 
     trip_rows = conn.execute("""
         SELECT id, vehicle_no, started_at, ended_at FROM trips
         WHERE route_code=? AND service_date=? ORDER BY started_at
     """, (route_code, service_date)).fetchall()
 
+    if not trip_rows:
+        return {"assigned": 0, "handoffs": 0}
+
+    actual_mins = [_iso_to_mins_since_midnight(t["started_at"]) for t in trip_rows]
+    assignment  = align_trips_to_slots(actual_mins, sched_mins)
+
     n_assigned = n_handoffs = 0
     last_vehicle_per_slot: dict[int, tuple[str, str]] = {}
 
-    for trip in trip_rows:
-        trip_mins = _iso_to_mins_since_midnight(trip["started_at"])
-
-        best_sched_id = best_diff = None
-        for sr in sched_rows:
-            sched_mins = _time_to_mins(sr["departure_time"])
-            diff = trip_mins - sched_mins
-            if -match_window <= diff <= headway*3:
-                if best_diff is None or abs(diff) < abs(best_diff):
-                    best_diff = diff
-                    best_sched_id = sr["id"]
-                    best_sched_time = sr["departure_time"]
-
-        if best_sched_id is None:
+    for trip, sched_idx, amins in zip(trip_rows, assignment, actual_mins):
+        if sched_idx is None:
             continue
+        g = grid[sched_idx]
+        slot_num   = g["slot_number"]
+        sched_time = g["departure_time"]
+        deviation  = round(amins - sched_mins[sched_idx], 1)
 
-        slot_num = sched_slot[best_sched_id]
         conn.execute("""
             INSERT INTO slot_assignments
                 (trip_id, route_code, service_date, slot_number,
@@ -209,13 +323,13 @@ def assign_slots(conn, route_code: str, service_date: str,
                 departure_deviation_mins=excluded.departure_deviation_mins,
                 computed_at=excluded.computed_at
         """, (trip["id"], route_code, service_date, slot_num,
-              best_sched_time, round(best_diff,1), computed_at))
+              sched_time, deviation, computed_at))
         n_assigned += 1
 
-        # Handoff detection with minimum gap threshold
+        # Handoff detection
         if slot_num in last_vehicle_per_slot:
             prev_veh, prev_ended = last_vehicle_per_slot[slot_num]
-            if prev_veh != trip["vehicle_no"]:
+            if prev_veh != trip["vehicle_no"] and prev_ended:
                 try:
                     gap = (datetime.fromisoformat(trip["started_at"]) -
                            datetime.fromisoformat(prev_ended)).total_seconds()/60
@@ -229,15 +343,17 @@ def assign_slots(conn, route_code: str, service_date: str,
                              handoff_time, gap_mins, computed_at)
                         VALUES (?,?,?,?,?,?,?,?)
                     """, (route_code, service_date, slot_num,
-                          prev_veh, trip["vehicle_no"],
-                          trip["started_at"],
+                          prev_veh, trip["vehicle_no"], trip["started_at"],
                           round(gap,1) if gap else None, computed_at))
                     n_handoffs += 1
 
-        last_vehicle_per_slot[slot_num] = (trip["vehicle_no"], trip["ended_at"])
+        last_vehicle_per_slot[slot_num] = (trip["vehicle_no"],
+                                           trip["ended_at"] or trip["started_at"])
 
     return {"assigned": n_assigned, "handoffs": n_handoffs}
 
+
+# ── vehicle activity ─────────────────────────────────────────────────────────
 
 def build_vehicle_activity(conn, service_date: str, computed_at: str):
     conn.execute("DELETE FROM vehicle_activity WHERE service_date=?", (service_date,))
@@ -245,9 +361,10 @@ def build_vehicle_activity(conn, service_date: str, computed_at: str):
         SELECT t.vehicle_no, t.route_code, sa.slot_number,
                COUNT(*) AS trip_count,
                MIN(t.started_at) AS first_dep, MAX(t.started_at) AS last_dep,
-               SUM((strftime('%s',t.ended_at)-strftime('%s',t.started_at))/60.0) AS total_mins
+               SUM((strftime('%s',COALESCE(t.ended_at,t.started_at))
+                    -strftime('%s',t.started_at))/60.0) AS total_mins
         FROM trips t
-        JOIN slot_assignments sa ON sa.trip_id=t.id
+        LEFT JOIN slot_assignments sa ON sa.trip_id=t.id
         WHERE t.service_date=?
         GROUP BY t.vehicle_no, t.route_code, sa.slot_number
         ORDER BY t.vehicle_no, t.route_code
@@ -270,42 +387,24 @@ def build_vehicle_activity(conn, service_date: str, computed_at: str):
               round(r["total_mins"] or 0, 1), computed_at))
 
 
+# ── persistent slot definitions (typical times per slot) ─────────────────────
+
 def update_slot_definitions(conn, route_code: str, service_date: str,
-                             computed_at: str):
-    """Update persistent slot definitions from today's observed data."""
-    pattern = conn.execute("""
-        SELECT slot_count FROM rotation_patterns
-        WHERE route_code=? AND service_date=?
-    """, (route_code, service_date)).fetchone()
+                            slot_count: int, computed_at: str):
+    grid = build_slot_grid(conn, route_code, service_date, slot_count)
+    by_slot: dict[int, list[str]] = {}
+    for g in grid:
+        by_slot.setdefault(g["slot_number"], []).append(g["departure_time"])
 
-    if not pattern:
-        return
-
-    for slot_num in range(1, pattern["slot_count"]+1):
-        deps = conn.execute("""
-            SELECT sa.scheduled_departure FROM slot_assignments sa
-            JOIN trips t ON t.id=sa.trip_id
-            WHERE t.route_code=? AND t.service_date=? AND sa.slot_number=?
-              AND sa.scheduled_departure IS NOT NULL
-            ORDER BY sa.scheduled_departure
-        """, (route_code, service_date, slot_num)).fetchall()
-
-        if not deps:
-            continue
-
-        first_dep = deps[0]["scheduled_departure"][:5]
+    for slot_num, times in by_slot.items():
+        times.sort()
+        first_dep = times[0][:5]
         intervals = []
-        for i in range(1, len(deps)):
-            try:
-                t1 = _time_to_mins(deps[i-1]["scheduled_departure"])
-                t2 = _time_to_mins(deps[i]["scheduled_departure"])
-                if t2 > t1:
-                    intervals.append(t2-t1)
-            except Exception:
-                pass
-
-        avg_interval = round(statistics.mean(intervals), 1) if intervals else None
-
+        for i in range(1, len(times)):
+            t1, t2 = _time_to_mins(times[i-1]), _time_to_mins(times[i])
+            if t2 > t1:
+                intervals.append(t2-t1)
+        avg_interval = round(statistics.mean(intervals),1) if intervals else None
         conn.execute("""
             INSERT INTO slot_definitions
                 (route_code, slot_number, typical_first_dep,
@@ -318,6 +417,8 @@ def update_slot_definitions(conn, route_code: str, service_date: str,
         """, (route_code, slot_num, first_dep, avg_interval, computed_at))
 
 
+# ── orchestration ────────────────────────────────────────────────────────────
+
 def compute_all_slots(conn, service_date: str, computed_at: str) -> dict:
     routes = conn.execute("SELECT route_code FROM routes").fetchall()
     n_patterns = n_assigned = n_handoffs = 0
@@ -325,16 +426,17 @@ def compute_all_slots(conn, service_date: str, computed_at: str) -> dict:
     for r in routes:
         rc = r["route_code"]
         try:
-            pat = infer_rotation(conn, rc, service_date, computed_at)
-            if pat:
-                n_patterns += 1
-            result = assign_slots(conn, rc, service_date, computed_at)
+            rot = update_route_rotation(conn, rc, service_date, computed_at)
+            if not rot:
+                continue
+            n_patterns += 1
+            slot_count = rot["slot_count"]
+            result = assign_slots(conn, rc, service_date, slot_count, computed_at)
             n_assigned += result["assigned"]
             n_handoffs += result["handoffs"]
-            update_slot_definitions(conn, rc, service_date, computed_at)
+            update_slot_definitions(conn, rc, service_date, slot_count, computed_at)
         except Exception as e:
             log.warning("Slot computation failed for route %s: %s", rc, e)
 
     build_vehicle_activity(conn, service_date, computed_at)
-
     return {"patterns": n_patterns, "assigned": n_assigned, "handoffs": n_handoffs}

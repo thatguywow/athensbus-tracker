@@ -90,9 +90,9 @@ CREATE TABLE IF NOT EXISTS trips (
     route_code      TEXT NOT NULL,
     vehicle_no      TEXT NOT NULL,
     service_date    TEXT NOT NULL,
-    started_at      TEXT NOT NULL,      -- ISO8601 UTC, first ping
-    ended_at        TEXT NOT NULL,      -- ISO8601 UTC, last ping
-    terminus_arrived_at TEXT,           -- from getStopArrivals if available, else interpolated
+    started_at      TEXT NOT NULL,      -- ISO8601 UTC, departure from origin
+    ended_at        TEXT NOT NULL,      -- ISO8601 UTC, last observed ping
+    terminus_arrived_at TEXT,           -- arrival at terminus; NULL if trip never completed
     stop_count      INTEGER NOT NULL,
     computed_at     TEXT NOT NULL
 );
@@ -224,4 +224,18 @@ CREATE TABLE IF NOT EXISTS slot_definitions (
     typical_interval_mins REAL, -- typical interval between this slot's departures
     last_updated    TEXT NOT NULL,
     PRIMARY KEY (route_code, slot_number)
+);
+
+-- ─────────────────── Persistent rotation per route+direction ─────────────────
+-- Accumulates the stable slot_count (number of καρτελάκια) across many days.
+-- The pattern locks once enough clean days confirm the same count.
+-- Only changes when the timetable changes (summer/winter).
+CREATE TABLE IF NOT EXISTS route_rotation (
+    route_code       TEXT PRIMARY KEY,
+    slot_count       INTEGER NOT NULL,
+    median_cycle_mins REAL,
+    median_headway_mins REAL,
+    confidence_days  INTEGER DEFAULT 1,   -- how many days confirmed this count
+    cycle_samples    TEXT,                -- JSON list of recent cycle observations
+    last_updated     TEXT NOT NULL
 );

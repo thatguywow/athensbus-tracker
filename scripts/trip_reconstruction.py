@@ -272,27 +272,33 @@ def estimate_arrival_time(trip_pings: list[dict],
     return trip_pings[-1]["ts_utc"]
 
 
-def is_valid_trip(trip_pings: list[dict], stops: list[dict],
-                  started_at: str, ended_at: str) -> bool:
+def classify_trip(trip_pings: list[dict], stops: list[dict],
+                  started_at: str, ended_at: str) -> str:
     """
-    Returns True only if this ping sequence represents a real completed trip.
+    Classify a ping sequence as one of:
+      "complete"   — a real trip that reached (near) the terminus
+      "incomplete" — a bus that departed normally from the origin but was
+                     never seen reaching the terminus (went out of service,
+                     lost signal, etc). Recorded with departure but no arrival.
+      "reject"     — a GPS fragment / stationary bus / sparse-poll artifact
 
-    The key check is ROUTE-PROGRESS SPAN: the bus must have physically
-    traversed at least MIN_PROGRESS_SPAN (50%) of the route from its lowest
-    to highest progress point. This kills fragments like a bus caught only
-    at the tail end of a route (high stop-coverage but tiny span) and the
-    sparse-polling "9-minute trip" artifact, while still accepting real trips
-    even if we missed the exact endpoints.
+    Logic:
+      started_near_origin  = first ping at progress <= 0.20
+      reached_terminus     = max progress >= 0.85
+      span                 = max - min progress
+
+      complete   : started_near_origin AND reached_terminus
+                   OR (caught mid-route but span >= MIN_PROGRESS_SPAN)
+      incomplete : started_near_origin AND NOT reached_terminus AND moved
+                   forward meaningfully (max progress >= 0.25)
+      reject     : everything else
     """
-    # Absolute duration floor
+    # Absolute duration & movement floors (apply to all)
     try:
         duration_mins = (parse_iso(ended_at) - parse_iso(started_at)).total_seconds()/60
-        if duration_mins < MIN_TRIP_DURATION_MINS:
-            return False
     except Exception:
-        return False
+        return "reject"
 
-    # Movement floor
     if len(trip_pings) >= 2:
         max_dist = 0.0
         first = trip_pings[0]
@@ -300,22 +306,42 @@ def is_valid_trip(trip_pings: list[dict], stops: list[dict],
             max_dist = max(max_dist, haversine_m(
                 first["lat"], first["lng"], p["lat"], p["lng"]))
         if max_dist < MIN_MOVEMENT_M:
-            return False
+            return "reject"
 
-    # Route-progress span — the decisive check
-    if stops and len(stops) >= 4:
-        progresses = []
-        for p in trip_pings:
-            prog, dist = compute_progress(p, stops)
-            if prog is not None and dist is not None and dist <= MAX_MATCH_DISTANCE_M * 2:
-                progresses.append(prog)
-        if not progresses:
-            return False
-        span = max(progresses) - min(progresses)
-        if span < MIN_PROGRESS_SPAN:
-            return False
+    # Without stop geometry we can only do a basic duration check
+    if not stops or len(stops) < 4:
+        return "complete" if duration_mins >= MIN_TRIP_DURATION_MINS else "reject"
 
-    return True
+    progresses = []
+    for p in trip_pings:
+        prog, dist = compute_progress(p, stops)
+        if prog is not None and dist is not None and dist <= MAX_MATCH_DISTANCE_M * 2:
+            progresses.append(prog)
+    if not progresses:
+        return "reject"
+
+    first_progress = progresses[0]
+    max_progress   = max(progresses)
+    span           = max_progress - min(progresses)
+
+    started_near_origin = first_progress <= 0.20
+    reached_terminus    = max_progress >= 0.85
+
+    # Complete: full trip OR caught mid-route covering enough of the route
+    if started_near_origin and reached_terminus:
+        if duration_mins >= MIN_TRIP_DURATION_MINS:
+            return "complete"
+        return "reject"
+    if not started_near_origin and span >= MIN_PROGRESS_SPAN:
+        if duration_mins >= MIN_TRIP_DURATION_MINS:
+            return "complete"
+        return "reject"
+
+    # Incomplete: departed origin normally but never reached terminus
+    if started_near_origin and not reached_terminus and max_progress >= 0.25:
+        return "incomplete"
+
+    return "reject"
 
 
 def _interpolate_pass_time(p_a, p_b, stop_lat, stop_lng):
@@ -577,13 +603,26 @@ def reconstruct_route_day(conn, route_code: str, service_date: str,
             else:
                 terminus_arrived = gps_arrival
 
-            # Validate this is a real trip
-            if not is_valid_trip(trip_pings, stops, started_at, terminus_arrived):
+            # Classify: complete / incomplete / reject
+            status = classify_trip(trip_pings, stops, started_at, terminus_arrived)
+            if status == "reject":
                 continue
 
+            # Incomplete trips: bus departed but never reached terminus.
+            # Record the departure, but arrival/duration are unknown (NULL).
+            if status == "incomplete":
+                terminus_arrived = None
+
             matches = match_stops_to_trip(
-                trip_pings, stops, started_at, terminus_arrived
+                trip_pings, stops,
+                started_at,
+                terminus_arrived if status == "complete" else None
             ) if stops else []
+
+            # ended_at always = last observed ping (satisfies NOT NULL).
+            # terminus_arrived_at = arrival for complete trips, NULL for incomplete.
+            ended_at_val   = raw_end
+            terminus_val   = terminus_arrived if status == "complete" else None
 
             cur = conn.execute("""
                 INSERT INTO trips
@@ -591,8 +630,8 @@ def reconstruct_route_day(conn, route_code: str, service_date: str,
                      terminus_arrived_at, stop_count, computed_at)
                 VALUES (?,?,?,?,?,?,?,?)
             """, (route_code, vehicle_no, service_date,
-                  started_at, terminus_arrived,
-                  terminus_arrived, len(matches), computed_at))
+                  started_at, ended_at_val, terminus_val,
+                  len(matches), computed_at))
             trip_id = cur.lastrowid
             n_trips += 1
 
@@ -604,15 +643,15 @@ def reconstruct_route_day(conn, route_code: str, service_date: str,
                 """, (trip_id, m["stop_code"], m["stop_order"],
                       m["passed_at"], m["distance_m"], m["method"]))
 
-            if matches and matches[0]["stop_order"] == 1:
-                conn.execute("""
-                    INSERT INTO vehicle_departures
-                        (vehicle_no, route_code, service_date,
-                         departed_at, trip_id, computed_at)
-                    VALUES (?,?,?,?,?,?)
-                """, (vehicle_no, route_code, service_date,
-                      started_at, trip_id, computed_at))
-                n_departures += 1
+            # Record the departure for slot assignment (both complete & incomplete)
+            conn.execute("""
+                INSERT INTO vehicle_departures
+                    (vehicle_no, route_code, service_date,
+                     departed_at, trip_id, computed_at)
+                VALUES (?,?,?,?,?,?)
+            """, (vehicle_no, route_code, service_date,
+                  started_at, trip_id, computed_at))
+            n_departures += 1
 
     return {
         "route_code":        route_code,

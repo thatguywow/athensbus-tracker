@@ -118,6 +118,7 @@ function renderSummary(d){
   document.getElementById("stat-actual").textContent     = fmtInt(d.system_actual_trips);
   document.getElementById("stat-scheduled").textContent  = fmtInt(d.system_scheduled_trips);
   document.getElementById("stat-routes").textContent     = fmtInt(d.route_count);
+  document.getElementById("stat-vehicles").textContent   = fmtInt(d.total_vehicles);
   document.getElementById("last-updated").textContent    = fmtRel(d.generated_at);
   const cel = document.getElementById("stat-completion");
   cel.textContent = fmtPct(d.system_completion_pct);
@@ -231,17 +232,21 @@ function renderScheduleTable(routeCode){
     '</tr></thead><tbody>';
 
   trips.forEach(t=>{
-    const missed=!t.vehicle_no;
+    const missed = !t.vehicle_no;           // no bus ran this scheduled slot
+    const incomplete = !missed && !t.ended_at;  // bus departed but never finished
     const dev=t.deviation;
     const devTip=dev==null?"":Math.abs(dev)<0.5?"στην ώρα":dev>0?"+"+dev.toFixed(1)+"λεπ":dev.toFixed(1)+"λεπ";
     const vehHtml=missed
       ? `<span class="slot-pill slot-unknown">${t.slot_label||"—"}</span>`
       : `<span class="veh-no" title="${devTip}">${t.vehicle_no}</span>`;
+    // Λήξη/Διάρκεια: dashes if missed OR incomplete (never reached terminus)
+    const endCell = (missed || incomplete) ? "—" : fmtTime(t.ended_at);
+    const durCell = (missed || incomplete) ? "—" : fmtDur(t.started_at, t.ended_at);
     html+=`<tr class="${missed?"missed-row":""}">
       <td class="mono">${(t.scheduled_dep||"—").substring(0,5)}</td>
       <td class="mono">${missed?"—":fmtTime(t.started_at)}</td>
-      <td class="mono">${missed?"—":fmtTime(t.ended_at)}</td>
-      <td class="mono">${missed?"—":fmtDur(t.started_at,t.ended_at)}</td>
+      <td class="mono">${endCell}</td>
+      <td class="mono">${durCell}</td>
       <td>${vehHtml}</td>
     </tr>`;
   });

@@ -78,6 +78,11 @@ def generate_for_date(conn, service_date: str):
         sys_actual += r["actual_trip_count"] or 0
         sys_sched  += r["scheduled_trip_count"] or 0
 
+    # Total DISTINCT vehicles across the whole system for the day
+    total_vehicles = conn.execute("""
+        SELECT COUNT(DISTINCT vehicle_no) c FROM trips WHERE service_date=?
+    """, (service_date,)).fetchone()["c"]
+
     write_json(os.path.join(ddir, "summary.json"), {
         "service_date":            service_date,
         "generated_at":            db.now_utc_iso(),
@@ -85,6 +90,7 @@ def generate_for_date(conn, service_date: str):
         "system_scheduled_trips":  sys_sched,
         "system_completion_pct":   round(sys_actual/sys_sched*100,1) if sys_sched else None,
         "route_count":             len(routes_latest),
+        "total_vehicles":          total_vehicles,
         "routes":                  routes_latest,
     })
 
@@ -134,7 +140,7 @@ def generate_for_date(conn, service_date: str):
         SELECT t.route_code, r.line_code, l.line_id, r.descr AS route_name,
                r.route_type, sa.scheduled_departure, sa.slot_number,
                sa.departure_deviation_mins, t.vehicle_no,
-               t.started_at, t.ended_at
+               t.started_at, t.terminus_arrived_at
         FROM trips t
         JOIN slot_assignments sa ON sa.trip_id=t.id
         LEFT JOIN routes r ON r.route_code=t.route_code
@@ -159,7 +165,7 @@ def generate_for_date(conn, service_date: str):
             "vehicle_no":    r["vehicle_no"],
             "deviation":     r["departure_deviation_mins"],
             "started_at":    r["started_at"],
-            "ended_at":      r["ended_at"],
+            "ended_at":      r["terminus_arrived_at"],  # NULL for incomplete trips
         })
 
     # Add missed scheduled trips
