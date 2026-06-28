@@ -50,7 +50,32 @@ log = logging.getLogger("rotation_slots")
 
 MIN_HANDOFF_GAP_MINS = 10
 MAX_CYCLE_SAMPLES    = 200   # rolling window of cycle observations
-DEVIATION_PENALTY    = 25    # minutes; cost ceiling for matching a trip to a slot
+
+# Asymmetric matching: buses rarely depart EARLY (≤ a few min) but often LATE.
+# So matching an observed departure to an earlier scheduled slot (= bus is late)
+# is far more plausible than to a later slot (= bus left early).
+EARLY_GRACE_MINS   = 5     # buses may leave up to ~5 min early without penalty
+MAX_EARLY_MINS     = 9     # beyond this early, almost never a real match
+MAX_LATE_MINS      = 40    # buses can run quite late
+EARLY_PENALTY      = 4.0   # cost multiplier for leaving early beyond grace
+
+
+def match_cost(actual_mins: float, scheduled_mins: float) -> float:
+    """
+    Asymmetric cost of matching an observed departure to a scheduled one.
+    deviation > 0 = bus left late (plausible, low cost)
+    deviation < 0 = bus left early (implausible beyond a few min, high cost)
+    Returns float('inf') if the match is outside acceptable bounds.
+    """
+    dev = actual_mins - scheduled_mins
+    if dev >= 0:                       # late
+        return float("inf") if dev > MAX_LATE_MINS else dev
+    early = -dev                        # how many minutes early
+    if early > MAX_EARLY_MINS:
+        return float("inf")
+    if early <= EARLY_GRACE_MINS:
+        return early                    # small grace, treated normally
+    return EARLY_GRACE_MINS + (early - EARLY_GRACE_MINS) * EARLY_PENALTY
 
 
 def _time_to_mins(t: str) -> float:
@@ -108,6 +133,64 @@ def measure_headway(conn, route_code: str, service_date: str) -> float | None:
     return statistics.median(gaps) if gaps else None
 
 
+def _accumulate_segment_times(conn, route_code, service_date, computed_at):
+    """
+    For each vehicle that passed the ORIGIN (stop_order = min) and one or more
+    near-origin stops on the same trip, record the origin→stop travel time.
+    Persists the median per (route, stop_order) in segment_times.
+    """
+    rows = conn.execute("""
+        SELECT vehicle_no, stop_order, passed_at, stop_type
+        FROM stop_passages
+        WHERE route_code=? AND service_date=?
+        ORDER BY vehicle_no, passed_at
+    """, (route_code, service_date)).fetchall()
+    if not rows:
+        return
+
+    bounds = conn.execute(
+        "SELECT MIN(stop_order) lo FROM stops WHERE route_code=?", (route_code,)
+    ).fetchone()
+    lo = bounds["lo"] if bounds else None
+    if lo is None:
+        return
+
+    # Group by vehicle, find origin passage then subsequent near stops within 25min
+    by_veh = {}
+    for r in rows:
+        by_veh.setdefault(r["vehicle_no"], []).append(r)
+
+    new_samples = {}  # stop_order → [mins,...]
+    for veh, ps in by_veh.items():
+        origin_p = next((p for p in ps if p["stop_order"] == lo), None)
+        if not origin_p:
+            continue
+        t0 = datetime.fromisoformat(origin_p["passed_at"])
+        for p in ps:
+            if p["stop_order"] <= lo:
+                continue
+            dt_min = (datetime.fromisoformat(p["passed_at"]) - t0).total_seconds()/60
+            if 0 < dt_min < 25:   # plausible near-origin segment
+                new_samples.setdefault(p["stop_order"], []).append(round(dt_min, 2))
+
+    for stop_order, samples in new_samples.items():
+        row = conn.execute(
+            "SELECT samples FROM segment_times WHERE route_code=? AND stop_order=?",
+            (route_code, stop_order)).fetchone()
+        existing = json.loads(row["samples"]) if (row and row["samples"]) else []
+        existing.extend(samples)
+        existing = existing[-MAX_CYCLE_SAMPLES:]
+        median_mins = round(statistics.median(existing), 2) if existing else None
+        conn.execute("""
+            INSERT INTO segment_times (route_code, stop_order, median_mins, samples, last_updated)
+            VALUES (?,?,?,?,?)
+            ON CONFLICT(route_code, stop_order) DO UPDATE SET
+                median_mins=excluded.median_mins,
+                samples=excluded.samples,
+                last_updated=excluded.last_updated
+        """, (route_code, stop_order, median_mins, json.dumps(existing), computed_at))
+
+
 def update_route_rotation(conn, route_code: str, service_date: str,
                           computed_at: str) -> dict | None:
     """
@@ -149,6 +232,34 @@ def update_route_rotation(conn, route_code: str, service_date: str,
 
     slot_count = max(1, round(cycle_mins / headway))
 
+    # ── Accumulate per-segment travel times (origin → near-origin stops) ──
+    # When a vehicle was seen passing the ORIGIN and also a near-origin stop on
+    # the same trip, the time difference is the real segment time. Median across
+    # days gives an accurate offset for departure back-calculation.
+    try:
+        _accumulate_segment_times(conn, route_code, service_date, computed_at)
+    except Exception:
+        pass
+
+    # ── Accumulate route trip duration (origin→terminus) for departure
+    #    extrapolation on sparse days ──
+    dur_rows = conn.execute("""
+        SELECT (strftime('%s',terminus_arrived_at)-strftime('%s',started_at))/60.0 d
+        FROM trips WHERE route_code=? AND service_date=?
+          AND terminus_arrived_at IS NOT NULL
+    """, (route_code, service_date)).fetchall()
+    today_durs = [round(r["d"],1) for r in dur_rows if r["d"] and 5 < r["d"] < 180]
+
+    dur_samples = json.loads(row["duration_samples"]) if (row and row["duration_samples"]) else []
+    dur_samples.extend(today_durs)
+    dur_samples = dur_samples[-MAX_CYCLE_SAMPLES:]
+    if dur_samples:
+        median_duration = round(statistics.median(dur_samples), 1)
+    elif row and row["median_trip_duration_mins"]:
+        median_duration = row["median_trip_duration_mins"]
+    else:
+        median_duration = None
+
     # Confidence: increment if today's count agrees with stored count
     if row and row["slot_count"] == slot_count:
         confidence = (row["confidence_days"] or 1) + 1
@@ -158,16 +269,20 @@ def update_route_rotation(conn, route_code: str, service_date: str,
     conn.execute("""
         INSERT INTO route_rotation
             (route_code, slot_count, median_cycle_mins, median_headway_mins,
+             median_trip_duration_mins, duration_samples,
              confidence_days, cycle_samples, last_updated)
-        VALUES (?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?)
         ON CONFLICT(route_code) DO UPDATE SET
             slot_count=excluded.slot_count,
             median_cycle_mins=excluded.median_cycle_mins,
             median_headway_mins=excluded.median_headway_mins,
+            median_trip_duration_mins=excluded.median_trip_duration_mins,
+            duration_samples=excluded.duration_samples,
             confidence_days=excluded.confidence_days,
             cycle_samples=excluded.cycle_samples,
             last_updated=excluded.last_updated
     """, (route_code, slot_count, cycle_mins, round(headway,2),
+          median_duration, json.dumps(dur_samples),
           confidence, json.dumps(samples), computed_at))
 
     # Also store per-day pattern for reference
@@ -231,6 +346,7 @@ def align_trips_to_slots(actual_deps: list[float],
         return [None]*n
 
     INF = float("inf")
+    SKIP_ACTUAL_COST = MAX_LATE_MINS + 1   # cost of leaving an actual unmatched
     # dp[i][j] = min cost aligning first i actuals using first j scheduled
     dp = [[INF]*(m+1) for _ in range(n+1)]
     back = [[None]*(m+1) for _ in range(n+1)]
@@ -244,15 +360,15 @@ def align_trips_to_slots(actual_deps: list[float],
             if dp[i][j-1] < dp[i][j]:
                 dp[i][j] = dp[i][j-1]
                 back[i][j] = ("skip_sched", i, j-1)
-            # Option B: match actual i-1 to scheduled j-1
-            cost = abs(actual_deps[i-1] - scheduled[j-1])
-            if cost <= DEVIATION_PENALTY:
+            # Option B: match actual i-1 to scheduled j-1 (asymmetric cost)
+            cost = match_cost(actual_deps[i-1], scheduled[j-1])
+            if cost != INF:
                 c = dp[i-1][j-1] + cost
                 if c < dp[i][j]:
                     dp[i][j] = c
                     back[i][j] = ("match", i-1, j-1)
             # Option C: actual i-1 matches nothing (penalty)
-            c = dp[i-1][j] + DEVIATION_PENALTY
+            c = dp[i-1][j] + SKIP_ACTUAL_COST
             if c < dp[i][j]:
                 dp[i][j] = c
                 back[i][j] = ("skip_actual", i-1, j)

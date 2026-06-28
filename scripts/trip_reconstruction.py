@@ -520,24 +520,60 @@ def get_terminus_observed_times(conn, route_code, vehicle_no,
     origin_time = terminus_time = None
 
     if passages:
-        # EARLIEST passage → back-calculate departure
+        # ── DEPARTURE: best available method, in priority order ──
+        # Collect near-origin passages (progress < 0.5) as (progress, datetime)
+        near_origin = []
+        for p in passages:
+            pr = progress_of(p["stop_order"])
+            if pr is not None and pr < 0.5:
+                near_origin.append((pr, parse_iso(p["passed_at"]), p["stop_order"]))
+
         earliest = passages[0]
-        p = progress_of(earliest["stop_order"])
-        if p is not None and route_duration_mins:
-            origin_time = (parse_iso(earliest["passed_at"]) -
-                           timedelta(minutes=p * route_duration_mins)).isoformat()
-        elif earliest["stop_type"] == "origin":
+        ep = progress_of(earliest["stop_order"])
+
+        if earliest["stop_type"] == "origin":
+            # Exact: we saw it leave the origin (circular routes)
             origin_time = earliest["passed_at"]
 
-        # LATEST passage → arrival
+        elif len(near_origin) >= 2:
+            # (1) Linear regression on near-origin passages → extrapolate to progress 0.
+            #     Uses the LOCAL speed at the start of the route — self-correcting.
+            xs = [pr for pr, _, _ in near_origin]
+            ts = [(dt_ - near_origin[0][1]).total_seconds()/60 for _, dt_, _ in near_origin]
+            n = len(xs)
+            sx = sum(xs); sy = sum(ts)
+            sxy = sum(x*y for x, y in zip(xs, ts))
+            sxx = sum(x*x for x in xs)
+            denom = n*sxx - sx*sx
+            if abs(denom) > 1e-9:
+                slope = (n*sxy - sx*sy)/denom        # mins per unit progress
+                intercept = (sy - slope*sx)/n         # mins (rel to first) at progress 0
+                origin_time = (near_origin[0][1] + timedelta(minutes=intercept)).isoformat()
+
+        if origin_time is None and near_origin:
+            # (2) Persistent per-segment offset: subtract the REAL historical
+            #     origin→stop time for the earliest near-origin stop.
+            pr, dt_, order = near_origin[0]
+            seg = conn.execute(
+                "SELECT median_mins FROM segment_times WHERE route_code=? AND stop_order=?",
+                (route_code, order)).fetchone()
+            if seg and seg["median_mins"] is not None:
+                origin_time = (dt_ - timedelta(minutes=seg["median_mins"])).isoformat()
+
+        if origin_time is None and ep is not None and route_duration_mins:
+            # (3) Last resort: proportional (assumes uniform speed)
+            origin_time = (parse_iso(earliest["passed_at"]) -
+                           timedelta(minutes=ep * route_duration_mins)).isoformat()
+
+        # ── ARRIVAL ──
         latest = passages[-1]
         if latest["stop_type"] == "terminus":
             terminus_time = latest["passed_at"]
         else:
-            p = progress_of(latest["stop_order"])
-            if p is not None and route_duration_mins:
+            lp = progress_of(latest["stop_order"])
+            if lp is not None and route_duration_mins:
                 terminus_time = (parse_iso(latest["passed_at"]) +
-                                 timedelta(minutes=(1 - p) * route_duration_mins)).isoformat()
+                                 timedelta(minutes=(1 - lp) * route_duration_mins)).isoformat()
 
     # Fallback to legacy terminus_observations if no passages
     if origin_time is None:
