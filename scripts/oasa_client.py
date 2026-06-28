@@ -19,8 +19,10 @@ from typing import Any
 
 import requests
 
-BASE_URL        = "http://telematics.oasa.gr/api/"
-DEFAULT_TIMEOUT = 20       # seconds — OASA is slow, 12s was too tight
+BASE_URL        = "https://telematics.oasa.gr/api/"
+CONNECT_TIMEOUT = 5        # fail fast if the host won't even accept a connection
+READ_TIMEOUT    = 20       # OASA can be slow to respond once connected
+DEFAULT_TIMEOUT = (CONNECT_TIMEOUT, READ_TIMEOUT)
 MAX_RETRIES     = 4
 BACKOFF_BASE    = 2.0
 NO_RETRY_STATUS = {403, 429}   # rate-limit / forbidden — retrying only makes it worse
@@ -33,7 +35,7 @@ class OasaApiError(Exception):
 
 
 def _request(act: str, params: dict[str, str] | None = None,
-             timeout: int = DEFAULT_TIMEOUT) -> Any:
+             timeout=DEFAULT_TIMEOUT) -> Any:
     """Single request with retries. Returns parsed JSON or raises OasaApiError."""
     query = {"act": act, **(params or {})}
     last_err: Exception | None = None
