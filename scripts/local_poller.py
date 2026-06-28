@@ -39,7 +39,7 @@ logging.basicConfig(
 log = logging.getLogger("local_poller")
 
 POLL_INTERVAL_SECS = 300   # 5 minutes
-MAX_WORKERS        = 8     # getBusLocation — gentler while the IP recovers from rate-limiting
+MAX_WORKERS        = 16    # getBusLocation (712 routes — original, always worked at 16)
 STOP_MAX_WORKERS   = 6     # getStopArrivals — low concurrency like fragkakis, avoids 403
 STOP_BATCH_SIZE    = 150   # spread stop polls in chunks across the cycle
 
