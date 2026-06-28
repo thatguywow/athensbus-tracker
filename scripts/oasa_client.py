@@ -19,8 +19,8 @@ from typing import Any
 
 import requests
 
-BASE_URL        = "https://telematics.oasa.gr/api/"
-DEFAULT_TIMEOUT = 12       # seconds
+BASE_URL        = "http://telematics.oasa.gr/api/"
+DEFAULT_TIMEOUT = 20       # seconds — OASA is slow, 12s was too tight
 MAX_RETRIES     = 4
 BACKOFF_BASE    = 2.0
 NO_RETRY_STATUS = {403, 429}   # rate-limit / forbidden — retrying only makes it worse
