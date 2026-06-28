@@ -7,6 +7,7 @@ let summaryData   = null;
 let vehicleData   = null;
 let schedData     = null;
 let kartData      = null;
+let depotData     = null;
 let availDates    = [];
 
 // ── utils ──────────────────────────────────────────────────────────────────
@@ -88,21 +89,24 @@ async function loadDay(d){
   document.getElementById("kart-route-select").style.display="none";
 
   try{
-    const [summary, vehicles, sched, kart] = await Promise.all([
+    const [summary, vehicles, sched, kart, depots] = await Promise.all([
       loadJSON(dataPath("summary.json")),
       loadJSON(dataPath("vehicle_activity.json")).catch(()=>({vehicles:[]})),
       loadJSON(dataPath("schedule_distribution.json")).catch(()=>({trips:[]})),
       loadJSON(dataPath("kartelakia.json")).catch(()=>({slots:[]})),
+      loadJSON(dataPath("depots.json")).catch(()=>({depots:[]})),
     ]);
     summaryData = summary;
     vehicleData = vehicles;
     schedData   = sched;
     kartData    = kart;
+    depotData   = depots;
 
     renderSummary(summary);
     renderVehicles(vehicles, document.getElementById("veh-search").value);
     buildLineSelectors(sched, kart);
     renderComparison(sched, document.getElementById("cmp-search").value);
+    renderDepots(depots);
 
     const health = await loadJSON("data/pipeline_health.json").catch(()=>({recent_runs:[]}));
     renderHealth(health);
@@ -229,7 +233,7 @@ function renderScheduleTable(routeCode){
 
   let html=`<div class="summary-bar"><span>${exec}</span> από <span>${total}</span> δρομολόγια εκτελέστηκαν (<span class="${pctClass(pct)}">${pct}%</span>)</div>`;
   html+='<table class="data-table"><thead><tr>'+
-    '<th>Πρόγραμμα</th><th>Αναχώρηση</th><th>Λήξη</th><th>Διάρκεια</th><th>Όχημα</th>'+
+    '<th>Πρόγραμμα</th><th>Καρτελάκι</th><th>Αναχώρηση</th><th>Λήξη</th><th>Διάρκεια</th><th>Όχημα</th>'+
     '</tr></thead><tbody>';
 
   trips.forEach(t=>{
@@ -237,14 +241,17 @@ function renderScheduleTable(routeCode){
     const incomplete = !missed && !t.ended_at;  // bus departed but never finished
     const dev=t.deviation;
     const devTip=dev==null?"":Math.abs(dev)<0.5?"στην ώρα":dev>0?"+"+dev.toFixed(1)+"λεπ":dev.toFixed(1)+"λεπ";
-    const vehHtml=missed
-      ? `<span class="slot-pill slot-unknown">${t.slot_label||"—"}</span>`
+    const slotHtml = t.slot_number
+      ? `<span class="slot-pill${missed?" slot-unknown":""}">Κ${t.slot_number}</span>`
+      : "—";
+    const vehHtml = missed
+      ? `<span class="veh-empty" title="κενό δρομολόγιο">κενό</span>`
       : `<span class="veh-no" title="${devTip}">${t.vehicle_no}</span>`;
-    // Λήξη/Διάρκεια: dashes if missed OR incomplete (never reached terminus)
     const endCell = (missed || incomplete) ? "—" : fmtTime(t.ended_at);
     const durCell = (missed || incomplete) ? "—" : fmtDur(t.started_at, t.ended_at);
     html+=`<tr class="${missed?"missed-row":""}">
       <td class="mono">${(t.scheduled_dep||"—").substring(0,5)}</td>
+      <td>${slotHtml}</td>
       <td class="mono">${missed?"—":fmtTime(t.started_at)}</td>
       <td class="mono">${endCell}</td>
       <td class="mono">${durCell}</td>
@@ -314,6 +321,29 @@ document.getElementById("veh-search").addEventListener("input",e=>{
 document.getElementById("cmp-search").addEventListener("input",e=>{
   if(schedData) renderComparison(schedData, e.target.value);
 });
+
+// ── Αμαξοστάσια / Τύπος Οχήματος ────────────────────────────────────────────
+function renderDepots(data){
+  const wrap = document.getElementById("depots-wrap");
+  const depots = (data && data.depots) ? data.depots : [];
+  if(!depots.length){
+    wrap.innerHTML='<div class="empty-state">Δεν υπάρχουν δεδομένα οχημάτων για αυτή την ημέρα.</div>';
+    return;
+  }
+  let h='<div class="depot-grid">';
+  depots.forEach(d=>{
+    h+=`<div class="depot-card">
+      <div class="depot-head"><span class="depot-name">${d.depot}</span>
+        <span class="depot-total">${d.total} οχήματα</span></div>
+      <table class="depot-table">`;
+    d.types.forEach(t=>{
+      h+=`<tr><td class="depot-count mono">${t.count}</td><td class="depot-type">${t.type}</td></tr>`;
+    });
+    h+=`</table></div>`;
+  });
+  h+='</div>';
+  wrap.innerHTML=h;
+}
 
 // ── three-way comparison: Προβλεπόμενα / Ημερήσιος / Εκτελεσμένα ────────────
 function renderComparison(sched, filter){

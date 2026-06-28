@@ -141,6 +141,26 @@ def generate_for_date(conn, service_date: str):
         if key not in known_vehicles:
             known_vehicles[key] = r["vehicle_no"]
 
+    # Stable ordinal καρτελάκι for EVERY scheduled departure (filled or not).
+    # slot = ((ordinal position in the day's sorted schedule) mod slot_count)+1.
+    # This is the delay-immune pattern, so an unexecuted slot still shows its
+    # καρτελάκι — letting us see empty slots vs vehicle replacements.
+    slot_counts = {r["route_code"]: r["slot_count"]
+                   for r in conn.execute(
+                       "SELECT route_code, slot_count FROM route_rotation").fetchall()}
+    slot_lookup: dict[tuple, int] = {}
+    sched_by_route: dict[str, list] = {}
+    for r in conn.execute("""
+        SELECT route_code, departure_time FROM scheduled_trips
+        WHERE schedule_date=? GROUP BY route_code, departure_time
+        ORDER BY route_code, departure_time
+    """, (service_date,)).fetchall():
+        sched_by_route.setdefault(r["route_code"], []).append(r["departure_time"])
+    for rc, times in sched_by_route.items():
+        sc = slot_counts.get(rc)
+        for i, t in enumerate(times):
+            slot_lookup[(rc, t)] = ((i % sc) + 1) if sc else None
+
     dist_rows = []
     for r in conn.execute("""
         SELECT t.route_code, r.line_code, l.line_id, r.descr AS route_name,
@@ -154,11 +174,8 @@ def generate_for_date(conn, service_date: str):
         WHERE t.service_date=?
         ORDER BY r.line_code, t.route_code, sa.scheduled_departure
     """, (service_date,)).fetchall():
-        slot_num = r["slot_number"]
-        veh_key  = (r["route_code"], slot_num)
-        slot_label = known_vehicles.get(veh_key) or (
-            f"Καρτελάκι {slot_num}" if slot_num else "—"
-        )
+        slot_num = r["slot_number"] or slot_lookup.get((r["route_code"], r["scheduled_departure"]))
+        slot_label = f"Καρτελάκι {slot_num}" if slot_num else "—"
         dist_rows.append({
             "route_code":    r["route_code"],
             "line_code":     r["line_code"],
@@ -191,6 +208,7 @@ def generate_for_date(conn, service_date: str):
         GROUP BY st.route_code, st.departure_time
         ORDER BY r.line_code, st.route_code, st.departure_time
     """, (service_date, service_date)).fetchall():
+        m_slot = slot_lookup.get((r["route_code"], r["departure_time"]))
         dist_rows.append({
             "route_code":    r["route_code"],
             "line_code":     r["line_code"],
@@ -198,8 +216,8 @@ def generate_for_date(conn, service_date: str):
             "route_name":    r["route_name"],
             "direction":     "Εξερχόμενη" if r["route_type"]=="1" else "Εισερχόμενη",
             "scheduled_dep": r["departure_time"],
-            "slot_number":   None,
-            "slot_label":    "—",
+            "slot_number":   m_slot,
+            "slot_label":    f"Καρτελάκι {m_slot}" if m_slot else "—",
             "vehicle_no":    None,
             "deviation":     None,
             "started_at":    None,
@@ -239,6 +257,40 @@ def generate_for_date(conn, service_date: str):
         "date": service_date, "generated_at": db.now_utc_iso(),
         "trips": dist_rows,
         "comparison": route_comparison,
+    })
+
+    # ── Depots / vehicle types: which vehicle types ran from each depot today ──
+    import vehicle_classification as vc
+    veh_rows = conn.execute("""
+        SELECT DISTINCT vehicle_no FROM trips WHERE service_date=?
+    """, (service_date,)).fetchall()
+
+    depot_map = {}     # depot_name → {type_name → count}
+    unknown = []
+    for r in veh_rows:
+        depot, vtype = vc.classify(r["vehicle_no"])
+        if not depot and not vtype:
+            unknown.append(r["vehicle_no"]); continue
+        dname = depot or "Άγνωστο αμαξοστάσιο"
+        tname = vtype or "Άγνωστος τύπος"
+        depot_map.setdefault(dname, {}).setdefault(tname, 0)
+        depot_map[dname][tname] += 1
+
+    depots_out = []
+    for dname, types in depot_map.items():
+        type_list = sorted(({"type": t, "count": c} for t, c in types.items()),
+                           key=lambda x: -x["count"])
+        depots_out.append({
+            "depot": dname,
+            "total": sum(types.values()),
+            "types": type_list,
+        })
+    depots_out.sort(key=lambda x: -x["total"])
+
+    write_json(os.path.join(ddir, "depots.json"), {
+        "date": service_date, "generated_at": db.now_utc_iso(),
+        "depots": depots_out,
+        "unclassified_count": len(unknown),
     })
 
     # ── kartelakia (slot schedule) ────────────────────────────────────────────

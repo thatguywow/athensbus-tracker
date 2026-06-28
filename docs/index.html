@@ -50,6 +50,16 @@
   .tab:hover{color:var(--paper);}
   .tab.active{color:var(--blue-bright);border-bottom-color:var(--blue-bright);}
   .tab-panel{display:none;} .tab-panel.active{display:block;}
+  .depot-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:1rem;}
+  .depot-card{background:var(--navy2);border:1px solid var(--line);border-radius:8px;padding:.9rem 1rem;}
+  .depot-head{display:flex;justify-content:space-between;align-items:baseline;
+    margin-bottom:.6rem;padding-bottom:.5rem;border-bottom:1px solid var(--line);}
+  .depot-name{font-weight:600;color:var(--paper);font-size:.95rem;}
+  .depot-total{font-size:.75rem;color:var(--slate);}
+  .depot-table{width:100%;border-collapse:collapse;}
+  .depot-table td{padding:.25rem 0;font-size:.83rem;vertical-align:baseline;}
+  .depot-count{color:var(--blue-bright);font-weight:600;width:2.5rem;}
+  .depot-type{color:var(--slate);}
 
   .panel-head{display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;margin-bottom:.9rem;}
   .panel-title{font-family:'Archivo Expanded',sans-serif;font-weight:600;font-size:1rem;}
@@ -71,6 +81,7 @@
   .data-table tr.missed-row td{opacity:.5;}
 
   .veh-no{font-family:'IBM Plex Mono',monospace;font-weight:600;color:var(--blue-bright);}
+  .veh-empty{font-size:.78rem;color:#e06b6b;font-style:italic;}
   .mono{font-family:'IBM Plex Mono',monospace;}
   .slot-pill{display:inline-block;background:rgba(63,167,150,.18);color:var(--teal);
     font-size:.68rem;padding:.1rem .4rem;border-radius:3px;font-family:'IBM Plex Mono',monospace;}
@@ -139,6 +150,7 @@
     <div class="tab active" data-tab="vehicles">Οχήματα</div>
     <div class="tab" data-tab="schedule">Κατανομή Δρομολογίων</div>
     <div class="tab" data-tab="comparison">Πρόγραμμα</div>
+    <div class="tab" data-tab="depots">Αμαξοστάσια</div>
     <div class="tab" data-tab="kartelakia">Καρτελάκια</div>
     <div class="tab" data-tab="health">Pipeline</div>
   </div>
@@ -168,6 +180,18 @@
       <strong>Εκτελεσμένα</strong>: τι όντως έγινε (κατά προσέγγιση).
     </p>
     <div id="comparison-table-wrap"><div class="empty-state">Φόρτωση…</div></div>
+  </div>
+
+  <!-- Αμαξοστάσια / Τύπος Οχήματος -->
+  <div class="tab-panel" id="tab-depots">
+    <div class="panel-head">
+      <div class="panel-title">Αμαξοστάσια / Τύπος Οχήματος</div>
+    </div>
+    <p style="font-size:.8rem;color:var(--slate);margin:.2rem 0 1rem;line-height:1.5;">
+      Πόσα οχήματα κάθε τύπου βγήκαν σήμερα από κάθε αμαξοστάσιο
+      (με βάση τον αριθμό οχήματος).
+    </p>
+    <div id="depots-wrap"><div class="empty-state">Φόρτωση…</div></div>
   </div>
 
   <!-- Κατανομή Δρομολογίων -->
