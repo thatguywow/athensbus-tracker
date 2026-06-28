@@ -205,11 +205,19 @@ function populateRouteSelect(id, lineCode, trips, onRouteSelect){
   sel.innerHTML='<option value="">— Διαδρομή —</option>';
   const routes={};
   trips.filter(t=>t.line_code===lineCode).forEach(t=>{
-    routes[t.route_code]=(t.route_name||t.route_code)+" ("+t.direction+")";
+    if(!routes[t.route_code])
+      routes[t.route_code]={label:(t.route_name||t.route_code)+" ("+t.direction+")",
+                            dir:t.direction};
   });
-  Object.entries(routes).forEach(([rc,lbl])=>{
+  // Εξερχόμενη (outbound) first, then Εισερχόμενη — consistent across all lines
+  const ordered=Object.entries(routes).sort((a,b)=>{
+    const rank=d=>d.dir==="Εξερχόμενη"?0:1;
+    const r=rank(a[1])-rank(b[1]);
+    return r!==0?r:a[1].label.localeCompare(b[1].label,"el");
+  });
+  ordered.forEach(([rc,info])=>{
     const o=document.createElement("option");
-    o.value=rc; o.textContent=lbl;
+    o.value=rc; o.textContent=info.label;
     sel.appendChild(o);
   });
   sel.style.display="inline-block";
@@ -233,7 +241,7 @@ function renderScheduleTable(routeCode){
 
   let html=`<div class="summary-bar"><span>${exec}</span> από <span>${total}</span> δρομολόγια εκτελέστηκαν (<span class="${pctClass(pct)}">${pct}%</span>)</div>`;
   html+='<table class="data-table"><thead><tr>'+
-    '<th>Πρόγραμμα</th><th>Καρτελάκι</th><th>Αναχώρηση</th><th>Λήξη</th><th>Διάρκεια</th><th>Όχημα</th>'+
+    '<th>Πρόγραμμα</th><th>Αναχώρηση</th><th>Λήξη</th><th>Διάρκεια</th><th>Όχημα</th>'+
     '</tr></thead><tbody>';
 
   trips.forEach(t=>{
@@ -241,17 +249,13 @@ function renderScheduleTable(routeCode){
     const incomplete = !missed && !t.ended_at;  // bus departed but never finished
     const dev=t.deviation;
     const devTip=dev==null?"":Math.abs(dev)<0.5?"στην ώρα":dev>0?"+"+dev.toFixed(1)+"λεπ":dev.toFixed(1)+"λεπ";
-    const slotHtml = t.slot_number
-      ? `<span class="slot-pill${missed?" slot-unknown":""}">Κ${t.slot_number}</span>`
-      : "—";
     const vehHtml = missed
-      ? `<span class="veh-empty" title="κενό δρομολόγιο">κενό</span>`
+      ? `<span class="veh-empty">—</span>`
       : `<span class="veh-no" title="${devTip}">${t.vehicle_no}</span>`;
     const endCell = (missed || incomplete) ? "—" : fmtTime(t.ended_at);
     const durCell = (missed || incomplete) ? "—" : fmtDur(t.started_at, t.ended_at);
     html+=`<tr class="${missed?"missed-row":""}">
       <td class="mono">${(t.scheduled_dep||"—").substring(0,5)}</td>
-      <td>${slotHtml}</td>
       <td class="mono">${missed?"—":fmtTime(t.started_at)}</td>
       <td class="mono">${endCell}</td>
       <td class="mono">${durCell}</td>

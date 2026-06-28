@@ -141,26 +141,6 @@ def generate_for_date(conn, service_date: str):
         if key not in known_vehicles:
             known_vehicles[key] = r["vehicle_no"]
 
-    # Stable ordinal καρτελάκι for EVERY scheduled departure (filled or not).
-    # slot = ((ordinal position in the day's sorted schedule) mod slot_count)+1.
-    # This is the delay-immune pattern, so an unexecuted slot still shows its
-    # καρτελάκι — letting us see empty slots vs vehicle replacements.
-    slot_counts = {r["route_code"]: r["slot_count"]
-                   for r in conn.execute(
-                       "SELECT route_code, slot_count FROM route_rotation").fetchall()}
-    slot_lookup: dict[tuple, int] = {}
-    sched_by_route: dict[str, list] = {}
-    for r in conn.execute("""
-        SELECT route_code, departure_time FROM scheduled_trips
-        WHERE schedule_date=? GROUP BY route_code, departure_time
-        ORDER BY route_code, departure_time
-    """, (service_date,)).fetchall():
-        sched_by_route.setdefault(r["route_code"], []).append(r["departure_time"])
-    for rc, times in sched_by_route.items():
-        sc = slot_counts.get(rc)
-        for i, t in enumerate(times):
-            slot_lookup[(rc, t)] = ((i % sc) + 1) if sc else None
-
     dist_rows = []
     for r in conn.execute("""
         SELECT t.route_code, r.line_code, l.line_id, r.descr AS route_name,
@@ -174,7 +154,7 @@ def generate_for_date(conn, service_date: str):
         WHERE t.service_date=?
         ORDER BY r.line_code, t.route_code, sa.scheduled_departure
     """, (service_date,)).fetchall():
-        slot_num = r["slot_number"] or slot_lookup.get((r["route_code"], r["scheduled_departure"]))
+        slot_num = r["slot_number"]
         slot_label = f"Καρτελάκι {slot_num}" if slot_num else "—"
         dist_rows.append({
             "route_code":    r["route_code"],
@@ -208,7 +188,6 @@ def generate_for_date(conn, service_date: str):
         GROUP BY st.route_code, st.departure_time
         ORDER BY r.line_code, st.route_code, st.departure_time
     """, (service_date, service_date)).fetchall():
-        m_slot = slot_lookup.get((r["route_code"], r["departure_time"]))
         dist_rows.append({
             "route_code":    r["route_code"],
             "line_code":     r["line_code"],
@@ -216,8 +195,8 @@ def generate_for_date(conn, service_date: str):
             "route_name":    r["route_name"],
             "direction":     "Εξερχόμενη" if r["route_type"]=="1" else "Εισερχόμενη",
             "scheduled_dep": r["departure_time"],
-            "slot_number":   m_slot,
-            "slot_label":    f"Καρτελάκι {m_slot}" if m_slot else "—",
+            "slot_number":   None,
+            "slot_label":    "—",
             "vehicle_no":    None,
             "deviation":     None,
             "started_at":    None,
@@ -285,7 +264,12 @@ def generate_for_date(conn, service_date: str):
             "total": sum(types.values()),
             "types": type_list,
         })
-    depots_out.sort(key=lambda x: -x["total"])
+    # Fixed display order for depots (as requested)
+    DEPOT_ORDER = ["Βοτανικός", "Πειραιάς", "Ράλλη", "Μπραχάμι", "Ανθούσα",
+                   "Λιόσια", "ΚΤΕΛ", "ΡΟΥΦ", "Κόκκινος Μύλος"]
+    def depot_rank(name):
+        return DEPOT_ORDER.index(name) if name in DEPOT_ORDER else len(DEPOT_ORDER)
+    depots_out.sort(key=lambda x: depot_rank(x["depot"]))
 
     write_json(os.path.join(ddir, "depots.json"), {
         "date": service_date, "generated_at": db.now_utc_iso(),
@@ -294,8 +278,10 @@ def generate_for_date(conn, service_date: str):
     })
 
     # ── kartelakia (slot schedule) ────────────────────────────────────────────
-    # Per route: ordered list of scheduled departures with their slot number.
-    # This is the stable pattern — slot numbers don't change day to day.
+    # Per route: ordered list of scheduled departures with their STABLE καρτελάκι
+    # (ordinal position mod slot_count). Independent of whether a trip ran, so the
+    # pattern is consistent day to day. Where a trip executed, prefer its matched
+    # slot_assignment; otherwise fall back to the stable ordinal lookup.
     slot_rows = []
     for r in conn.execute("""
         SELECT st.route_code, r.line_code, l.line_id,
