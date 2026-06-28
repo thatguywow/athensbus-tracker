@@ -32,25 +32,27 @@ def is_valid_departure(t_str: str) -> bool:
         return False
 
 
-def extract_departure_times(entries: list[dict]) -> list[tuple[str, str]]:
+def extract_departure_times(entries: list[dict], direction: str) -> list[tuple[str, str]]:
     """
-    Extract (sdd_code, HH:MM:SS) pairs from getDailySchedule entries.
-    Only returns times within the valid service window.
+    Extract (sdd_code, HH:MM:SS) pairs from getDailySchedule entries for ONE
+    direction. OASA stores the outbound (go) time in sde_start1 and the inbound
+    (come) time in sde_start2 within each entry, so we must read only the field
+    matching the direction — otherwise both directions get merged into one list.
     """
+    field = "sde_start1" if direction == "go" else "sde_start2"
     out = []
     for e in entries:
         sdd_code = str(e.get("sdd_code") or "")
-        for field in ("sde_start1", "sde_start2"):
-            raw = e.get(field)
-            if not raw:
-                continue
-            try:
-                t = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").time()
-                t_str = t.strftime("%H:%M:%S")
-                if is_valid_departure(t_str):
-                    out.append((sdd_code, t_str))
-            except ValueError:
-                continue
+        raw = e.get(field)
+        if not raw:
+            continue
+        try:
+            t = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").time()
+            t_str = t.strftime("%H:%M:%S")
+            if is_valid_departure(t_str):
+                out.append((sdd_code, t_str))
+        except ValueError:
+            continue
     return out
 
 
@@ -119,7 +121,7 @@ def sync_normal_schedules(conn, routes_by_line, lines_meta, today, synced_at) ->
             if route is None:
                 continue
             entries = sched.get(direction_key) or []
-            times = extract_departure_times(entries)
+            times = extract_departure_times(entries, direction_key)
             conn.execute(
                 "DELETE FROM normal_schedule WHERE route_code=? AND schedule_date=?",
                 (route["route_code"], today)
@@ -182,7 +184,7 @@ def main():
                     if route is None:
                         continue
                     entries = sched.get(direction_key) or []
-                    times = extract_departure_times(entries)
+                    times = extract_departure_times(entries, direction_key)
 
                     # Clear today's existing rows for this route so a re-sync
                     # produces a clean schedule (no stale duplicates).
