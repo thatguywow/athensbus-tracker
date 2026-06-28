@@ -39,10 +39,12 @@ logging.basicConfig(
 log = logging.getLogger("local_poller")
 
 POLL_INTERVAL_SECS = 300   # 5 minutes
-MAX_WORKERS        = 16
+MAX_WORKERS        = 16    # getBusLocation (712 routes — under the rate limit)
+STOP_MAX_WORKERS   = 6     # getStopArrivals — low concurrency like fragkakis, avoids 403
+STOP_BATCH_SIZE    = 150   # spread stop polls in chunks across the cycle
 
 
-CHECKPOINT_DEPTH = 3   # track first K and last K stops per route
+CHECKPOINT_DEPTH = 2   # track first K and last K stops per route
 
 
 def get_terminus_stops(conn) -> list[dict]:
@@ -138,7 +140,19 @@ def collect_and_store_terminus(conn, terminus_stops: list[dict],
     adds zero git/storage overhead.
     """
     stop_codes = list({s["stop_code"] for s in terminus_stops})
-    batch = oasa.batch_get_stop_arrivals(stop_codes, max_workers=MAX_WORKERS)
+    # Spread the polls: small chunks at low concurrency, brief pause between —
+    # mirrors fragkakis (never bursts), which is what avoids the 403 rate-limit.
+    ok_map: dict = {}
+    for i in range(0, len(stop_codes), STOP_BATCH_SIZE):
+        chunk = stop_codes[i:i + STOP_BATCH_SIZE]
+        b = oasa.batch_get_stop_arrivals(chunk, max_workers=STOP_MAX_WORKERS)
+        ok_map.update(b.ok)
+        if i + STOP_BATCH_SIZE < len(stop_codes):
+            time.sleep(1.0)
+
+    class _B:  # adapt to the existing .ok interface below
+        ok = ok_map
+    batch = _B()
 
     stop_meta: dict[str, list[tuple[str, str, int]]] = {}
     for s in terminus_stops:

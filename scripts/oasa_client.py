@@ -20,9 +20,10 @@ from typing import Any
 import requests
 
 BASE_URL        = "https://telematics.oasa.gr/api/"
-DEFAULT_TIMEOUT = 20       # seconds — OASA is slow, 12s was too tight
+DEFAULT_TIMEOUT = 12       # seconds
 MAX_RETRIES     = 4
 BACKOFF_BASE    = 2.0
+NO_RETRY_STATUS = {403, 429}   # rate-limit / forbidden — retrying only makes it worse
 
 log = logging.getLogger("oasa_client")
 
@@ -40,12 +41,23 @@ def _request(act: str, params: dict[str, str] | None = None,
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = requests.post(BASE_URL, params=query, timeout=timeout)
+            # Rate-limit / forbidden: do NOT retry — back off this stop entirely
+            if resp.status_code in NO_RETRY_STATUS:
+                raise OasaApiError(f"act={act} rate-limited ({resp.status_code})")
             resp.raise_for_status()
             text = resp.text.strip()
             if not text:
                 raise OasaApiError(f"empty response for act={act}")
             return json.loads(text)
-        except (requests.RequestException, json.JSONDecodeError, OasaApiError) as e:
+        except OasaApiError as e:
+            # rate-limit errors are non-retryable; fail fast
+            if "rate-limited" in str(e):
+                raise
+            last_err = e
+            if attempt < MAX_RETRIES:
+                sleep_s = BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                time.sleep(sleep_s)
+        except (requests.RequestException, json.JSONDecodeError) as e:
             last_err = e
             if attempt < MAX_RETRIES:
                 sleep_s = BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
