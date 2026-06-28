@@ -52,9 +52,15 @@ FULL_RANGES = [
     (60600, 60680, "Solaris 12m 8,6"),
     (69001, 69200, "Irisbus Citelis CNG 12m"),
     (79001, 79200, "Irisbus Citelis CNG 12m"),
-    # Depot 0 (ΡΟΥΦ) entries written with a leading zero in the reference
-    (6001, 6112, "Neoplan N6014"),   # 06001-06112
-    (9001, 9051, "Neoplan n6221"),   # 09001-09051
+]
+
+# ── Trolley-only base ranges (base = number WITHOUT first digit) ──
+# These trolley models appear only at trolley depots (ΡΟΥΦ=0, Κόκκινος Μύλος=8).
+# Listed in the fleet file as 06001-06112 and 09001-09051 (the leading 0 was the
+# depot). Kept trolley-only so ΚΤΕΛ (9XXXX) buses aren't misclassified.
+TROLLEY_BASE_RANGES = [
+    (6001, 6112, "Neoplan N6014"),
+    (9001, 9051, "Neoplan n6221"),
 ]
 
 # ── Any-depot ranges (base = vehicle number WITHOUT the first depot digit) ──
@@ -126,6 +132,9 @@ def classify(vehicle_no) -> tuple[str | None, str | None]:
         try:
             base = int(digits[1:])
             vtype = _in_ranges(base, BASE_RANGES)
+            # 3) Trolley-only models, only at trolley depots (ΡΟΥΦ, Κόκκινος Μύλος)
+            if vtype is None and first in TROLLEY_DEPOTS:
+                vtype = _in_ranges(base, TROLLEY_BASE_RANGES)
         except ValueError:
             pass
 
