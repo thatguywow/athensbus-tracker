@@ -102,6 +102,7 @@ async function loadDay(d){
     renderSummary(summary);
     renderVehicles(vehicles, document.getElementById("veh-search").value);
     buildLineSelectors(sched, kart);
+    renderComparison(sched, document.getElementById("cmp-search").value);
 
     const health = await loadJSON("data/pipeline_health.json").catch(()=>({recent_runs:[]}));
     renderHealth(health);
@@ -310,6 +311,51 @@ function renderHealth(data){
 document.getElementById("veh-search").addEventListener("input",e=>{
   if(vehicleData) renderVehicles(vehicleData, e.target.value);
 });
+document.getElementById("cmp-search").addEventListener("input",e=>{
+  if(schedData) renderComparison(schedData, e.target.value);
+});
+
+// ── three-way comparison: Προβλεπόμενα / Ημερήσιος / Εκτελεσμένα ────────────
+function renderComparison(sched, filter){
+  const wrap = document.getElementById("comparison-table-wrap");
+  const rows = (sched && sched.comparison) ? sched.comparison.slice() : [];
+  if(!rows.length){
+    wrap.innerHTML='<div class="empty-state">Δεν υπάρχουν δεδομένα σύγκρισης. '+
+      'Το κανονικό πρόγραμμα συγχρονίζεται στο επόμενο sync_schedules.</div>';
+    return;
+  }
+  const f=(filter||"").trim().toLowerCase();
+  const shown = f ? rows.filter(r=>
+    (r.line_id||"").toLowerCase().includes(f) ||
+    (r.route_name||"").toLowerCase().includes(f)) : rows;
+
+  shown.sort((a,b)=>(b.planned_cuts+b.failures)-(a.planned_cuts+a.failures));
+
+  let h='<table class="data-table"><thead><tr>'+
+    '<th>Γραμμή</th><th>Διαδρομή</th>'+
+    '<th style="text-align:right">Προβλεπόμενα</th>'+
+    '<th style="text-align:right">Ημερήσιος</th>'+
+    '<th style="text-align:right">Εκτελεσμένα</th>'+
+    '<th style="text-align:right">Περικοπές</th>'+
+    '<th style="text-align:right">Αποτυχίες</th></tr></thead><tbody>';
+  shown.forEach(r=>{
+    const cuts = r.planned_cuts>0
+      ? `<span style="color:var(--amber,#e0a458)">−${r.planned_cuts}</span>` : "0";
+    const fails = r.failures>0
+      ? `<span style="color:#e06b6b">−${r.failures}</span>` : "0";
+    h+=`<tr>
+      <td><strong>${r.line_id||"—"}</strong></td>
+      <td style="color:var(--slate);font-size:.8rem">${r.route_name||""} <span style="opacity:.6">(${r.direction})</span></td>
+      <td class="mono" style="text-align:right">${r.normal||"—"}</td>
+      <td class="mono" style="text-align:right">${r.daily||"—"}</td>
+      <td class="mono" style="text-align:right">${r.executed||0}</td>
+      <td class="mono" style="text-align:right">${cuts}</td>
+      <td class="mono" style="text-align:right">${fails}</td>
+    </tr>`;
+  });
+  h+='</tbody></table>';
+  wrap.innerHTML=h;
+}
 
 // ── init ───────────────────────────────────────────────────────────────────
 initDatePicker().catch(err=>{

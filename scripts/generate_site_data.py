@@ -83,11 +83,17 @@ def generate_for_date(conn, service_date: str):
         SELECT COUNT(DISTINCT vehicle_no) c FROM trips WHERE service_date=?
     """, (service_date,)).fetchone()["c"]
 
+    # System-wide normal (theoretical) trip count for three-way comparison
+    sys_normal = conn.execute("""
+        SELECT COUNT(*) c FROM normal_schedule WHERE schedule_date=?
+    """, (service_date,)).fetchone()["c"]
+
     write_json(os.path.join(ddir, "summary.json"), {
         "service_date":            service_date,
         "generated_at":            db.now_utc_iso(),
         "system_actual_trips":     sys_actual,
         "system_scheduled_trips":  sys_sched,
+        "system_normal_trips":     sys_normal,
         "system_completion_pct":   round(sys_actual/sys_sched*100,1) if sys_sched else None,
         "route_count":             len(routes_latest),
         "total_vehicles":          total_vehicles,
@@ -200,8 +206,39 @@ def generate_for_date(conn, service_date: str):
             "ended_at":      None,
         })
 
+    # Per-route three-way comparison: Normal / Daily / Executed
+    route_comparison = []
+    for r in conn.execute("""
+        SELECT r.route_code, r.line_code, l.line_id, r.descr AS route_name, r.route_type,
+            (SELECT COUNT(*) FROM normal_schedule ns
+             WHERE ns.route_code=r.route_code AND ns.schedule_date=?) AS normal_count,
+            (SELECT COUNT(DISTINCT st.departure_time) FROM scheduled_trips st
+             WHERE st.route_code=r.route_code AND st.schedule_date=?) AS daily_count,
+            (SELECT COUNT(*) FROM trips t
+             WHERE t.route_code=r.route_code AND t.service_date=?) AS executed_count
+        FROM routes r
+        LEFT JOIN lines l ON l.line_code=r.line_code
+    """, (service_date, service_date, service_date)).fetchall():
+        nc, dc, ec = r["normal_count"], r["daily_count"], r["executed_count"]
+        if not (nc or dc or ec):
+            continue
+        route_comparison.append({
+            "route_code":   r["route_code"],
+            "line_code":    r["line_code"],
+            "line_id":      r["line_id"] or r["line_code"],
+            "route_name":   r["route_name"],
+            "direction":    "Εξερχόμενη" if r["route_type"]=="1" else "Εισερχόμενη",
+            "normal":       nc,    # Προβλεπόμενα
+            "daily":        dc,    # Ημερήσιος προγραμματισμός
+            "executed":     ec,    # Εκτελεσμένα
+            "planned_cuts": (nc - dc) if (nc and dc is not None and nc >= dc) else 0,
+            "failures":     (dc - ec) if (dc and ec is not None and dc >= ec) else 0,
+        })
+
     write_json(os.path.join(ddir, "schedule_distribution.json"), {
-        "date": service_date, "generated_at": db.now_utc_iso(), "trips": dist_rows
+        "date": service_date, "generated_at": db.now_utc_iso(),
+        "trips": dist_rows,
+        "comparison": route_comparison,
     })
 
     # ── kartelakia (slot schedule) ────────────────────────────────────────────

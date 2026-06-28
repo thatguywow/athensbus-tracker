@@ -138,6 +138,7 @@
   <div class="tabs">
     <div class="tab active" data-tab="vehicles">Οχήματα</div>
     <div class="tab" data-tab="schedule">Κατανομή Δρομολογίων</div>
+    <div class="tab" data-tab="comparison">Πρόγραμμα</div>
     <div class="tab" data-tab="kartelakia">Καρτελάκια</div>
     <div class="tab" data-tab="health">Pipeline</div>
   </div>
@@ -151,6 +152,22 @@
       </div>
     </div>
     <div id="vehicle-table-wrap"><div class="empty-state">Φόρτωση…</div></div>
+  </div>
+
+  <!-- Πρόγραμμα (τριπλή σύγκριση) -->
+  <div class="tab-panel" id="tab-comparison">
+    <div class="panel-head">
+      <div class="panel-title">Προβλεπόμενα · Ημερήσιος · Εκτελεσμένα</div>
+      <div class="controls">
+        <input type="search" id="cmp-search" placeholder="Αναζήτηση γραμμής…">
+      </div>
+    </div>
+    <p style="font-size:.8rem;color:var(--slate);margin:.2rem 0 1rem;line-height:1.5;">
+      <strong>Προβλεπόμενα</strong>: το κανονικό πρόγραμμα. ·
+      <strong>Ημερήσιος</strong>: το αναθεωρημένο πλάνο της ημέρας (γνωστές ελλείψεις). ·
+      <strong>Εκτελεσμένα</strong>: τι όντως έγινε (κατά προσέγγιση).
+    </p>
+    <div id="comparison-table-wrap"><div class="empty-state">Φόρτωση…</div></div>
   </div>
 
   <!-- Κατανομή Δρομολογίων -->

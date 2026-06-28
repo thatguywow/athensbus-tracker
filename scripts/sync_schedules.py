@@ -54,6 +54,92 @@ def extract_departure_times(entries: list[dict]) -> list[tuple[str, str]]:
     return out
 
 
+WEEKDAY_TERMS = ["ΔΕΥΤΕΡΑ -", "ΚΑΘΗΜΕΡΙΝΗ", "ΚΑΘΗΜΕΡΙΝH", "ΟΛΕΣ"]
+
+
+def pick_sdc_code(line_code: str) -> str | None:
+    """
+    Choose the schedule day-type code (sdc_code) for TODAY from
+    getScheduleDaysMasterline: Sunday / Saturday / Friday / weekday.
+    Adapted from fragkakis SdcCodePicker.
+    """
+    try:
+        types = oasa.get_schedule_days_masterline(line_code)
+    except Exception:
+        return None
+    if not types:
+        return None
+
+    def find(term):
+        for e in types:
+            if term in str(e.get("sdc_descr") or ""):
+                return str(e.get("sdc_code") or "")
+        return None
+
+    weekday = None
+    for term in WEEKDAY_TERMS:
+        weekday = find(term)
+        if weekday:
+            break
+
+    wd = date.today().weekday()  # Mon=0 .. Sun=6
+    if wd == 6:    # Sunday
+        return find("ΚΥΡΙΑΚΗ") or weekday
+    if wd == 5:    # Saturday
+        return find("ΣΑΒΒΑΤΟ") or weekday
+    if wd == 4:    # Friday
+        return find("ΠΑΡΑΣΚΕΥΗ") or weekday
+    return weekday
+
+
+def sync_normal_schedules(conn, routes_by_line, lines_meta, today, synced_at) -> int:
+    """
+    Sync the NORMAL (theoretical) timetable via getSchedLines, using the
+    day-correct sdc_code. Stores into normal_schedule for the three-way
+    comparison. Independent of the daily sync; failures here never affect it.
+    """
+    total = 0
+    for line_code, meta in lines_meta.items():
+        line_id = meta["line_id"]
+        try:
+            sdc_code = pick_sdc_code(line_code)
+            if not sdc_code:
+                continue
+            sched = oasa.get_sched_lines(line_id, sdc_code, line_code)
+        except Exception:
+            continue
+        if not isinstance(sched, dict):
+            continue
+
+        routes_for_line = routes_by_line.get(line_code, [])
+        come_route = next((r for r in routes_for_line if r["route_type"] == "2"), None)
+        go_route   = next((r for r in routes_for_line if r["route_type"] == "1"), None)
+
+        for direction_key, route in (("come", come_route), ("go", go_route)):
+            if route is None:
+                continue
+            entries = sched.get(direction_key) or []
+            times = extract_departure_times(entries)
+            conn.execute(
+                "DELETE FROM normal_schedule WHERE route_code=? AND schedule_date=?",
+                (route["route_code"], today)
+            )
+            seen = set()
+            for _sdd, dep_time in times:
+                if dep_time in seen:
+                    continue
+                seen.add(dep_time)
+                conn.execute("""
+                    INSERT INTO normal_schedule
+                        (route_code, schedule_date, departure_time, sdc_code, last_synced)
+                    VALUES (?,?,?,?,?)
+                    ON CONFLICT(route_code, schedule_date, departure_time)
+                    DO UPDATE SET sdc_code=excluded.sdc_code, last_synced=excluded.last_synced
+                """, (route["route_code"], today, dep_time, sdc_code, synced_at))
+                total += 1
+    return total
+
+
 def main():
     db.ensure_schema()
     synced_at = db.now_utc_iso()
@@ -62,8 +148,9 @@ def main():
     with db.job_run("sync_schedules") as run:
         conn = db.get_connection()
         try:
-            line_rows = conn.execute("SELECT line_code FROM lines").fetchall()
+            line_rows = conn.execute("SELECT line_code, line_id FROM lines").fetchall()
             line_codes = [r["line_code"] for r in line_rows]
+            lines_meta = {r["line_code"]: {"line_id": r["line_id"]} for r in line_rows}
             log.info("Syncing schedules for %d lines", len(line_codes))
 
             route_rows = conn.execute(
@@ -131,9 +218,20 @@ def main():
                     log.info("Progress: %d/%d lines", i, len(line_codes))
 
             conn.commit()
+
+            # Sync the NORMAL (theoretical) timetable for three-way comparison.
+            # Isolated: any failure here does not affect the daily sync above.
+            normal_rows = 0
+            try:
+                normal_rows = sync_normal_schedules(
+                    conn, routes_by_line, lines_meta, today, synced_at)
+                conn.commit()
+            except Exception as e:
+                log.warning("Normal schedule sync failed: %s", e)
+
             run.detail = (
                 f"date={today} schedule_rows={total_inserted} "
-                f"failed_lines={len(failed)}"
+                f"normal_rows={normal_rows} failed_lines={len(failed)}"
             )
             if failed:
                 run.status = "partial"

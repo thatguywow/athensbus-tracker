@@ -68,6 +68,36 @@ def _migrate(conn):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_passages_vehicle ON stop_passages(vehicle_no, service_date)")
     add_column("stop_passages", "stop_order", "INTEGER")
 
+    # Normal (theoretical) timetable — the standard schedule that SHOULD run,
+    # separate from the daily revised plan in scheduled_trips. Enables the
+    # three-way comparison: Normal vs Daily vs Executed.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS normal_schedule (
+            route_code     TEXT NOT NULL,
+            schedule_date  TEXT NOT NULL,
+            departure_time TEXT NOT NULL,
+            sdc_code       TEXT,
+            last_synced    TEXT NOT NULL,
+            UNIQUE(route_code, schedule_date, departure_time)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_normal_sched_route_date ON normal_schedule(route_code, schedule_date)")
+
+    # Persistent per-segment travel time: median minutes from the ORIGIN to each
+    # near-origin stop_order, accumulated across days. Used to subtract the REAL
+    # origin→stop offset when back-calculating departure (instead of assuming
+    # uniform speed), eliminating the small early-bias.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS segment_times (
+            route_code   TEXT NOT NULL,
+            stop_order   INTEGER NOT NULL,
+            median_mins  REAL,
+            samples      TEXT,
+            last_updated TEXT NOT NULL,
+            UNIQUE(route_code, stop_order)
+        )
+    """)
+
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()

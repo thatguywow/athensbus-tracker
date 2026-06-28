@@ -19,7 +19,7 @@ from typing import Any
 
 import requests
 
-BASE_URL        = "https://telematics.oasa.gr/api/"
+BASE_URL        = "http://telematics.oasa.gr/api/"
 DEFAULT_TIMEOUT = 20       # seconds — OASA is slow, 12s was too tight
 MAX_RETRIES     = 4
 BACKOFF_BASE    = 2.0
@@ -71,6 +71,20 @@ def web_get_stops(route_code: str) -> list[dict]:
 
 def get_daily_schedule(line_code: str) -> dict:
     return _request("getDailySchedule", {"line_code": line_code})
+
+def get_schedule_days_masterline(line_code: str) -> list[dict]:
+    """Returns the available schedule day-types (sdc_code + sdc_descr) for a line."""
+    result = _request("getScheduleDaysMasterline", {"p1": line_code})
+    return result if isinstance(result, list) else []
+
+def get_sched_lines(line_id: str, sdc_code: str, line_code: str) -> dict:
+    """
+    Returns the NORMAL (theoretical) timetable for a line on a given day-type.
+    line_id is the public line number (e.g. '619'); sdc_code is the day-type
+    code from getScheduleDaysMasterline; line_code is the internal code.
+    """
+    return _request("getSchedLines",
+                    {"p1": line_id, "p2": sdc_code, "p3": line_code})
 
 def get_bus_location(route_code: str) -> list[dict]:
     return _request("getBusLocation", {"p1": route_code})

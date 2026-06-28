@@ -262,3 +262,30 @@ CREATE TABLE IF NOT EXISTS stop_passages (
 );
 CREATE INDEX IF NOT EXISTS idx_passages_route_date ON stop_passages(route_code, service_date);
 CREATE INDEX IF NOT EXISTS idx_passages_vehicle ON stop_passages(vehicle_no, service_date);
+
+-- ─────────── Normal (theoretical) timetable for three-way comparison ─────────
+-- The standard schedule that SHOULD run (Προβλεπόμενα), from getSchedLines with
+-- the day-type sdc_code. Compared against the daily revised plan (scheduled_trips)
+-- and the executed trips to reveal planned cuts vs unplanned failures.
+CREATE TABLE IF NOT EXISTS normal_schedule (
+    route_code     TEXT NOT NULL,
+    schedule_date  TEXT NOT NULL,
+    departure_time TEXT NOT NULL,
+    sdc_code       TEXT,
+    last_synced    TEXT NOT NULL,
+    UNIQUE(route_code, schedule_date, departure_time)
+);
+CREATE INDEX IF NOT EXISTS idx_normal_sched_route_date ON normal_schedule(route_code, schedule_date);
+
+-- ─────────── Persistent per-segment travel times (origin → near stops) ───────
+-- Median minutes from the origin to each near-origin stop_order, accumulated
+-- across days. Lets us subtract the REAL origin→stop time when back-calculating
+-- departure, instead of assuming uniform speed (removes the early-bias).
+CREATE TABLE IF NOT EXISTS segment_times (
+    route_code   TEXT NOT NULL,
+    stop_order   INTEGER NOT NULL,
+    median_mins  REAL,
+    samples      TEXT,
+    last_updated TEXT NOT NULL,
+    UNIQUE(route_code, stop_order)
+);
