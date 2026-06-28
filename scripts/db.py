@@ -29,8 +29,44 @@ def ensure_schema():
         with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
             conn.executescript(f.read())
         conn.commit()
+        _migrate(conn)
+        conn.commit()
     finally:
         conn.close()
+
+
+def _migrate(conn):
+    """Apply safe additive migrations (add columns if missing)."""
+    def add_column(table, column, decl):
+        cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if column not in cols:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            except Exception:
+                pass
+
+    # Persistent median route trip duration (for departure extrapolation)
+    add_column("route_rotation", "median_trip_duration_mins", "REAL")
+    add_column("route_rotation", "duration_samples", "TEXT")
+
+    # stop_passages table (exact pass times via disappearance detection)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stop_passages (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            route_code   TEXT NOT NULL,
+            stop_code    TEXT NOT NULL,
+            stop_type    TEXT NOT NULL,
+            stop_order   INTEGER,
+            vehicle_no   TEXT NOT NULL,
+            passed_at    TEXT NOT NULL,
+            service_date TEXT NOT NULL,
+            recorded_at  TEXT NOT NULL,
+            UNIQUE(route_code, stop_code, vehicle_no, passed_at)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_passages_route_date ON stop_passages(route_code, service_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_passages_vehicle ON stop_passages(vehicle_no, service_date)")
+    add_column("stop_passages", "stop_order", "INTEGER")
 
 
 def now_utc_iso() -> str:

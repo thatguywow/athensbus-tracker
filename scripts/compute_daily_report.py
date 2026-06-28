@@ -38,7 +38,8 @@ def purge_old_data(conn, retention_days: int) -> dict:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
     p1 = conn.execute("DELETE FROM vehicle_pings WHERE ts_utc < ?", (cutoff,)).rowcount
     p2 = conn.execute("DELETE FROM terminus_observations WHERE observed_at < ?", (cutoff,)).rowcount
-    return {"pings": p1, "terminus_obs": p2}
+    p3 = conn.execute("DELETE FROM stop_passages WHERE passed_at < ?", (cutoff,)).rowcount
+    return {"pings": p1, "terminus_obs": p2, "passages": p3}
 
 
 def main():

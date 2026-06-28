@@ -235,7 +235,30 @@ CREATE TABLE IF NOT EXISTS route_rotation (
     slot_count       INTEGER NOT NULL,
     median_cycle_mins REAL,
     median_headway_mins REAL,
+    median_trip_duration_mins REAL,   -- typical origin→terminus time (persistent)
+    duration_samples TEXT,            -- JSON list of recent duration observations
     confidence_days  INTEGER DEFAULT 1,   -- how many days confirmed this count
     cycle_samples    TEXT,                -- JSON list of recent cycle observations
     last_updated     TEXT NOT NULL
 );
+
+-- ─────────── Exact stop passages via "disappearance detection" ───────────────
+-- When a vehicle's arrival prediction at a stop DISAPPEARS between two polls,
+-- it means the vehicle passed that stop. The pass time is the prediction from
+-- the last poll (last_poll + btime2), which is OASA's own estimate — far more
+-- accurate than the poll time. Used for exact departure (origin) and arrival
+-- (terminus) times. Adapted from fragkakis/athensbus StopSyncer.
+CREATE TABLE IF NOT EXISTS stop_passages (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    route_code   TEXT NOT NULL,
+    stop_code    TEXT NOT NULL,
+    stop_type    TEXT NOT NULL,        -- 'origin' | 'near_origin' | 'near_terminus' | 'terminus'
+    stop_order   INTEGER,              -- position in route (for back-calculation)
+    vehicle_no   TEXT NOT NULL,
+    passed_at    TEXT NOT NULL,        -- ISO8601 UTC, OASA-predicted exact pass time
+    service_date TEXT NOT NULL,
+    recorded_at  TEXT NOT NULL,
+    UNIQUE(route_code, stop_code, vehicle_no, passed_at)
+);
+CREATE INDEX IF NOT EXISTS idx_passages_route_date ON stop_passages(route_code, service_date);
+CREATE INDEX IF NOT EXISTS idx_passages_vehicle ON stop_passages(vehicle_no, service_date);
