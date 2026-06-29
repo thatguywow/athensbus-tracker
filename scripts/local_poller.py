@@ -177,11 +177,14 @@ def collect_and_store_terminus(conn, terminus_stops: list[dict],
 
         current = {}
         for a in arrivals:
-            veh = str(a.get("VEH_NO") or "")
+            # getStopArrivals uses "veh_code" for the vehicle (NOT "VEH_NO",
+            # which is getBusLocation's field). This was the cause of 0 passages:
+            # we read a missing field, so no vehicles were ever tracked.
+            veh = str(a.get("veh_code") or a.get("VEH_NO") or "")
             if not veh:
                 continue
             try:
-                bt = int(a.get("btime2") or a.get("time2") or 0)
+                bt = int(a.get("btime2") or a.get("btime") or 0)
             except (ValueError, TypeError):
                 bt = 0
             current[veh] = {"btime2": bt, "route_code": str(a.get("route_code") or "")}
