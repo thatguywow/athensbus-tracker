@@ -21,6 +21,9 @@ from __future__ import annotations
 import logging
 import sys
 import time
+import queue
+import threading
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -38,12 +41,25 @@ logging.basicConfig(
 )
 log = logging.getLogger("local_poller")
 
-POLL_INTERVAL_SECS = 300   # 5 minutes
-MAX_WORKERS        = 8     # getBusLocation — gentler burst so it doesn't spike the rate budget
-STOP_MAX_WORKERS   = 4     # getStopArrivals concurrency (low)
-STOP_RATE_PER_SEC  = 8     # getStopArrivals steady rate (req/sec) — stays under the IP limit
+# ── Two-speed spread poller ─────────────────────────────────────────────────
+# Edge stops (first/last EDGE_DEPTH of each route) are polled densely so we
+# catch fast early/late passages and get accurate departure/arrival. Middle
+# stops (optional) are spread thinly over MIDDLE_WINDOW. A global rate cap keeps
+# us under the IP request limit; the spread means we never burst.
+EDGE_DEPTH      = 3      # first/last K stops per route (where accuracy matters)
+EDGE_INTERVAL   = 90     # target seconds between polls of each edge stop
+ENABLE_MIDDLE   = False  # poll middle stops too (fragkakis-style); off until needed
+MIDDLE_WINDOW   = 300    # seconds between polls of each middle stop
+TARGET_RATE     = 10     # max getStopArrivals/sec (safety cap) — raise if no 403s
+STOP_WORKERS    = 8      # getStopArrivals fetch threads
+LOC_WORKERS     = 8      # getBusLocation fetch threads
+GBL_INTERVAL    = 300    # getBusLocation sweep every N seconds (GPS pings)
+DISAPPEAR_GUARD_MINS = 10
+COMMIT_EVERY_SECS    = 2.0
+LOG_EVERY_SECS       = 60
+WORK_Q_MAX           = 20000
 
-CHECKPOINT_DEPTH = 2   # track first K and last K stops per route
+CHECKPOINT_DEPTH = EDGE_DEPTH   # get_terminus_stops uses this
 
 
 def get_terminus_stops(conn) -> list[dict]:
@@ -96,135 +112,182 @@ def get_terminus_stops(conn) -> list[dict]:
     return checkpoints
 
 
-def collect_and_store_pings(conn, route_codes: list[str], polled_at: str) -> dict:
-    batch = oasa.batch_get_bus_locations(route_codes, max_workers=MAX_WORKERS)
-    n_pings = parse_errors = 0
-
-    for route_code, vehicles in batch.ok.items():
-        for v in (vehicles or []):
-            try:
-                conn.execute("""
-                    INSERT OR IGNORE INTO vehicle_pings
-                        (route_code, vehicle_no, lat, lng, ts_utc, polled_at)
-                    VALUES (?,?,?,?,?,?)
-                """, (route_code, str(v["VEH_NO"]),
-                      float(v["CS_LAT"]), float(v["CS_LNG"]),
-                      oasa.parse_oasa_date(v["CS_DATE"]), polled_at))
-                n_pings += 1
-            except (KeyError, ValueError, TypeError):
-                parse_errors += 1
-
-    conn.commit()
-    return {
-        "routes_ok":     batch.success_count,
-        "routes_failed": batch.failure_count,
-        "pings":         n_pings,
-        "parse_errors":  parse_errors,
-    }
+def get_middle_stops(conn) -> list[dict]:
+    """All stops that are NOT edges (between first EDGE_DEPTH and last EDGE_DEPTH)."""
+    rows = conn.execute("""
+        SELECT route_code, MIN(stop_order) AS lo, MAX(stop_order) AS hi
+        FROM stops GROUP BY route_code
+    """).fetchall()
+    out = []
+    for r in rows:
+        lo, hi = r["lo"], r["hi"]
+        srows = conn.execute(
+            "SELECT stop_order, stop_code FROM stops WHERE route_code=? ORDER BY stop_order",
+            (r["route_code"],)).fetchall()
+        for s in srows:
+            o = s["stop_order"]
+            if lo + EDGE_DEPTH <= o <= hi - EDGE_DEPTH:
+                out.append({"route_code": r["route_code"], "stop_code": s["stop_code"],
+                            "stop_type": "middle", "stop_order": o})
+    return out
 
 
-def collect_and_store_terminus(conn, terminus_stops: list[dict],
-                                polled_at: str, prev_state: dict) -> dict:
-    """
-    Disappearance detection (adapted from fragkakis/athensbus StopSyncer):
+def build_stop_meta(stops: list[dict]) -> dict:
+    """stop_code -> [(route_code, stop_type, stop_order), ...]"""
+    meta: dict[str, list] = defaultdict(list)
+    for s in stops:
+        meta[s["stop_code"]].append((s["route_code"], s["stop_type"], s["stop_order"]))
+    return dict(meta)
 
-    For each tracked stop we remember the set of vehicles predicted to arrive
-    in the PREVIOUS poll, with their predicted time. When a vehicle that was
-    predicted last time is NO LONGER predicted now, it has PASSED the stop.
-    Its exact pass time = previous_poll_time + btime2_minutes (OASA's own
-    prediction), capped at now. This yields accurate departure (origin) and
-    arrival (terminus) times even with multi-minute polling.
 
-    prev_state is kept IN MEMORY across cycles (poller is long-running), so it
-    adds zero git/storage overhead.
-    """
-    stop_codes = list({s["stop_code"] for s in terminus_stops})
-    # Spread getStopArrivals EVENLY at a steady low rate (fragkakis technique).
-    # The 403s are a per-IP request-rate limit: bursting all stops trips it, but
-    # a steady ~STOP_RATE_PER_SEC requests/sec stays under it. We process tiny
-    # chunks and sleep to hold the target rate — never bursting.
-    ok_map: dict = {}
-    poll_time: dict[str, str] = {}   # actual poll time per stop (spread over the cycle)
-    chunk_n = max(1, STOP_RATE_PER_SEC)
-    for i in range(0, len(stop_codes), chunk_n):
-        t0 = time.time()
-        chunk = stop_codes[i:i + chunk_n]
-        chunk_iso = oasa.now_utc_iso()
-        b = oasa.batch_get_stop_arrivals(chunk, max_workers=STOP_MAX_WORKERS)
-        ok_map.update(b.ok)
-        for sc in chunk:
-            poll_time[sc] = chunk_iso
-        if i + chunk_n < len(stop_codes):
-            time.sleep(max(0.0, 1.0 - (time.time() - t0)))  # hold ~1 chunk/sec
+def build_buckets(stop_codes: list[str], window: int) -> dict[int, list[str]]:
+    """Spread stop codes evenly across `window` one-second slots."""
+    buckets: dict[int, list[str]] = defaultdict(list)
+    n = max(1, len(stop_codes))
+    for i, sc in enumerate(stop_codes):
+        buckets[(i * window) // n % window].append(sc)
+    return dict(buckets)
 
-    class _B:  # adapt to the existing .ok interface below
-        ok = ok_map
-    batch = _B()
 
-    stop_meta: dict[str, list[tuple[str, str, int]]] = {}
-    for s in terminus_stops:
-        stop_meta.setdefault(s["stop_code"], []).append(
-            (s["route_code"], s["stop_type"], s["stop_order"]))
+class RateLimiter:
+    """Token bucket: at most `rate` acquisitions per second across all threads."""
+    def __init__(self, rate: float):
+        self.rate = float(rate)
+        self.allowance = float(rate)
+        self.last = time.monotonic()
+        self.lock = threading.Lock()
 
-    n_passages = 0
+    def acquire(self):
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                self.allowance += (now - self.last) * self.rate
+                self.last = now
+                if self.allowance > self.rate:
+                    self.allowance = self.rate
+                if self.allowance >= 1.0:
+                    self.allowance -= 1.0
+                    return
+            time.sleep(0.01)
 
-    for stop_code in stop_codes:
-        arrivals = batch.ok.get(stop_code) or []
-        # Actual time THIS stop was polled (spread across the cycle), not the
-        # cycle start — keeps pass times accurate despite the spreading.
-        stop_now_iso = poll_time.get(stop_code, polled_at)
-        now_dt = datetime.fromisoformat(stop_now_iso)
 
-        current = {}
-        for a in arrivals:
-            # getStopArrivals uses "veh_code" for the vehicle (NOT "VEH_NO",
-            # which is getBusLocation's field). This was the cause of 0 passages:
-            # we read a missing field, so no vehicles were ever tracked.
-            veh = str(a.get("veh_code") or a.get("VEH_NO") or "")
-            if not veh:
-                continue
-            try:
-                bt = int(a.get("btime2") or a.get("btime") or 0)
-            except (ValueError, TypeError):
-                bt = 0
-            current[veh] = {"btime2": bt, "route_code": str(a.get("route_code") or "")}
+def _stop_worker(work_q, result_q, limiter, stop_event):
+    while not stop_event.is_set():
+        try:
+            stop_code = work_q.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        try:
+            limiter.acquire()                       # global rate cap
+            poll_iso = oasa.now_utc_iso()
+            arrivals = oasa.get_stop_arrivals(stop_code) or []
+            current = {}
+            for a in arrivals:
+                veh = str(a.get("veh_code") or a.get("VEH_NO") or "")
+                if not veh:
+                    continue
+                try:
+                    bt = int(a.get("btime2") or a.get("btime") or 0)
+                except (ValueError, TypeError):
+                    bt = 0
+                current[veh] = {"btime2": bt, "route_code": str(a.get("route_code") or "")}
+            result_q.put(("arrival", stop_code, current, poll_iso))
+        except Exception:
+            pass
+        finally:
+            work_q.task_done()
 
-        prev = prev_state.get(stop_code)
 
-        if prev:
-            try:
-                gap_min = (now_dt - datetime.fromisoformat(prev["polled_at"])).total_seconds()/60
-            except Exception:
-                gap_min = 999
-            if gap_min <= 10:
-                for veh, info in prev["vehicles"].items():
-                    if veh in current:
-                        continue  # still approaching
-                    pass_dt = datetime.fromisoformat(prev["polled_at"]) + \
-                              timedelta(minutes=info["btime2"])
-                    if pass_dt > now_dt:
-                        pass_dt = now_dt
-                    pass_iso = pass_dt.isoformat()
-                    service_date = _athens_date(pass_dt)
-                    for (route_code, stop_type, stop_order) in stop_meta.get(stop_code, []):
-                        if info["route_code"] and info["route_code"] != route_code:
-                            continue
-                        try:
-                            conn.execute("""
-                                INSERT OR IGNORE INTO stop_passages
-                                    (route_code, stop_code, stop_type, stop_order,
-                                     vehicle_no, passed_at, service_date, recorded_at)
-                                VALUES (?,?,?,?,?,?,?,?)
-                            """, (route_code, stop_code, stop_type, stop_order,
-                                  veh, pass_iso, service_date, stop_now_iso))
-                            n_passages += 1
-                        except Exception:
-                            pass
+def _loc_worker(loc_q, result_q, stop_event):
+    while not stop_event.is_set():
+        try:
+            route_code = loc_q.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        try:
+            poll_iso = oasa.now_utc_iso()
+            data = oasa.get_bus_location(route_code) or []
+            result_q.put(("location", route_code, data, poll_iso))
+        except Exception:
+            pass
+        finally:
+            loc_q.task_done()
 
-        prev_state[stop_code] = {"polled_at": stop_now_iso, "vehicles": current}
 
-    conn.commit()
-    return {"passages": n_passages}
+def _writer_thread(result_q, stop_meta, stats, stop_event):
+    conn = db.get_connection()
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+    except Exception:
+        pass
+    prev: dict[str, dict] = {}
+    last_commit = time.time()
+
+    while not (stop_event.is_set() and result_q.empty()):
+        try:
+            item = result_q.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        try:
+            if item[0] == "arrival":
+                _, stop_code, current, poll_iso = item
+                now_dt = datetime.fromisoformat(poll_iso)
+                p = prev.get(stop_code)
+                if p:
+                    try:
+                        gap = (now_dt - datetime.fromisoformat(p["polled_at"])).total_seconds()/60
+                    except Exception:
+                        gap = 999
+                    if gap <= DISAPPEAR_GUARD_MINS:
+                        for veh, info in p["vehicles"].items():
+                            if veh in current:
+                                continue
+                            pass_dt = datetime.fromisoformat(p["polled_at"]) + \
+                                      timedelta(minutes=info["btime2"])
+                            if pass_dt > now_dt:
+                                pass_dt = now_dt
+                            pass_iso = pass_dt.isoformat()
+                            sd = _athens_date(pass_dt)
+                            for (rc, stype, order) in stop_meta.get(stop_code, []):
+                                if info["route_code"] and info["route_code"] != rc:
+                                    continue
+                                try:
+                                    conn.execute("""
+                                        INSERT OR IGNORE INTO stop_passages
+                                            (route_code, stop_code, stop_type, stop_order,
+                                             vehicle_no, passed_at, service_date, recorded_at)
+                                        VALUES (?,?,?,?,?,?,?,?)
+                                    """, (rc, stop_code, stype, order, veh, pass_iso, sd, poll_iso))
+                                    stats["passages"] += 1
+                                except Exception:
+                                    pass
+                prev[stop_code] = {"polled_at": poll_iso, "vehicles": current}
+            else:
+                _, route_code, vehicles, poll_iso = item
+                for v in (vehicles or []):
+                    try:
+                        conn.execute("""
+                            INSERT OR IGNORE INTO vehicle_pings
+                                (route_code, vehicle_no, lat, lng, ts_utc, polled_at)
+                            VALUES (?,?,?,?,?,?)
+                        """, (route_code, str(v["VEH_NO"]), float(v["CS_LAT"]),
+                              float(v["CS_LNG"]), oasa.parse_oasa_date(v["CS_DATE"]), poll_iso))
+                        stats["pings"] += 1
+                    except (KeyError, ValueError, TypeError):
+                        pass
+        except Exception as e:
+            log.error("writer error: %s", e)
+        finally:
+            result_q.task_done()
+        if time.time() - last_commit > COMMIT_EVERY_SECS:
+            try: conn.commit()
+            except Exception: pass
+            last_commit = time.time()
+
+    try:
+        conn.commit(); conn.close()
+    except Exception:
+        pass
 
 
 def _athens_date(dt_utc: datetime) -> str:
@@ -237,67 +300,92 @@ def _athens_date(dt_utc: datetime) -> str:
 
 def main():
     db.ensure_schema()
-    log.info("Local poller started. Polling every %ds.", POLL_INTERVAL_SECS)
-
     conn = db.get_connection()
     route_codes = [r["route_code"] for r in
                    conn.execute("SELECT route_code FROM routes").fetchall()]
-    terminus_stops = get_terminus_stops(conn)
+    edges = get_terminus_stops(conn)
+    middles = get_middle_stops(conn) if ENABLE_MIDDLE else []
     conn.close()
 
     if not route_codes:
-        log.error("No routes in DB. Run first_time_setup.bat first.")
+        log.error("No routes in DB. Run first_time_setup first.")
         sys.exit(1)
 
-    log.info("Loaded %d routes, %d terminus stops.", len(route_codes), len(terminus_stops))
+    stop_meta = build_stop_meta(edges + middles)
+    edge_codes = sorted({s["stop_code"] for s in edges})
+    middle_codes = sorted({s["stop_code"] for s in middles}) if ENABLE_MIDDLE else []
+    edge_buckets = build_buckets(edge_codes, EDGE_INTERVAL)
+    middle_buckets = build_buckets(middle_codes, MIDDLE_WINDOW) if ENABLE_MIDDLE else {}
 
-    last_reload = time.time()
-    # In-memory previous predictions per stop (for disappearance detection).
-    prev_arrival_state: dict = {}
+    implied_rate = len(edge_codes) / max(1, EDGE_INTERVAL)
+    log.info("Two-speed poller: %d routes | %d edge stops (every %ds → ~%.1f/s) | "
+             "%d middle stops | rate cap %d/s",
+             len(route_codes), len(edge_codes), EDGE_INTERVAL, implied_rate,
+             len(middle_codes), TARGET_RATE)
+    if implied_rate > TARGET_RATE:
+        log.warning("Edge demand ~%.1f/s exceeds cap %d/s → edges will poll slower "
+                    "than %ds. Raise TARGET_RATE if no 403s, or raise EDGE_INTERVAL.",
+                    implied_rate, TARGET_RATE, EDGE_INTERVAL)
 
-    while True:
-        cycle_start = time.time()
-        polled_at   = oasa.now_utc_iso()
+    work_q = queue.Queue(maxsize=WORK_Q_MAX)
+    loc_q = queue.Queue(maxsize=5000)
+    result_q = queue.Queue(maxsize=50000)
+    limiter = RateLimiter(TARGET_RATE)
+    stats = {"passages": 0, "pings": 0, "skipped": 0}
+    stop_event = threading.Event()
 
-        try:
-            conn = db.get_connection()
+    threads = []
+    for _ in range(STOP_WORKERS):
+        t = threading.Thread(target=_stop_worker, args=(work_q, result_q, limiter, stop_event), daemon=True)
+        t.start(); threads.append(t)
+    for _ in range(LOC_WORKERS):
+        t = threading.Thread(target=_loc_worker, args=(loc_q, result_q, stop_event), daemon=True)
+        t.start(); threads.append(t)
+    writer = threading.Thread(target=_writer_thread, args=(result_q, stop_meta, stats, stop_event), daemon=True)
+    writer.start()
 
-            ping_stats = collect_and_store_pings(conn, route_codes, polled_at)
-            log.info("Pings: routes_ok=%d routes_failed=%d pings=%d",
-                     ping_stats["routes_ok"], ping_stats["routes_failed"],
-                     ping_stats["pings"])
+    start = time.monotonic()
+    last_sec = -1
+    last_gbl = -GBL_INTERVAL
+    last_log = time.time()
 
-            if terminus_stops:
-                term_stats = collect_and_store_terminus(
-                    conn, terminus_stops, polled_at, prev_arrival_state)
-                log.info("Exact stop passages detected: %d", term_stats["passages"])
+    try:
+        while True:
+            now = time.monotonic() - start
+            cur = int(now)
+            while last_sec < cur:
+                last_sec += 1
+                for sc in edge_buckets.get(last_sec % EDGE_INTERVAL, []):
+                    try: work_q.put_nowait(sc)
+                    except queue.Full: stats["skipped"] += 1
+                if ENABLE_MIDDLE:
+                    for sc in middle_buckets.get(last_sec % MIDDLE_WINDOW, []):
+                        try: work_q.put_nowait(sc)
+                        except queue.Full: stats["skipped"] += 1
 
-            with db.job_run("local_poll") as run:
-                run.detail = (
-                    f"routes_ok={ping_stats['routes_ok']} "
-                    f"routes_failed={ping_stats['routes_failed']} "
-                    f"pings={ping_stats['pings']}"
-                )
+            if now - last_gbl >= GBL_INTERVAL:
+                last_gbl = now
+                for rc in route_codes:
+                    try: loc_q.put_nowait(rc)
+                    except queue.Full: pass
 
-            conn.close()
+            if time.time() - last_log >= LOG_EVERY_SECS:
+                log.info("two-speed: passages=%d pings=%d skipped=%d  queue(stop=%d loc=%d result=%d)",
+                         stats["passages"], stats["pings"], stats["skipped"],
+                         work_q.qsize(), loc_q.qsize(), result_q.qsize())
+                try:
+                    with db.job_run("local_poll") as run:
+                        run.detail = (f"passages={stats['passages']} pings={stats['pings']} "
+                                      f"skipped={stats['skipped']} qlag={work_q.qsize()}")
+                except Exception:
+                    pass
+                last_log = time.time()
 
-        except Exception as e:
-            log.error("Poll cycle error: %s", e, exc_info=True)
-
-        if time.time() - last_reload > 3600:
-            conn = db.get_connection()
-            route_codes = [r["route_code"] for r in
-                           conn.execute("SELECT route_code FROM routes").fetchall()]
-            terminus_stops = get_terminus_stops(conn)
-            conn.close()
-            last_reload = time.time()
-            log.info("Reloaded: %d routes, %d terminus stops",
-                     len(route_codes), len(terminus_stops))
-
-        elapsed = time.time() - cycle_start
-        sleep   = max(0, POLL_INTERVAL_SECS - elapsed)
-        log.info("Cycle done in %.1fs. Sleeping %.1fs.", elapsed, sleep)
-        time.sleep(sleep)
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        log.info("Stopping (Ctrl-C). Flushing…")
+        stop_event.set()
+        writer.join(timeout=10)
 
 
 if __name__ == "__main__":
