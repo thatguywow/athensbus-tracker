@@ -39,10 +39,9 @@ logging.basicConfig(
 log = logging.getLogger("local_poller")
 
 POLL_INTERVAL_SECS = 300   # 5 minutes
-MAX_WORKERS        = 16    # getBusLocation (712 routes — original, always worked at 16)
-STOP_MAX_WORKERS   = 6     # getStopArrivals — low concurrency like fragkakis, avoids 403
+MAX_WORKERS        = 16    # getBusLocation (712 routes)
+STOP_MAX_WORKERS   = 6     # getStopArrivals — low concurrency, avoids 403
 STOP_BATCH_SIZE    = 150   # spread stop polls in chunks across the cycle
-
 
 CHECKPOINT_DEPTH = 2   # track first K and last K stops per route
 
@@ -226,7 +225,6 @@ def main():
     db.ensure_schema()
     log.info("Local poller started. Polling every %ds.", POLL_INTERVAL_SECS)
 
-    # Load route list and terminus stops
     conn = db.get_connection()
     route_codes = [r["route_code"] for r in
                    conn.execute("SELECT route_code FROM routes").fetchall()]
@@ -241,7 +239,6 @@ def main():
 
     last_reload = time.time()
     # In-memory previous predictions per stop (for disappearance detection).
-    # Lives only in this long-running process → zero storage/git overhead.
     prev_arrival_state: dict = {}
 
     while True:
@@ -251,19 +248,16 @@ def main():
         try:
             conn = db.get_connection()
 
-            # Poll vehicle positions
             ping_stats = collect_and_store_pings(conn, route_codes, polled_at)
             log.info("Pings: routes_ok=%d routes_failed=%d pings=%d",
                      ping_stats["routes_ok"], ping_stats["routes_failed"],
                      ping_stats["pings"])
 
-            # Poll endpoint arrivals → disappearance detection for exact times
             if terminus_stops:
                 term_stats = collect_and_store_terminus(
                     conn, terminus_stops, polled_at, prev_arrival_state)
                 log.info("Exact stop passages detected: %d", term_stats["passages"])
 
-            # Log to job_runs for pipeline health visibility
             with db.job_run("local_poll") as run:
                 run.detail = (
                     f"routes_ok={ping_stats['routes_ok']} "
@@ -276,7 +270,6 @@ def main():
         except Exception as e:
             log.error("Poll cycle error: %s", e, exc_info=True)
 
-        # Reload route list every hour in case master data was synced
         if time.time() - last_reload > 3600:
             conn = db.get_connection()
             route_codes = [r["route_code"] for r in

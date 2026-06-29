@@ -39,7 +39,13 @@ def _request(act: str, params: dict[str, str] | None = None,
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = requests.post(BASE_URL, params=query, timeout=timeout)
+            # GET is the native method for the telematics API and is far more
+            # reliable than POST for getStopArrivals (confirmed empirically + it
+            # is what fragkakis uses). A browser User-Agent avoids UA-based blocks.
+            resp = requests.get(
+                BASE_URL, params=query, timeout=timeout,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
             # 404 = no buses/arrivals for this route/stop right now (common at night).
             # Treat as a valid empty result, not an error — and don't retry.
             if resp.status_code == 404:
