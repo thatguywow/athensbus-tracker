@@ -31,7 +31,12 @@ from __future__ import annotations
 import logging
 import math
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
+try:
+    from zoneinfo import ZoneInfo
+    _ATHENS = ZoneInfo("Europe/Athens")
+except Exception:
+    _ATHENS = None
 
 import db
 
@@ -613,12 +618,22 @@ def reconstruct_route_day(conn, route_code: str, service_date: str,
         conn.execute("DELETE FROM trips WHERE route_code=? AND service_date=?",
                      (route_code, service_date))
 
-    start_bound = f"{service_date}T00:00:00"
-    end_bound   = f"{service_date}T23:59:59.999999"
+    # The service_date is an Athens calendar day, but ts_utc is stored in UTC.
+    # Convert the Athens day [00:00, next 00:00) to its UTC window, so night
+    # buses (e.g. 01:00 Athens = 22:00 UTC the previous day) are included.
+    if _ATHENS is not None:
+        d = date.fromisoformat(service_date)
+        start_local = datetime(d.year, d.month, d.day, tzinfo=_ATHENS)
+        end_local   = start_local + timedelta(days=1)
+        start_bound = start_local.astimezone(timezone.utc).isoformat()
+        end_bound   = end_local.astimezone(timezone.utc).isoformat()
+    else:
+        start_bound = f"{service_date}T00:00:00"
+        end_bound   = f"{service_date}T23:59:59.999999"
 
     ping_rows = conn.execute("""
         SELECT vehicle_no, lat, lng, ts_utc FROM vehicle_pings
-        WHERE route_code=? AND ts_utc>=? AND ts_utc<=?
+        WHERE route_code=? AND ts_utc>=? AND ts_utc<?
         ORDER BY vehicle_no, ts_utc
     """, (route_code, start_bound, end_bound)).fetchall()
 
