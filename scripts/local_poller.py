@@ -39,9 +39,9 @@ logging.basicConfig(
 log = logging.getLogger("local_poller")
 
 POLL_INTERVAL_SECS = 300   # 5 minutes
-MAX_WORKERS        = 16    # getBusLocation (712 routes)
-STOP_MAX_WORKERS   = 6     # getStopArrivals — low concurrency, avoids 403
-STOP_BATCH_SIZE    = 150   # spread stop polls in chunks across the cycle
+MAX_WORKERS        = 8     # getBusLocation — gentler burst so it doesn't spike the rate budget
+STOP_MAX_WORKERS   = 4     # getStopArrivals concurrency (low)
+STOP_RATE_PER_SEC  = 8     # getStopArrivals steady rate (req/sec) — stays under the IP limit
 
 CHECKPOINT_DEPTH = 2   # track first K and last K stops per route
 
@@ -139,15 +139,23 @@ def collect_and_store_terminus(conn, terminus_stops: list[dict],
     adds zero git/storage overhead.
     """
     stop_codes = list({s["stop_code"] for s in terminus_stops})
-    # Spread the polls: small chunks at low concurrency, brief pause between —
-    # mirrors fragkakis (never bursts), which is what avoids the 403 rate-limit.
+    # Spread getStopArrivals EVENLY at a steady low rate (fragkakis technique).
+    # The 403s are a per-IP request-rate limit: bursting all stops trips it, but
+    # a steady ~STOP_RATE_PER_SEC requests/sec stays under it. We process tiny
+    # chunks and sleep to hold the target rate — never bursting.
     ok_map: dict = {}
-    for i in range(0, len(stop_codes), STOP_BATCH_SIZE):
-        chunk = stop_codes[i:i + STOP_BATCH_SIZE]
+    poll_time: dict[str, str] = {}   # actual poll time per stop (spread over the cycle)
+    chunk_n = max(1, STOP_RATE_PER_SEC)
+    for i in range(0, len(stop_codes), chunk_n):
+        t0 = time.time()
+        chunk = stop_codes[i:i + chunk_n]
+        chunk_iso = oasa.now_utc_iso()
         b = oasa.batch_get_stop_arrivals(chunk, max_workers=STOP_MAX_WORKERS)
         ok_map.update(b.ok)
-        if i + STOP_BATCH_SIZE < len(stop_codes):
-            time.sleep(1.0)
+        for sc in chunk:
+            poll_time[sc] = chunk_iso
+        if i + chunk_n < len(stop_codes):
+            time.sleep(max(0.0, 1.0 - (time.time() - t0)))  # hold ~1 chunk/sec
 
     class _B:  # adapt to the existing .ok interface below
         ok = ok_map
@@ -158,11 +166,14 @@ def collect_and_store_terminus(conn, terminus_stops: list[dict],
         stop_meta.setdefault(s["stop_code"], []).append(
             (s["route_code"], s["stop_type"], s["stop_order"]))
 
-    now_dt = datetime.fromisoformat(polled_at)
     n_passages = 0
 
     for stop_code in stop_codes:
         arrivals = batch.ok.get(stop_code) or []
+        # Actual time THIS stop was polled (spread across the cycle), not the
+        # cycle start — keeps pass times accurate despite the spreading.
+        stop_now_iso = poll_time.get(stop_code, polled_at)
+        now_dt = datetime.fromisoformat(stop_now_iso)
 
         current = {}
         for a in arrivals:
@@ -202,12 +213,12 @@ def collect_and_store_terminus(conn, terminus_stops: list[dict],
                                      vehicle_no, passed_at, service_date, recorded_at)
                                 VALUES (?,?,?,?,?,?,?,?)
                             """, (route_code, stop_code, stop_type, stop_order,
-                                  veh, pass_iso, service_date, polled_at))
+                                  veh, pass_iso, service_date, stop_now_iso))
                             n_passages += 1
                         except Exception:
                             pass
 
-        prev_state[stop_code] = {"polled_at": polled_at, "vehicles": current}
+        prev_state[stop_code] = {"polled_at": stop_now_iso, "vehicles": current}
 
     conn.commit()
     return {"passages": n_passages}
