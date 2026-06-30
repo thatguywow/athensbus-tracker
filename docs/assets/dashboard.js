@@ -172,18 +172,19 @@ function renderVehicles(data, filter){
 
 // ── line selectors (shared logic) ──────────────────────────────────────────
 function buildLineSelectors(sched, kart){
-  // Schedule distribution lines
+  // Group by the public line label (line_id), not the internal line_code —
+  // OASA has several internal codes per public line, which produced duplicate
+  // "Γραμμή X97" entries. One entry per label; selection filters by label.
   const schedLines={};
-  (sched.trips||[]).forEach(t=>{ if(t.line_code) schedLines[t.line_code]=t.line_id||t.line_code; });
-  buildSelect("sched-line-select", schedLines, lc=>{
-    populateRouteSelect("sched-route-select", lc, sched.trips||[], rc=>renderScheduleTable(rc));
+  (sched.trips||[]).forEach(t=>{ const id=t.line_id||t.line_code; if(id) schedLines[id]=id; });
+  buildSelect("sched-line-select", schedLines, id=>{
+    populateRouteSelect("sched-route-select", id, sched.trips||[], rc=>renderScheduleTable(rc));
   });
 
-  // Kartelakia lines
   const kartLines={};
-  (kart.slots||[]).forEach(t=>{ if(t.line_code) kartLines[t.line_code]=t.line_id||t.line_code; });
-  buildSelect("kart-line-select", kartLines, lc=>{
-    populateRouteSelect("kart-route-select", lc, kart.slots||[], rc=>renderKartelakiaTable(rc));
+  (kart.slots||[]).forEach(t=>{ const id=t.line_id||t.line_code; if(id) kartLines[id]=id; });
+  buildSelect("kart-line-select", kartLines, id=>{
+    populateRouteSelect("kart-route-select", id, kart.slots||[], rc=>renderKartelakiaTable(rc));
   });
 }
 
@@ -191,7 +192,10 @@ function buildSelect(id, linesMap, onLineSelect){
   const sel = document.getElementById(id);
   sel.innerHTML='<option value="">— Γραμμή —</option>';
   Object.entries(linesMap)
-    .sort((a,b)=>a[1].localeCompare(b[1],undefined,{numeric:true}))
+    // Ascending by first character then the rest (lexicographic), so numbers
+    // group by leading digit (1, 10, 11, 140, 2, 21…) and letters sort
+    // alphabetically. Locale-aware for Greek labels.
+    .sort((a,b)=>a[1].localeCompare(b[1],"el"))
     .forEach(([code,lbl])=>{
       const o=document.createElement("option");
       o.value=code; o.textContent="Γραμμή "+lbl;
@@ -200,11 +204,11 @@ function buildSelect(id, linesMap, onLineSelect){
   sel.onchange=e=>{ if(e.target.value) onLineSelect(e.target.value); };
 }
 
-function populateRouteSelect(id, lineCode, trips, onRouteSelect){
+function populateRouteSelect(id, lineId, trips, onRouteSelect){
   const sel=document.getElementById(id);
   sel.innerHTML='<option value="">— Διαδρομή —</option>';
   const routes={};
-  trips.filter(t=>t.line_code===lineCode).forEach(t=>{
+  trips.filter(t=>(t.line_id||t.line_code)===lineId).forEach(t=>{
     if(!routes[t.route_code])
       routes[t.route_code]={label:(t.route_name||t.route_code)+" ("+t.direction+")",
                             dir:t.direction};
@@ -225,12 +229,20 @@ function populateRouteSelect(id, lineCode, trips, onRouteSelect){
   if(sel.options.length>1){ sel.selectedIndex=1; onRouteSelect(sel.options[1].value); }
 }
 
+// Sort key for a "HH:MM:SS" departure: night buses after midnight (00:00–03:59)
+// belong at the END of the service day, so treat hours < 4 as +24h.
+function depSortKey(s){
+  if(!s) return 1e9;
+  const p=s.split(":"); const h=+p[0]||0; const m=+p[1]||0;
+  return ((h<4?h+24:h)*60+m);
+}
+
 // ── schedule distribution ──────────────────────────────────────────────────
 function renderScheduleTable(routeCode){
   const wrap = document.getElementById("schedule-table-wrap");
   const trips = (schedData&&schedData.trips||[])
     .filter(t=>t.route_code===routeCode)
-    .sort((a,b)=>(a.scheduled_dep||"").localeCompare(b.scheduled_dep||""));
+    .sort((a,b)=>depSortKey(a.scheduled_dep)-depSortKey(b.scheduled_dep));
 
   if(!trips.length){
     wrap.innerHTML='<div class="empty-state">Δεν υπάρχουν δεδομένα.</div>'; return;
@@ -270,7 +282,7 @@ function renderKartelakiaTable(routeCode){
   const wrap=document.getElementById("kartelakia-wrap");
   const slots=(kartData&&kartData.slots||[])
     .filter(t=>t.route_code===routeCode)
-    .sort((a,b)=>(a.scheduled_dep||"").localeCompare(b.scheduled_dep||""));
+    .sort((a,b)=>depSortKey(a.scheduled_dep)-depSortKey(b.scheduled_dep));
 
   if(!slots.length){
     wrap.innerHTML='<div class="empty-state">Δεν υπάρχουν δεδομένα.</div>'; return;

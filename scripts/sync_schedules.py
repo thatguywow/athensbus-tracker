@@ -19,8 +19,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("sync_schedules")
 
 # Valid service window — anything outside this is an OASA data artifact
-SERVICE_START = time(4, 0)   # 04:00
-SERVICE_END   = time(23, 59) # 23:59
+SERVICE_START = time(0, 0)        # accept the whole service day…
+SERVICE_END   = time(23, 59, 59)  # …including after-midnight night buses (00:00–03:59)
 
 
 def is_valid_departure(t_str: str) -> bool:
