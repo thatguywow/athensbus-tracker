@@ -42,22 +42,20 @@ logging.basicConfig(
 log = logging.getLogger("local_poller")
 
 # ── Two-speed spread poller ─────────────────────────────────────────────────
-# Edge stops (first/last EDGE_DEPTH of each route) are polled densely so we
-# catch fast early/late passages and get accurate departure/arrival. Middle
-# stops (optional) are spread thinly over MIDDLE_WINDOW. A global rate cap keeps
-# us under the IP request limit; the spread means we never burst.
+# Edge stops (first/last EDGE_DEPTH of each route) are polled round-robin as
+# fast as TARGET_RATE allows, so each is polled every (num_stops / TARGET_RATE)
+# seconds. The feeder self-paces to worker throughput — the queue never backs
+# up. TARGET_RATE is the single knob: raise for denser polling (more accuracy)
+# if you see no 403s, lower it if 403s are heavy.
 EDGE_DEPTH      = 3      # first/last K stops per route (where accuracy matters)
-EDGE_INTERVAL   = 90     # target seconds between polls of each edge stop
-ENABLE_MIDDLE   = False  # poll middle stops too (fragkakis-style); off until needed
-MIDDLE_WINDOW   = 300    # seconds between polls of each middle stop
-TARGET_RATE     = 10     # max getStopArrivals/sec (safety cap) — raise if no 403s
+ENABLE_MIDDLE   = False  # also poll middle stops (fragkakis-style); off until needed
+TARGET_RATE     = 10     # max total requests/sec (stops + locations) — the main knob
 STOP_WORKERS    = 8      # getStopArrivals fetch threads
-LOC_WORKERS     = 8      # getBusLocation fetch threads
+LOC_WORKERS     = 6      # getBusLocation fetch threads
 GBL_INTERVAL    = 300    # getBusLocation sweep every N seconds (GPS pings)
 DISAPPEAR_GUARD_MINS = 10
 COMMIT_EVERY_SECS    = 2.0
 LOG_EVERY_SECS       = 60
-WORK_Q_MAX           = 20000
 
 CHECKPOINT_DEPTH = EDGE_DEPTH   # get_terminus_stops uses this
 
@@ -140,13 +138,22 @@ def build_stop_meta(stops: list[dict]) -> dict:
     return dict(meta)
 
 
-def build_buckets(stop_codes: list[str], window: int) -> dict[int, list[str]]:
-    """Spread stop codes evenly across `window` one-second slots."""
-    buckets: dict[int, list[str]] = defaultdict(list)
-    n = max(1, len(stop_codes))
-    for i, sc in enumerate(stop_codes):
-        buckets[(i * window) // n % window].append(sc)
-    return dict(buckets)
+def _feeder(cycle_stops: list[str], work_q: queue.Queue, stop_event: threading.Event):
+    """
+    Round-robin feed: hand the next stop to the workers, blocking when the small
+    work queue is full. This makes the poll rate self-pace to actual worker
+    throughput — the queue never backs up, and each stop is polled every
+    (len(cycle_stops) / effective_rate) seconds, automatically.
+    """
+    if not cycle_stops:
+        return
+    i, n = 0, len(cycle_stops)
+    while not stop_event.is_set():
+        try:
+            work_q.put(cycle_stops[i % n], timeout=1.0)
+            i += 1
+        except queue.Full:
+            continue
 
 
 class RateLimiter:
@@ -198,13 +205,14 @@ def _stop_worker(work_q, result_q, limiter, stop_event):
             work_q.task_done()
 
 
-def _loc_worker(loc_q, result_q, stop_event):
+def _loc_worker(loc_q, result_q, limiter, stop_event):
     while not stop_event.is_set():
         try:
             route_code = loc_q.get(timeout=1.0)
         except queue.Empty:
             continue
         try:
+            limiter.acquire()                       # shares the global rate budget
             poll_iso = oasa.now_utc_iso()
             data = oasa.get_bus_location(route_code) or []
             result_q.put(("location", route_code, data, poll_iso))
@@ -314,55 +322,45 @@ def main():
     stop_meta = build_stop_meta(edges + middles)
     edge_codes = sorted({s["stop_code"] for s in edges})
     middle_codes = sorted({s["stop_code"] for s in middles}) if ENABLE_MIDDLE else []
-    edge_buckets = build_buckets(edge_codes, EDGE_INTERVAL)
-    middle_buckets = build_buckets(middle_codes, MIDDLE_WINDOW) if ENABLE_MIDDLE else {}
+    cycle_stops = edge_codes + middle_codes   # round-robin set
 
-    implied_rate = len(edge_codes) / max(1, EDGE_INTERVAL)
-    log.info("Two-speed poller: %d routes | %d edge stops (every %ds → ~%.1f/s) | "
-             "%d middle stops | rate cap %d/s",
-             len(route_codes), len(edge_codes), EDGE_INTERVAL, implied_rate,
-             len(middle_codes), TARGET_RATE)
-    if implied_rate > TARGET_RATE:
-        log.warning("Edge demand ~%.1f/s exceeds cap %d/s → edges will poll slower "
-                    "than %ds. Raise TARGET_RATE if no 403s, or raise EDGE_INTERVAL.",
-                    implied_rate, TARGET_RATE, EDGE_INTERVAL)
+    interval = len(cycle_stops) / max(1, TARGET_RATE)   # emergent per-stop interval
+    log.info("Two-speed poller: %d routes | %d edge + %d middle stops | "
+             "rate cap %d/s → each stop polled ~every %.0fs",
+             len(route_codes), len(edge_codes), len(middle_codes), TARGET_RATE, interval)
+    if interval > DISAPPEAR_GUARD_MINS * 60:
+        log.warning("Stops poll every ~%.0fs > %dmin guard → passages may be missed. "
+                    "Raise TARGET_RATE or lower EDGE_DEPTH.", interval, DISAPPEAR_GUARD_MINS)
 
-    work_q = queue.Queue(maxsize=WORK_Q_MAX)
+    # Small bounded queue → feeder self-paces to worker throughput (no backup)
+    work_q = queue.Queue(maxsize=STOP_WORKERS * 4)
     loc_q = queue.Queue(maxsize=5000)
     result_q = queue.Queue(maxsize=50000)
-    limiter = RateLimiter(TARGET_RATE)
+    limiter = RateLimiter(TARGET_RATE)               # global cap (stops + locations)
     stats = {"passages": 0, "pings": 0, "skipped": 0}
     stop_event = threading.Event()
 
-    threads = []
     for _ in range(STOP_WORKERS):
-        t = threading.Thread(target=_stop_worker, args=(work_q, result_q, limiter, stop_event), daemon=True)
-        t.start(); threads.append(t)
+        threading.Thread(target=_stop_worker, args=(work_q, result_q, limiter, stop_event),
+                         daemon=True).start()
     for _ in range(LOC_WORKERS):
-        t = threading.Thread(target=_loc_worker, args=(loc_q, result_q, stop_event), daemon=True)
-        t.start(); threads.append(t)
-    writer = threading.Thread(target=_writer_thread, args=(result_q, stop_meta, stats, stop_event), daemon=True)
+        threading.Thread(target=_loc_worker, args=(loc_q, result_q, limiter, stop_event),
+                         daemon=True).start()
+    threading.Thread(target=_feeder, args=(cycle_stops, work_q, stop_event),
+                     daemon=True).start()
+    writer = threading.Thread(target=_writer_thread,
+                              args=(result_q, stop_meta, stats, stop_event), daemon=True)
     writer.start()
 
     start = time.monotonic()
-    last_sec = -1
     last_gbl = -GBL_INTERVAL
     last_log = time.time()
 
     try:
         while True:
             now = time.monotonic() - start
-            cur = int(now)
-            while last_sec < cur:
-                last_sec += 1
-                for sc in edge_buckets.get(last_sec % EDGE_INTERVAL, []):
-                    try: work_q.put_nowait(sc)
-                    except queue.Full: stats["skipped"] += 1
-                if ENABLE_MIDDLE:
-                    for sc in middle_buckets.get(last_sec % MIDDLE_WINDOW, []):
-                        try: work_q.put_nowait(sc)
-                        except queue.Full: stats["skipped"] += 1
 
+            # getBusLocation sweep (GPS pings) once per GBL_INTERVAL
             if now - last_gbl >= GBL_INTERVAL:
                 last_gbl = now
                 for rc in route_codes:
@@ -370,18 +368,18 @@ def main():
                     except queue.Full: pass
 
             if time.time() - last_log >= LOG_EVERY_SECS:
-                log.info("two-speed: passages=%d pings=%d skipped=%d  queue(stop=%d loc=%d result=%d)",
-                         stats["passages"], stats["pings"], stats["skipped"],
+                log.info("two-speed: passages=%d pings=%d  queue(stop=%d loc=%d result=%d)",
+                         stats["passages"], stats["pings"],
                          work_q.qsize(), loc_q.qsize(), result_q.qsize())
                 try:
                     with db.job_run("local_poll") as run:
                         run.detail = (f"passages={stats['passages']} pings={stats['pings']} "
-                                      f"skipped={stats['skipped']} qlag={work_q.qsize()}")
+                                      f"qlag={work_q.qsize()}")
                 except Exception:
                     pass
                 last_log = time.time()
 
-            time.sleep(0.05)
+            time.sleep(0.1)
     except KeyboardInterrupt:
         log.info("Stopping (Ctrl-C). Flushing…")
         stop_event.set()
