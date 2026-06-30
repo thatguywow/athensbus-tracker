@@ -11,7 +11,7 @@ import sys
 from datetime import date, timedelta, datetime, timezone
 
 import db
-from trip_reconstruction import reconstruct_route_day
+from trip_reconstruction_passages import reconstruct_route_day_from_passages as reconstruct_route_day
 from rotation_slots import compute_all_slots
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

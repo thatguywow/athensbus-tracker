@@ -51,8 +51,6 @@ EDGE_DEPTH      = 3      # first/last K stops per route (where accuracy matters)
 ENABLE_MIDDLE   = False  # also poll middle stops (fragkakis-style); off until needed
 TARGET_RATE     = 10     # max total requests/sec (stops + locations) — the main knob
 STOP_WORKERS    = 8      # getStopArrivals fetch threads
-LOC_WORKERS     = 6      # getBusLocation fetch threads
-GBL_INTERVAL    = 300    # getBusLocation sweep every N seconds (GPS pings)
 DISAPPEAR_GUARD_MINS = 10
 COMMIT_EVERY_SECS    = 2.0
 LOG_EVERY_SECS       = 60
@@ -205,22 +203,6 @@ def _stop_worker(work_q, result_q, limiter, stop_event):
             work_q.task_done()
 
 
-def _loc_worker(loc_q, result_q, limiter, stop_event):
-    while not stop_event.is_set():
-        try:
-            route_code = loc_q.get(timeout=1.0)
-        except queue.Empty:
-            continue
-        try:
-            limiter.acquire()                       # shares the global rate budget
-            poll_iso = oasa.now_utc_iso()
-            data = oasa.get_bus_location(route_code) or []
-            result_q.put(("location", route_code, data, poll_iso))
-        except Exception:
-            pass
-        finally:
-            loc_q.task_done()
-
 
 def _writer_thread(result_q, stop_meta, stats, stop_event):
     conn = db.get_connection()
@@ -270,19 +252,6 @@ def _writer_thread(result_q, stop_meta, stats, stop_event):
                                 except Exception:
                                     pass
                 prev[stop_code] = {"polled_at": poll_iso, "vehicles": current}
-            else:
-                _, route_code, vehicles, poll_iso = item
-                for v in (vehicles or []):
-                    try:
-                        conn.execute("""
-                            INSERT OR IGNORE INTO vehicle_pings
-                                (route_code, vehicle_no, lat, lng, ts_utc, polled_at)
-                            VALUES (?,?,?,?,?,?)
-                        """, (route_code, str(v["VEH_NO"]), float(v["CS_LAT"]),
-                              float(v["CS_LNG"]), oasa.parse_oasa_date(v["CS_DATE"]), poll_iso))
-                        stats["pings"] += 1
-                    except (KeyError, ValueError, TypeError):
-                        pass
         except Exception as e:
             log.error("writer error: %s", e)
         finally:
@@ -334,17 +303,13 @@ def main():
 
     # Small bounded queue → feeder self-paces to worker throughput (no backup)
     work_q = queue.Queue(maxsize=STOP_WORKERS * 4)
-    loc_q = queue.Queue(maxsize=5000)
     result_q = queue.Queue(maxsize=50000)
-    limiter = RateLimiter(TARGET_RATE)               # global cap (stops + locations)
+    limiter = RateLimiter(TARGET_RATE)               # full budget goes to stops now
     stats = {"passages": 0, "pings": 0, "skipped": 0}
     stop_event = threading.Event()
 
     for _ in range(STOP_WORKERS):
         threading.Thread(target=_stop_worker, args=(work_q, result_q, limiter, stop_event),
-                         daemon=True).start()
-    for _ in range(LOC_WORKERS):
-        threading.Thread(target=_loc_worker, args=(loc_q, result_q, limiter, stop_event),
                          daemon=True).start()
     threading.Thread(target=_feeder, args=(cycle_stops, work_q, stop_event),
                      daemon=True).start()
@@ -352,33 +317,19 @@ def main():
                               args=(result_q, stop_meta, stats, stop_event), daemon=True)
     writer.start()
 
-    start = time.monotonic()
-    last_gbl = -GBL_INTERVAL
     last_log = time.time()
 
     try:
         while True:
-            now = time.monotonic() - start
-
-            # getBusLocation sweep (GPS pings) once per GBL_INTERVAL
-            if now - last_gbl >= GBL_INTERVAL:
-                last_gbl = now
-                for rc in route_codes:
-                    try: loc_q.put_nowait(rc)
-                    except queue.Full: pass
-
             if time.time() - last_log >= LOG_EVERY_SECS:
-                log.info("two-speed: passages=%d pings=%d  queue(stop=%d loc=%d result=%d)",
-                         stats["passages"], stats["pings"],
-                         work_q.qsize(), loc_q.qsize(), result_q.qsize())
+                log.info("two-speed: passages=%d  queue(stop=%d result=%d)",
+                         stats["passages"], work_q.qsize(), result_q.qsize())
                 try:
                     with db.job_run("local_poll") as run:
-                        run.detail = (f"passages={stats['passages']} pings={stats['pings']} "
-                                      f"qlag={work_q.qsize()}")
+                        run.detail = (f"passages={stats['passages']} qlag={work_q.qsize()}")
                 except Exception:
                     pass
                 last_log = time.time()
-
             time.sleep(0.1)
     except KeyboardInterrupt:
         log.info("Stopping (Ctrl-C). Flushing…")

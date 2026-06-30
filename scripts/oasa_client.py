@@ -34,6 +34,16 @@ class OasaApiError(Exception):
 def _request(act: str, params: dict[str, str] | None = None,
              timeout=DEFAULT_TIMEOUT) -> Any:
     """Single request with retries. Returns parsed JSON or raises OasaApiError."""
+def _request(act: str, params: dict[str, str] | None = None,
+             timeout=DEFAULT_TIMEOUT, retry_forbidden: bool = True) -> Any:
+    """
+    Single request with retries. Returns parsed JSON or raises OasaApiError.
+
+    retry_forbidden=False → a 403/429 fails immediately (no retry). Used for the
+    high-volume getStopArrivals: retrying a rate-limit 403 only multiplies the
+    load and keeps the IP blocked, and the round-robin poller re-polls each stop
+    within ~one cycle anyway, so nothing is really lost.
+    """
     query = {"act": act, **(params or {})}
     last_err: Exception | None = None
 
@@ -50,12 +60,22 @@ def _request(act: str, params: dict[str, str] | None = None,
             # Treat as a valid empty result, not an error — and don't retry.
             if resp.status_code == 404:
                 return []
+            # Rate-limit on a high-volume endpoint: fail fast, don't hammer.
+            if resp.status_code in (403, 429) and not retry_forbidden:
+                raise OasaApiError(f"act={act} rate-limited ({resp.status_code})")
             resp.raise_for_status()
             text = resp.text.strip()
             if not text:
                 raise OasaApiError(f"empty response for act={act}")
             return json.loads(text)
-        except (requests.RequestException, json.JSONDecodeError, OasaApiError) as e:
+        except OasaApiError as e:
+            if "rate-limited" in str(e):
+                raise                       # non-retryable by request
+            last_err = e
+            if attempt < MAX_RETRIES:
+                sleep_s = BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
+                time.sleep(sleep_s)
+        except (requests.RequestException, json.JSONDecodeError) as e:
             last_err = e
             if attempt < MAX_RETRIES:
                 sleep_s = BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
@@ -105,7 +125,7 @@ def get_stop_arrivals(stop_code: str) -> list[dict]:
     Each entry has: route_code, vehicle_no, btime2 (mins until arrival),
     route_descr, etc.
     """
-    result = _request("getStopArrivals", {"p1": stop_code})
+    result = _request("getStopArrivals", {"p1": stop_code}, retry_forbidden=False)
     if result is None:
         return []
     return result if isinstance(result, list) else []
