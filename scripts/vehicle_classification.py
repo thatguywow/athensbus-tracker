@@ -31,6 +31,7 @@ DEPOTS = {
 
 # ── Specific-depot ranges (full vehicle number) — checked FIRST ──
 FULL_RANGES = [
+    (6001, 6112, "Neoplan N6014"),          # depot 0 ΡΟΥΦ (06001-06112), trolley
     (10001, 10220, "Solaris 8,6m"),
     (10541, 10729, "N2"),
     (10954, 10954, "N2"),
@@ -41,26 +42,18 @@ FULL_RANGES = [
     (16023, 16023, "Solaris Urbino 12m"),
     (16025, 16029, "MAN 12m leasing 2020"),
     (16094, 16132, "Citaro 12m leasing 2020"),
-    (30600, 30680, "Solaris 8,6m"),
-    (30701, 30981, "Irisbus Agora Diesel 12m"),
+    (30600, 30699, "Solaris 8,6m"),
+    (30701, 30991, "Irisbus Agora Diesel 12m"),
     (40401, 40719, "GN"),
     (40821, 40940, "Solaris Urbino 18m"),
-    (50701, 50981, "Irisbus Agora Diesel 12m"),
+    (50701, 50991, "Irisbus Agora Diesel 12m"),
     (56031, 56087, "Volvo 12m leasing 2020"),
-    (59701, 59981, "Irisbus Agora Diesel 12m"),
+    (59701, 59991, "Irisbus Agora Diesel 12m"),
     (60001, 60220, "Solaris 12m 8,6"),
     (60600, 60680, "Solaris 12m 8,6"),
     (69001, 69200, "Irisbus Citelis CNG 12m"),
     (79001, 79200, "Irisbus Citelis CNG 12m"),
-]
-
-# ── Trolley-only base ranges (base = number WITHOUT first digit) ──
-# These trolley models appear only at trolley depots (ΡΟΥΦ=0, Κόκκινος Μύλος=8).
-# Listed in the fleet file as 06001-06112 and 09001-09051 (the leading 0 was the
-# depot). Kept trolley-only so ΚΤΕΛ (9XXXX) buses aren't misclassified.
-TROLLEY_BASE_RANGES = [
-    (6001, 6112, "Neoplan N6014"),
-    (9001, 9051, "Neoplan n6221"),
+    (89001, 89051, "Neoplan n6221"),         # depot 8 Κόκκινος Μύλος, trolley
 ]
 
 # ── Any-depot ranges (base = vehicle number WITHOUT the first depot digit) ──
@@ -132,9 +125,6 @@ def classify(vehicle_no) -> tuple[str | None, str | None]:
         try:
             base = int(digits[1:])
             vtype = _in_ranges(base, BASE_RANGES)
-            # 3) Trolley-only models, only at trolley depots (ΡΟΥΦ, Κόκκινος Μύλος)
-            if vtype is None and first in TROLLEY_DEPOTS:
-                vtype = _in_ranges(base, TROLLEY_BASE_RANGES)
         except ValueError:
             pass
 
