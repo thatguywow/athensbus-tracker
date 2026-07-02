@@ -125,7 +125,7 @@ def get_stop_arrivals(stop_code: str) -> list[dict]:
     Each entry has: route_code, vehicle_no, btime2 (mins until arrival),
     route_descr, etc.
     """
-    result = _request("getStopArrivals", {"p1": stop_code}, retry_forbidden=False)
+    result = _request("getStopArrivals", {"p1": stop_code}, timeout=5, retry_forbidden=False)
     if result is None:
         return []
     return result if isinstance(result, list) else []

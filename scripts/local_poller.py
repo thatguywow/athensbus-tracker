@@ -49,7 +49,7 @@ log = logging.getLogger("local_poller")
 # if you see no 403s, lower it if 403s are heavy.
 EDGE_DEPTH      = 3      # first/last K stops per route (where accuracy matters)
 ENABLE_MIDDLE   = False  # also poll middle stops (fragkakis-style); off until needed
-TARGET_RATE     = 10     # max total requests/sec (stops + locations) — the main knob
+TARGET_RATE     = 25     # max total requests/sec — the main knob (OASA p99≈0.11s; raise stepwise while 403s stay rare)
 STOP_WORKERS    = 8      # getStopArrivals fetch threads
 DISAPPEAR_GUARD_MINS = 10
 COMMIT_EVERY_SECS    = 2.0
