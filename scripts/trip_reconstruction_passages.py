@@ -37,6 +37,7 @@ except Exception:
 log = logging.getLogger("trip_reconstruction_passages")
 
 TRIP_GAP_MINUTES = 25   # gap between consecutive passages that splits trips
+OVERLAP_HOURS    = 3    # read past the 04:00 day end so 04:00-crossing trips stay whole
 
 
 def _parse(iso: str) -> datetime:
@@ -161,13 +162,21 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
     except Exception:
         pass
 
+    # Read passages in an EXTENDED window: the service day plus a few hours past
+    # its 04:00 end, so a trip that departs before 04:00 but finishes after it
+    # (e.g. dep 03:40 → arr 04:30) is assembled WHOLE. After building trips we
+    # keep only those whose DEPARTURE falls inside the service day — a trip
+    # belongs to the day its shift departed. The next day's reconstruction sees
+    # the same tail passages but drops the trip (departure before its window),
+    # so each trip lands in exactly one day.
     start_bound, end_bound = _athens_window(service_date)
+    query_end = (_parse(end_bound) + timedelta(hours=OVERLAP_HOURS)).isoformat()
     rows = conn.execute("""
         SELECT vehicle_no, stop_code, stop_order, passed_at
         FROM stop_passages
         WHERE route_code=? AND passed_at>=? AND passed_at<?
         ORDER BY vehicle_no, passed_at
-    """, (route_code, start_bound, end_bound)).fetchall()
+    """, (route_code, start_bound, query_end)).fetchall()
 
     by_vehicle: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
@@ -179,7 +188,6 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
     distinct_vehicles = set()
 
     for vehicle_no, plist in by_vehicle.items():
-        distinct_vehicles.add(vehicle_no)
         for trip in _split_trips(plist, route_duration):
             if not trip:
                 continue
@@ -217,6 +225,12 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
             if terminus_dt and terminus_dt <= started_dt:
                 terminus_dt = None
 
+            # ── DAY OWNERSHIP: a trip belongs to the day it DEPARTED ──
+            # Departures outside [day start, day end) belong to the previous/next
+            # service day (their own reconstruction builds them whole there).
+            if not (_parse(start_bound) <= started_dt < _parse(end_bound)):
+                continue
+
             started_at = started_dt.isoformat()
             ended_at = last_dt.isoformat()          # last observed passage (NOT NULL)
             terminus_val = terminus_dt.isoformat() if terminus_dt else None
@@ -231,6 +245,7 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
                   started_at, ended_at, terminus_val, stop_count, computed_at))
             trip_id = cur.lastrowid
             n_trips += 1
+            distinct_vehicles.add(vehicle_no)
 
             for p in trip:
                 conn.execute("""
