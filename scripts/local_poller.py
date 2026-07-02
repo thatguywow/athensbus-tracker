@@ -268,11 +268,9 @@ def _writer_thread(result_q, stop_meta, stats, stop_event):
 
 
 def _athens_date(dt_utc: datetime) -> str:
-    try:
-        from zoneinfo import ZoneInfo
-        return dt_utc.astimezone(ZoneInfo("Europe/Athens")).date().isoformat()
-    except Exception:
-        return dt_utc.date().isoformat()
+    # Service day (04:00→04:00 Athens): passages before 04:00 belong to the
+    # previous day's service — keeps night buses on the day their shift started.
+    return db.athens_service_date(dt_utc)
 
 
 def main():

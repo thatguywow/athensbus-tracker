@@ -71,13 +71,22 @@ def _linfit_predict(points: list[tuple[int, datetime]], x_target: int):
 
 
 def _athens_window(service_date: str) -> tuple[str, str]:
+    """UTC window of one service day: D 04:00 Athens → D+1 04:00 Athens."""
+    start_h = 4
+    try:
+        from db import SERVICE_DAY_START_HOUR as start_h  # single source of truth
+    except Exception:
+        pass
     if _ATHENS is not None:
         d = date.fromisoformat(service_date)
-        start_local = datetime(d.year, d.month, d.day, tzinfo=_ATHENS)
+        start_local = datetime(d.year, d.month, d.day, start_h, 0, tzinfo=_ATHENS)
         end_local = start_local + timedelta(days=1)
         return (start_local.astimezone(timezone.utc).isoformat(),
                 end_local.astimezone(timezone.utc).isoformat())
-    return (f"{service_date}T00:00:00", f"{service_date}T23:59:59.999999")
+    d = date.fromisoformat(service_date)
+    d2 = d + timedelta(days=1)
+    return (f"{d.isoformat()}T{start_h:02d}:00:00",
+            f"{d2.isoformat()}T{start_h:02d}:00:00")
 
 
 def _split_trips(passages: list[dict], route_duration: float | None) -> list[list[dict]]:

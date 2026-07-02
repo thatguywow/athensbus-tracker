@@ -103,6 +103,28 @@ def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ── Service day (μέρα βάρδιας) ────────────────────────────────────────────────
+# The operational day runs 04:00 → 04:00 Athens time: everything before 04:00
+# belongs to the PREVIOUS day's service (night buses, trips finishing after
+# midnight), everything from 04:00 onward to the new day.
+SERVICE_DAY_START_HOUR = 4
+
+
+def athens_service_date(dt_utc: datetime | None = None) -> str:
+    """Service date (YYYY-MM-DD) for a UTC datetime (default: now)."""
+    from datetime import timedelta
+    if dt_utc is None:
+        dt_utc = datetime.now(timezone.utc)
+    if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+    try:
+        from zoneinfo import ZoneInfo
+        local = dt_utc.astimezone(ZoneInfo("Europe/Athens"))
+    except Exception:
+        local = dt_utc
+    return (local - timedelta(hours=SERVICE_DAY_START_HOUR)).date().isoformat()
+
+
 @contextmanager
 def job_run(job_name: str):
     """

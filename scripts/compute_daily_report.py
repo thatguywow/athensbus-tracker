@@ -23,7 +23,9 @@ RETENTION_DAYS = 30
 def target_service_date() -> str:
     if len(sys.argv) > 1:
         return sys.argv[1]
-    return date.today().isoformat()  # always today for live updates
+    # Service day 04:00→04:00 Athens: an hourly run at e.g. 01:00 must keep
+    # computing YESTERDAY's service (night buses still running), not today's.
+    return db.athens_service_date()
 
 
 def count_scheduled(conn, route_code: str, service_date: str) -> int:
