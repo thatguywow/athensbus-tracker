@@ -19,7 +19,8 @@ function fmtTime(iso){
   try{
     const d = new Date(iso);
     if(isNaN(d.getTime())) return iso.substring(11,16)||"—";
-    return d.toLocaleTimeString("el-GR",{hour:"2-digit",minute:"2-digit"});
+    // 24-hour clock, same style as the scheduled times (11:00, 23:00)
+    return d.toLocaleTimeString("el-GR",{hour:"2-digit",minute:"2-digit",hour12:false});
   }catch(e){ return "—"; }
 }
 function fmtDur(a,b){
@@ -131,6 +132,39 @@ function renderSummary(d){
 }
 
 // ── vehicles ───────────────────────────────────────────────────────────────
+function exportVehiclesXlsx(){
+  if(!vehicleData || !(vehicleData.vehicles||[]).length){ return; }
+  // One row per vehicle: A = vehicle number, B = its lines comma-joined
+  // e.g.  21115 | X96, X93   (never duplicate rows per line)
+  const byVeh = {};
+  (vehicleData.vehicles||[]).forEach(v=>{
+    const veh = v.vehicle_no; if(!veh) return;
+    const line = v.line_id || v.line_code || "";
+    if(!byVeh[veh]) byVeh[veh] = new Set();
+    if(line) byVeh[veh].add(line);
+  });
+  const rows = Object.keys(byVeh)
+    .sort((a,b)=>parseInt(a)-parseInt(b))
+    .map(veh=>[veh, Array.from(byVeh[veh]).sort((a,b)=>a.localeCompare(b,"el")).join(", ")]);
+  const base = `oximata_${currentDate||"export"}`;
+
+  if(typeof XLSX !== "undefined"){
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    ws["!cols"] = [{wch:10},{wch:24}];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Οχήματα");
+    XLSX.writeFile(wb, base+".xlsx");
+    return;
+  }
+  // Fallback (CDN unavailable): CSV with UTF-8 BOM — opens directly in Excel
+  const csv = "\uFEFF" + rows.map(r=>`${r[0]};"${r[1]}"`).join("\r\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([csv],{type:"text/csv;charset=utf-8"}));
+  a.download = base+".csv";
+  document.body.appendChild(a); a.click();
+  setTimeout(()=>{URL.revokeObjectURL(a.href); a.remove();},500);
+}
+
 function renderVehicles(data, filter){
   const wrap = document.getElementById("vehicle-table-wrap");
   let rows = (data&&data.vehicles)||[];
@@ -163,7 +197,7 @@ function renderVehicles(data, filter){
   deduped.forEach(v=>{
     html+='<tr>'+
       '<td><span class="veh-no">'+v.vehicle_no+'</span></td>'+
-      '<td class="mono">'+(v.line_id||v.line_code||"—")+'</td>'+
+      '<td><span class="line-tag">'+(v.line_id||v.line_code||"—")+'</span></td>'+
       '<td>'+(v.route_name||"")+'</td>'+
       '</tr>';
   });
@@ -334,6 +368,7 @@ function renderHealth(data){
 document.getElementById("veh-search").addEventListener("input",e=>{
   if(vehicleData) renderVehicles(vehicleData, e.target.value);
 });
+document.getElementById("veh-export").addEventListener("click", exportVehiclesXlsx);
 document.getElementById("cmp-search").addEventListener("input",e=>{
   if(schedData) renderComparison(schedData, e.target.value);
 });
