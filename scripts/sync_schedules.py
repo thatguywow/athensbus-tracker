@@ -23,6 +23,24 @@ SERVICE_START = time(0, 0)        # accept the whole service day…
 SERVICE_END   = time(23, 59, 59)  # …including after-midnight night buses (00:00–03:59)
 
 
+def _dep_key(t_str: str) -> int:
+    """Minutes within the service day: hours < 04 (night buses) sort at the END."""
+    h, m = int(t_str[:2]), int(t_str[3:5])
+    if h < 4:
+        h += 24
+    return h * 60 + m
+
+
+def _now_key() -> int:
+    """Current Athens time as a service-day key (comparable with _dep_key)."""
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("Europe/Athens"))
+    except Exception:
+        now = datetime.now()
+    return _dep_key(now.strftime("%H:%M"))
+
+
 def is_valid_departure(t_str: str) -> bool:
     """Accept only clean HH:MM:SS times within the service window."""
     try:
@@ -186,19 +204,40 @@ def main():
                     entries = sched.get(direction_key) or []
                     times = extract_departure_times(entries, direction_key)
 
-                    # Clear today's existing rows for this route so a re-sync
-                    # produces a clean schedule (no stale duplicates).
-                    conn.execute(
-                        "DELETE FROM scheduled_trips WHERE route_code=? AND schedule_date=?",
-                        (route["route_code"], today)
-                    )
+                    existing = [r["departure_time"] for r in conn.execute(
+                        "SELECT departure_time FROM scheduled_trips "
+                        "WHERE route_code=? AND schedule_date=?",
+                        (route["route_code"], today)).fetchall()]
+
+                    if existing:
+                        # FREEZE-MERGE re-sync: times that have already passed
+                        # (service-day clock) are history — they stay exactly as
+                        # first recorded, even if OASA's feed no longer lists
+                        # them. Only FUTURE times follow the new schedule: stale
+                        # future rows are removed and replaced by the feed's
+                        # current future times. Silent, no change markers.
+                        nk = _now_key()
+                        for t in existing:
+                            if _dep_key(t) > nk:
+                                conn.execute(
+                                    "DELETE FROM scheduled_trips WHERE route_code=? "
+                                    "AND schedule_date=? AND departure_time=?",
+                                    (route["route_code"], today, t))
+                        frozen = {t for t in existing if _dep_key(t) <= nk}
+                    else:
+                        # First sync of the day: take the full schedule as the
+                        # baseline, past hours included.
+                        nk = None
+                        frozen = set()
 
                     # Deduplicate by departure_time — OASA sometimes returns the
                     # same departure twice with different sdd_codes (08:25, 08:25).
-                    seen_times = set()
+                    seen_times = set(frozen)
                     for sdd_code, dep_time in times:
                         if dep_time in seen_times:
                             continue
+                        if nk is not None and _dep_key(dep_time) <= nk:
+                            continue   # newly-appeared PAST time → don't rewrite history
                         seen_times.add(dep_time)
                         conn.execute(
                             """
