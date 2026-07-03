@@ -38,6 +38,7 @@ log = logging.getLogger("trip_reconstruction_passages")
 
 TRIP_GAP_MINUTES = 25   # gap between consecutive passages that splits trips
 OVERLAP_HOURS    = 3    # read past the 04:00 day end so 04:00-crossing trips stay whole
+MIN_DURATION_FRACTION = 0.3   # arrival implying < 30% of typical duration → incomplete
 
 
 def _parse(iso: str) -> datetime:
@@ -224,6 +225,16 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
             # guard: arrival must be after departure
             if terminus_dt and terminus_dt <= started_dt:
                 terminus_dt = None
+
+            # sanity net (subordinate to real data): an arrival implying a trip
+            # far shorter than physically possible (< MIN_DURATION_FRACTION of
+            # the route's typical duration) is a withdrawal artifact — the
+            # vehicle vanished and its terminus prediction was misread as a
+            # passage. Mark incomplete ("—") instead of showing a fake Λήξη.
+            if terminus_dt and route_duration:
+                dur_mins = (terminus_dt - started_dt).total_seconds() / 60
+                if dur_mins < MIN_DURATION_FRACTION * route_duration:
+                    terminus_dt = None
 
             # ── DAY OWNERSHIP: a trip belongs to the day it DEPARTED ──
             # Departures outside [day start, day end) belong to the previous/next

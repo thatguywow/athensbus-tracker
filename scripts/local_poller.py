@@ -52,6 +52,9 @@ ENABLE_MIDDLE   = False  # also poll middle stops (fragkakis-style); off until n
 TARGET_RATE     = 25     # max total requests/sec — the main knob (OASA p99≈0.11s; raise stepwise while 403s stay rare)
 STOP_WORKERS    = 8      # getStopArrivals fetch threads
 DISAPPEAR_GUARD_MINS = 10
+PASS_TRUST_MINS      = 5     # a disappearance counts as a passage only if the
+                             # vehicle was ≤ this close (btime2) when last seen;
+                             # further away = withdrawn/cancelled, not passed
 COMMIT_EVERY_SECS    = 2.0
 LOG_EVERY_SECS       = 60
 
@@ -236,6 +239,11 @@ def _writer_thread(result_q, stop_meta, stats, stop_event):
             for veh, info in pending.items():
                 if veh in current:
                     continue            # reappeared → glitch, drop
+                if info["btime2"] > PASS_TRUST_MINS:
+                    continue            # was far away when last seen → withdrawn,
+                                        # not passed (e.g. pulled from service);
+                                        # a truly approaching vehicle is re-seen
+                                        # every cycle with shrinking btime2
                 seen_dt = datetime.fromisoformat(info["seen_at"])
                 if (now_dt - seen_dt).total_seconds() / 60 > DISAPPEAR_GUARD_MINS:
                     continue            # too stale to trust
