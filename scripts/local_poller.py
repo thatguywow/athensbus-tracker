@@ -155,10 +155,17 @@ def _feeder(cycle_stops: list[str], work_q: queue.Queue, stop_event: threading.E
 
 
 class RateLimiter:
-    """Token bucket: at most `rate` acquisitions per second across all threads."""
+    """
+    Token bucket: at most `rate` acquisitions per second across all threads.
+    The bucket is capped at BURST_CAP tokens so a brief stall can't be followed
+    by a burst of `rate` simultaneous requests (OASA is burst-sensitive).
+    """
+    BURST_CAP = 5.0
+
     def __init__(self, rate: float):
         self.rate = float(rate)
-        self.allowance = float(rate)
+        self.cap = min(self.rate, self.BURST_CAP)
+        self.allowance = self.cap
         self.last = time.monotonic()
         self.lock = threading.Lock()
 
@@ -168,8 +175,8 @@ class RateLimiter:
                 now = time.monotonic()
                 self.allowance += (now - self.last) * self.rate
                 self.last = now
-                if self.allowance > self.rate:
-                    self.allowance = self.rate
+                if self.allowance > self.cap:
+                    self.allowance = self.cap
                 if self.allowance >= 1.0:
                     self.allowance -= 1.0
                     return
@@ -210,55 +217,86 @@ def _writer_thread(result_q, stop_meta, stats, stop_event):
         conn.execute("PRAGMA busy_timeout=5000")
     except Exception:
         pass
+    # per stop: last poll state + disappearances awaiting confirmation.
+    # A vehicle must be missing from TWO consecutive polls before we record the
+    # passage — a single miss is often an API glitch (vehicle reappears). The
+    # pass TIME is unchanged (last-seen poll + btime2, capped at first miss), so
+    # accuracy is unaffected; only the confirmation is delayed by one cycle.
     prev: dict[str, dict] = {}
     last_commit = time.time()
+
+    def handle_arrival(stop_code, current, poll_iso):
+        now_dt = datetime.fromisoformat(poll_iso)
+        p = prev.get(stop_code)
+        pending = p["pending"] if p else {}
+        new_pending: dict[str, dict] = {}
+
+        if p:
+            # 1) confirm or cancel pending disappearances
+            for veh, info in pending.items():
+                if veh in current:
+                    continue            # reappeared → glitch, drop
+                seen_dt = datetime.fromisoformat(info["seen_at"])
+                if (now_dt - seen_dt).total_seconds() / 60 > DISAPPEAR_GUARD_MINS:
+                    continue            # too stale to trust
+                pass_dt = seen_dt + timedelta(minutes=info["btime2"])
+                miss_dt = datetime.fromisoformat(info["miss_at"])
+                if pass_dt > miss_dt:
+                    pass_dt = miss_dt   # passed before it first went missing
+                pass_iso = pass_dt.isoformat()
+                sd = _athens_date(pass_dt)
+                for (rc, stype, order) in stop_meta.get(stop_code, []):
+                    if info["route_code"] != rc:
+                        continue        # strict route match
+                    try:
+                        c = conn.execute("""
+                            INSERT OR IGNORE INTO stop_passages
+                                (route_code, stop_code, stop_type, stop_order,
+                                 vehicle_no, passed_at, service_date, recorded_at)
+                            VALUES (?,?,?,?,?,?,?,?)
+                        """, (rc, stop_code, stype, order, veh,
+                              pass_iso, sd, poll_iso))
+                        if c.rowcount > 0:
+                            stats["passages"] += 1
+                    except Exception:
+                        pass
+
+            # 2) fresh misses → pending (confirm on next poll)
+            gap = (now_dt - datetime.fromisoformat(p["polled_at"])).total_seconds() / 60
+            if gap <= DISAPPEAR_GUARD_MINS:
+                for veh, info in p["vehicles"].items():
+                    if veh in current or veh in pending:
+                        continue
+                    new_pending[veh] = {
+                        "btime2":     info["btime2"],
+                        "route_code": info["route_code"],
+                        "seen_at":    p["polled_at"],
+                        "miss_at":    poll_iso,
+                    }
+
+        prev[stop_code] = {"polled_at": poll_iso, "vehicles": current,
+                           "pending": new_pending}
 
     while not (stop_event.is_set() and result_q.empty()):
         try:
             item = result_q.get(timeout=1.0)
         except queue.Empty:
-            continue
-        try:
-            if item[0] == "arrival":
-                _, stop_code, current, poll_iso = item
-                now_dt = datetime.fromisoformat(poll_iso)
-                p = prev.get(stop_code)
-                if p:
-                    try:
-                        gap = (now_dt - datetime.fromisoformat(p["polled_at"])).total_seconds()/60
-                    except Exception:
-                        gap = 999
-                    if gap <= DISAPPEAR_GUARD_MINS:
-                        for veh, info in p["vehicles"].items():
-                            if veh in current:
-                                continue
-                            pass_dt = datetime.fromisoformat(p["polled_at"]) + \
-                                      timedelta(minutes=info["btime2"])
-                            if pass_dt > now_dt:
-                                pass_dt = now_dt
-                            pass_iso = pass_dt.isoformat()
-                            sd = _athens_date(pass_dt)
-                            for (rc, stype, order) in stop_meta.get(stop_code, []):
-                                if info["route_code"] and info["route_code"] != rc:
-                                    continue
-                                try:
-                                    conn.execute("""
-                                        INSERT OR IGNORE INTO stop_passages
-                                            (route_code, stop_code, stop_type, stop_order,
-                                             vehicle_no, passed_at, service_date, recorded_at)
-                                        VALUES (?,?,?,?,?,?,?,?)
-                                    """, (rc, stop_code, stype, order, veh, pass_iso, sd, poll_iso))
-                                    stats["passages"] += 1
-                                except Exception:
-                                    pass
-                prev[stop_code] = {"polled_at": poll_iso, "vehicles": current}
-        except Exception as e:
-            log.error("writer error: %s", e)
-        finally:
-            result_q.task_done()
+            item = None
+        if item is not None:
+            try:
+                if item[0] == "arrival":
+                    _, stop_code, current, poll_iso = item
+                    handle_arrival(stop_code, current, poll_iso)
+            except Exception as e:
+                log.error("writer error: %s", e)
+            finally:
+                result_q.task_done()
+        # periodic commit — runs on idle too, so writes never sit unflushed
         if time.time() - last_commit > COMMIT_EVERY_SECS:
-            try: conn.commit()
-            except Exception: pass
+            try:
+                conn.commit()
+            except Exception:
+                pass
             last_commit = time.time()
 
     try:

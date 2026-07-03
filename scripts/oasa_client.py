@@ -35,19 +35,22 @@ def _request(act: str, params: dict[str, str] | None = None,
              timeout=DEFAULT_TIMEOUT) -> Any:
     """Single request with retries. Returns parsed JSON or raises OasaApiError."""
 def _request(act: str, params: dict[str, str] | None = None,
-             timeout=DEFAULT_TIMEOUT, retry_forbidden: bool = True) -> Any:
+             timeout=DEFAULT_TIMEOUT, retry_forbidden: bool = True,
+             attempts: int | None = None) -> Any:
     """
     Single request with retries. Returns parsed JSON or raises OasaApiError.
 
-    retry_forbidden=False → a 403/429 fails immediately (no retry). Used for the
-    high-volume getStopArrivals: retrying a rate-limit 403 only multiplies the
-    load and keeps the IP blocked, and the round-robin poller re-polls each stop
-    within ~one cycle anyway, so nothing is really lost.
+    retry_forbidden=False → a 403/429 fails immediately (no retry).
+    attempts=1 → single shot, no retries at all. Used for the high-volume
+    getStopArrivals: the round-robin poller re-polls each stop within ~one
+    cycle anyway, so retrying (403 OR timeout) only wastes worker time —
+    a dead stop would otherwise hold a worker for ~35s (4 tries + backoff).
     """
     query = {"act": act, **(params or {})}
     last_err: Exception | None = None
+    max_tries = attempts if attempts is not None else MAX_RETRIES
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, max_tries + 1):
         try:
             # GET is the native method for the telematics API and is far more
             # reliable than POST for getStopArrivals (confirmed empirically + it
@@ -72,19 +75,19 @@ def _request(act: str, params: dict[str, str] | None = None,
             if "rate-limited" in str(e):
                 raise                       # non-retryable by request
             last_err = e
-            if attempt < MAX_RETRIES:
+            if attempt < max_tries:
                 sleep_s = BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
                 time.sleep(sleep_s)
         except (requests.RequestException, json.JSONDecodeError) as e:
             last_err = e
-            if attempt < MAX_RETRIES:
+            if attempt < max_tries:
                 sleep_s = BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, 0.5)
                 log.warning("act=%s attempt=%d/%d failed (%s); retrying in %.1fs",
-                            act, attempt, MAX_RETRIES, e, sleep_s)
+                            act, attempt, max_tries, e, sleep_s)
                 time.sleep(sleep_s)
 
     raise OasaApiError(
-        f"act={act} params={params} failed after {MAX_RETRIES} attempts: {last_err}"
+        f"act={act} params={params} failed after {max_tries} attempts: {last_err}"
     )
 
 
@@ -125,7 +128,8 @@ def get_stop_arrivals(stop_code: str) -> list[dict]:
     Each entry has: route_code, vehicle_no, btime2 (mins until arrival),
     route_descr, etc.
     """
-    result = _request("getStopArrivals", {"p1": stop_code}, timeout=5, retry_forbidden=False)
+    result = _request("getStopArrivals", {"p1": stop_code},
+                      timeout=5, retry_forbidden=False, attempts=1)
     if result is None:
         return []
     return result if isinstance(result, list) else []
