@@ -39,6 +39,9 @@ log = logging.getLogger("trip_reconstruction_passages")
 TRIP_GAP_MINUTES = 25   # gap between consecutive passages that splits trips
 OVERLAP_HOURS    = 3    # read past the 04:00 day end so 04:00-crossing trips stay whole
 MIN_DURATION_FRACTION = 0.3   # arrival implying < 30% of typical duration → incomplete
+BOUNDARY_ZONE_MINS = 20  # departures within ±20' of 04:00: owner day decided by
+                         # whichever day's SCHEDULE has the nearest slot (a 03:55
+                         # slot leaving late at 04:05 stays on yesterday)
 
 
 def _parse(iso: str) -> datetime:
@@ -89,6 +92,57 @@ def _athens_window(service_date: str) -> tuple[str, str]:
     d2 = d + timedelta(days=1)
     return (f"{d.isoformat()}T{start_h:02d}:00:00",
             f"{d2.isoformat()}T{start_h:02d}:00:00")
+
+
+def _sched_datetimes(conn, route_code: str, sched_date: str) -> list[datetime]:
+    """Scheduled departures of one service day as aware datetimes (Athens).
+    Times before 04:00 belong to the END of that service day (calendar +1)."""
+    out = []
+    try:
+        rows = conn.execute(
+            "SELECT departure_time FROM scheduled_trips "
+            "WHERE route_code=? AND schedule_date=?",
+            (route_code, sched_date)).fetchall()
+    except Exception:
+        return out
+    d0 = date.fromisoformat(sched_date)
+    for r in rows:
+        t = r["departure_time"]
+        try:
+            h, m = int(t[:2]), int(t[3:5])
+        except (ValueError, TypeError):
+            continue
+        d = d0 + timedelta(days=1) if h < 4 else d0
+        if _ATHENS is not None:
+            out.append(datetime(d.year, d.month, d.day, h, m, tzinfo=_ATHENS))
+        else:
+            out.append(datetime(d.year, d.month, d.day, h, m, tzinfo=timezone.utc))
+    return out
+
+
+def _nearest_secs(dts: list[datetime], t: datetime):
+    if not dts:
+        return None
+    return min(abs((d - t).total_seconds()) for d in dts)
+
+
+def _boundary_owner_is_this_day(conn, route_code: str, started_dt: datetime,
+                                this_date: str, other_date: str,
+                                default_this: bool) -> bool:
+    """
+    For a departure near the 04:00 boundary, the trip belongs to the day whose
+    SCHEDULE has the nearest slot: a 03:55 slot departing late at 04:05 stays on
+    yesterday; a 04:05 slot departing at 04:08 stays on today. Deterministic, so
+    both days' reconstructions reach the same verdict (no duplicates, no gaps).
+    Falls back to the actual-departure rule when either schedule is missing.
+    """
+    mine = _nearest_secs(_sched_datetimes(conn, route_code, this_date), started_dt)
+    theirs = _nearest_secs(_sched_datetimes(conn, route_code, other_date), started_dt)
+    if mine is None or theirs is None:
+        return default_this
+    if mine == theirs:
+        return default_this
+    return mine < theirs
 
 
 def _split_trips(passages: list[dict], route_duration: float | None) -> list[list[dict]]:
@@ -171,13 +225,19 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
     # the same tail passages but drops the trip (departure before its window),
     # so each trip lands in exactly one day.
     start_bound, end_bound = _athens_window(service_date)
-    query_end = (_parse(end_bound) + timedelta(hours=OVERLAP_HOURS)).isoformat()
+    day_start, day_end = _parse(start_bound), _parse(end_bound)
+    # Query extends past BOTH edges: after the end (so 04:00-crossing trips stay
+    # whole) and slightly before the start (so a boundary-zone trip departing
+    # e.g. 03:55 can be assembled whole here too, in case the schedule assigns
+    # it to this day).
+    query_start = (day_start - timedelta(minutes=BOUNDARY_ZONE_MINS + 10)).isoformat()
+    query_end = (day_end + timedelta(hours=OVERLAP_HOURS)).isoformat()
     rows = conn.execute("""
         SELECT vehicle_no, stop_code, stop_order, passed_at
         FROM stop_passages
         WHERE route_code=? AND passed_at>=? AND passed_at<?
         ORDER BY vehicle_no, passed_at
-    """, (route_code, start_bound, query_end)).fetchall()
+    """, (route_code, query_start, query_end)).fetchall()
 
     by_vehicle: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
@@ -236,10 +296,26 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
                 if dur_mins < MIN_DURATION_FRACTION * route_duration:
                     terminus_dt = None
 
-            # ── DAY OWNERSHIP: a trip belongs to the day it DEPARTED ──
-            # Departures outside [day start, day end) belong to the previous/next
-            # service day (their own reconstruction builds them whole there).
-            if not (_parse(start_bound) <= started_dt < _parse(end_bound)):
+            # ── DAY OWNERSHIP ──
+            # Normally: a trip belongs to the day it DEPARTED. Near the 04:00
+            # boundary (±BOUNDARY_ZONE_MINS), the day whose schedule has the
+            # nearest slot wins — so a delayed 03:55 slot leaving 04:05 stays on
+            # yesterday, and an early 04:00 slot leaving 03:57 moves to today.
+            zone = timedelta(minutes=BOUNDARY_ZONE_MINS)
+            in_day = day_start <= started_dt < day_end
+            if abs(started_dt - day_end) <= zone:
+                nxt = (date.fromisoformat(service_date) + timedelta(days=1)).isoformat()
+                keep = _boundary_owner_is_this_day(
+                    conn, route_code, started_dt, service_date, nxt,
+                    default_this=in_day)
+            elif abs(started_dt - day_start) <= zone:
+                prv = (date.fromisoformat(service_date) - timedelta(days=1)).isoformat()
+                keep = _boundary_owner_is_this_day(
+                    conn, route_code, started_dt, service_date, prv,
+                    default_this=in_day)
+            else:
+                keep = in_day
+            if not keep:
                 continue
 
             started_at = started_dt.isoformat()
