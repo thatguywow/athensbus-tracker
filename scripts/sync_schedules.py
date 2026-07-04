@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time as _time
 from datetime import datetime, date, time
 
 import db
@@ -125,6 +126,9 @@ def sync_normal_schedules(conn, routes_by_line, lines_meta, today, synced_at) ->
             sdc_code = pick_sdc_code(line_code)
             if not sdc_code:
                 continue
+            # Small gap between the 2 back-to-back calls per line: this phase
+            # runs alongside the poller, and unpaced bursts trip the IP limit.
+            _time.sleep(0.2)
             sched = oasa.get_sched_lines(line_id, sdc_code, line_code)
         except Exception:
             continue

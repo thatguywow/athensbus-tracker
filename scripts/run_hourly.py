@@ -59,8 +59,12 @@ def git_commit_and_push() -> bool:
     """Commit db + docs/data and push to GitHub. Returns True on success."""
     try:
         def run(cmd):
+            # encoding="utf-8" (with errors="replace") is required on Windows:
+            # the default console codec (cp1253) cannot decode git's UTF-8
+            # output (Greek commit messages) and crashes the reader thread.
             result = subprocess.run(
-                cmd, cwd=REPO_ROOT, capture_output=True, text=True
+                cmd, cwd=REPO_ROOT, capture_output=True, text=True,
+                encoding="utf-8", errors="replace"
             )
             if result.returncode != 0:
                 log.warning("git command failed: %s\n%s", " ".join(cmd), result.stderr)
