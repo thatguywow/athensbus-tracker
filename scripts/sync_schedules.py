@@ -207,42 +207,50 @@ def main(include_normal: bool = True):
                         continue
                     entries = sched.get(direction_key) or []
                     times = extract_departure_times(entries, direction_key)
+                    new_times = []
+                    seen = set()
+                    for sdd_code, dep_time in times:
+                        if dep_time in seen:
+                            continue   # OASA duplicates (08:25, 08:25)
+                        seen.add(dep_time)
+                        new_times.append((sdd_code, dep_time))
 
                     existing = [r["departure_time"] for r in conn.execute(
                         "SELECT departure_time FROM scheduled_trips "
                         "WHERE route_code=? AND schedule_date=?",
                         (route["route_code"], today)).fetchall()]
 
-                    if existing:
-                        # FREEZE-MERGE re-sync: times that have already passed
-                        # (service-day clock) are history — they stay exactly as
-                        # first recorded, even if OASA's feed no longer lists
-                        # them. Only FUTURE times follow the new schedule: stale
-                        # future rows are removed and replaced by the feed's
-                        # current future times. Silent, no change markers.
-                        nk = _now_key()
-                        for t in existing:
-                            if _dep_key(t) > nk:
-                                conn.execute(
-                                    "DELETE FROM scheduled_trips WHERE route_code=? "
-                                    "AND schedule_date=? AND departure_time=?",
-                                    (route["route_code"], today, t))
-                        frozen = {t for t in existing if _dep_key(t) <= nk}
-                    else:
-                        # First sync of the day: take the full schedule as the
-                        # baseline, past hours included.
-                        nk = None
-                        frozen = set()
+                    # ── SAFETY NET 1: never wipe a populated day with an empty
+                    # feed (transient 403/empty response). Retry next hour.
+                    if existing and not new_times:
+                        continue
 
-                    # Deduplicate by departure_time — OASA sometimes returns the
-                    # same departure twice with different sdd_codes (08:25, 08:25).
-                    seen_times = set(frozen)
-                    for sdd_code, dep_time in times:
-                        if dep_time in seen_times:
-                            continue
-                        if nk is not None and _dep_key(dep_time) <= nk:
-                            continue   # newly-appeared PAST time → don't rewrite history
-                        seen_times.add(dep_time)
+                    # ── SAFETY NET 2: past-agreement check. Executed times don't
+                    # get rewritten by OASA, so if most of OUR already-passed
+                    # times are missing from the feed, the feed is for another
+                    # day (e.g. tomorrow's served before midnight) or garbage —
+                    # skip this line, keep what we have. Triggers only on BULK
+                    # mismatch (>=3 missing AND <60% overlap): a stationmaster
+                    # editing 1-2 recent slots must still mirror through.
+                    if existing:
+                        nk = _now_key()
+                        past = {t for t in existing if _dep_key(t) <= nk}
+                        if past:
+                            feed_set = {t for _, t in new_times}
+                            missing = len(past - feed_set)
+                            overlap = 1 - missing / len(past)
+                            if missing >= 3 and overlap < 0.6:
+                                continue
+
+                    # ── SILENT MIRROR: the day's schedule always reflects
+                    # OASA's latest daily feed — additions, moves and removals
+                    # alike, past and future. Self-healing: any bad sync is
+                    # corrected by the next hourly one.
+                    conn.execute(
+                        "DELETE FROM scheduled_trips "
+                        "WHERE route_code=? AND schedule_date=?",
+                        (route["route_code"], today))
+                    for sdd_code, dep_time in new_times:
                         conn.execute(
                             """
                             INSERT INTO scheduled_trips

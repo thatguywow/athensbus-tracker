@@ -132,9 +132,9 @@
   /* ── tables ── */
   #vehicle-table-wrap,#schedule-table-wrap,#kartelakia-wrap,#comparison-wrap{
     background:var(--bg2);border:1px solid var(--line);border-radius:var(--radius);
-    overflow:hidden;box-shadow:var(--shadow);
+    overflow-x:auto;-webkit-overflow-scrolling:touch;box-shadow:var(--shadow);
   }
-  .data-table{width:100%;border-collapse:collapse;font-size:.84rem;}
+  .data-table{width:100%;border-collapse:collapse;font-size:.84rem;min-width:520px;}
   .data-table th{background:var(--bg3);color:var(--slate);padding:.55rem .8rem;
     text-align:left;font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.07em;
     border-bottom:1px solid var(--line-s);position:sticky;top:0;z-index:1;}
@@ -300,8 +300,10 @@
 </main>
 
 <footer>
-  Δεδομένα από το δημόσιο API ΟΑΣΑ Telematics. Χρόνοι στάσεων: γραμμική παρεμβολή μεταξύ GPS pings ανά 5 λεπτά.
-  Τερματικοί σταθμοί: προβλέψεις ΟΑΣΑ getStopArrivals. Ακατέργαστα δεδομένα: 30 ημέρες · Στατιστικά: επ' αόριστον.
+  Δεδομένα από το δημόσιο API ΟΑΣΑ Telematics. Αναχωρήσεις &amp; Λήξεις: ανίχνευση
+  διελεύσεων στις πρώτες/τελευταίες στάσεις κάθε διαδρομής (getStopArrivals) και
+  ανακατασκευή δρομολογίων. Ημέρα λειτουργίας: 04:00–04:00. Το ημερήσιο πρόγραμμα
+  ενημερώνεται ωριαία από τον ΟΑΣΑ. Ακατέργαστα δεδομένα: 30 ημέρες · Στατιστικά: επ' αόριστον.
 </footer>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
