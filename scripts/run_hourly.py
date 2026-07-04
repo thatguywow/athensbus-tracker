@@ -38,8 +38,14 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("run_hourly.log", encoding="utf-8"),
+        # Absolute path: Task Scheduler's CWD may differ from the repo root.
+        logging.FileHandler(str(Path(__file__).parent.parent / "run_hourly.log"),
+                            encoding="utf-8"),
     ],
+    # Imported modules (sync_schedules etc.) call basicConfig at import time,
+    # which would otherwise make this call a no-op — the file handler was never
+    # attached and run_hourly.log stayed empty. force=True reconfigures root.
+    force=True,
 )
 log = logging.getLogger("run_hourly")
 
