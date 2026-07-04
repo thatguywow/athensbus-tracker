@@ -80,7 +80,7 @@ def git_commit_and_push() -> bool:
             return True
 
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        run(["git", "commit", "-m", f"hourly update: {stamp}"])
+        run(["git", "commit", "-m", f"ωριαία ενημέρωση: {stamp}"])
         success = run(["git", "push", "origin", "main"])
         if success:
             log.info("Pushed to GitHub successfully.")
@@ -97,19 +97,19 @@ def main():
 
     conn = db.get_connection()
 
-    # Step 1: sync today's schedule if not done yet
-    if not schedule_already_synced_today(conn):
-        log.info("Syncing today's schedule...")
-        conn.close()
-        try:
-            sync_schedules()
-        except Exception as e:
-            log.warning("Schedule sync failed (non-fatal): %s", e)
-        conn = db.get_connection()
-    else:
-        log.info("Schedule already synced today, skipping.")
-
+    # Step 1: sync today's schedule — EVERY hour. The freeze-merge in
+    # sync_schedules makes this safe and idempotent: past times stay frozen,
+    # future times follow OASA's latest daily feed (mid-day revisions like
+    # X95's are picked up within the hour). The rarely-changing NORMAL
+    # timetable is only synced on the first run of the day.
+    first_sync_of_day = not schedule_already_synced_today(conn)
     conn.close()
+    log.info("Syncing today's schedule (%s)...",
+             "full, first of day" if first_sync_of_day else "daily refresh")
+    try:
+        sync_schedules(include_normal=first_sync_of_day)
+    except Exception as e:
+        log.warning("Schedule sync failed (non-fatal): %s", e)
 
     # Step 2: compute daily report (trips, slots, stats)
     log.info("Computing daily report...")

@@ -160,7 +160,7 @@ def sync_normal_schedules(conn, routes_by_line, lines_meta, today, synced_at) ->
     return total
 
 
-def main():
+def main(include_normal: bool = True):
     db.ensure_schema()
     synced_at = db.now_utc_iso()
     today = date.today().isoformat()
@@ -261,14 +261,16 @@ def main():
             conn.commit()
 
             # Sync the NORMAL (theoretical) timetable for three-way comparison.
-            # Isolated: any failure here does not affect the daily sync above.
+            # It changes rarely, so hourly re-syncs skip it (include_normal=False)
+            # and only the daily schedule above is refreshed (freeze-merge).
             normal_rows = 0
-            try:
-                normal_rows = sync_normal_schedules(
-                    conn, routes_by_line, lines_meta, today, synced_at)
-                conn.commit()
-            except Exception as e:
-                log.warning("Normal schedule sync failed: %s", e)
+            if include_normal:
+                try:
+                    normal_rows = sync_normal_schedules(
+                        conn, routes_by_line, lines_meta, today, synced_at)
+                    conn.commit()
+                except Exception as e:
+                    log.warning("Normal schedule sync failed: %s", e)
 
             run.detail = (
                 f"date={today} schedule_rows={total_inserted} "
