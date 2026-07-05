@@ -201,6 +201,7 @@ def _stop_worker(work_q, result_q, limiter, stop_event):
                 veh = str(a.get("veh_code") or a.get("VEH_NO") or "")
                 if not veh:
                     continue
+                veh = _normalize_vehicle_no(veh)
                 try:
                     bt = int(a.get("btime2") or a.get("btime") or 0)
                 except (ValueError, TypeError):
@@ -311,6 +312,25 @@ def _writer_thread(result_q, stop_meta, stats, stop_event):
         conn.commit(); conn.close()
     except Exception:
         pass
+
+
+from vehicle_classification import TROLLEY_RANGES
+
+
+def _normalize_vehicle_no(veh: str) -> str:
+    """
+    OASA sends Κόκκινος Μύλος trolleys in TWO forms: the 4-digit fleet number
+    (9012) and the legacy 8-prefixed 5-digit form (89012). Normalize to the
+    4-digit fleet number so counting/classification stays consistent. Safe:
+    no bus depot uses 5-digit numbers starting with 8, so a 5-digit 8XXXX
+    whose remainder is a valid trolley number can only be a trolley.
+    """
+    if len(veh) == 5 and veh[0] == "8" and veh[1:].isdigit():
+        rest = int(veh[1:])
+        for lo, hi, _name in TROLLEY_RANGES:
+            if lo <= rest <= hi:
+                return veh[1:]
+    return veh
 
 
 def _athens_date(dt_utc: datetime) -> str:
