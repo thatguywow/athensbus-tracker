@@ -49,6 +49,28 @@ def main():
     service_date = target_service_date()
     computed_at  = db.now_utc_iso()
 
+    # ── Handover window: for a few hours after the 04:00 day flip, ALSO
+    # recompute YESTERDAY. Trips that departed near/before 04:00 finish after
+    # it (e.g. dep 03:55 → arr 04:49); yesterday's last regular compute ran
+    # before they completed, so without this pass they would never be stored
+    # on their owner day (today's reconstruction rightly skips them).
+    dates_to_compute = [service_date]
+    if len(sys.argv) <= 1:   # only for automatic runs, not explicit dates
+        try:
+            from zoneinfo import ZoneInfo
+            athens_hour = datetime.now(ZoneInfo("Europe/Athens")).hour
+        except Exception:
+            athens_hour = 12
+        if 4 <= athens_hour < 7:
+            prev = (date.fromisoformat(service_date) - timedelta(days=1)).isoformat()
+            dates_to_compute.append(prev)
+
+    for service_date in dates_to_compute:
+        _compute_one_day(service_date, computed_at)
+
+
+def _compute_one_day(service_date: str, computed_at: str):
+
     with db.job_run("compute_daily_report") as run:
         conn = db.get_connection()
         try:

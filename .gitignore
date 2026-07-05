@@ -10,4 +10,5 @@ venv/
 .DS_Store
 .vscode/
 local_poller.log
-run_hourly.log 
+db/*.db
+run_hourly.log

@@ -121,9 +121,21 @@ def _sched_datetimes(conn, route_code: str, sched_date: str) -> list[datetime]:
 
 
 def _nearest_secs(dts: list[datetime], t: datetime):
+    """
+    Weighted distance of departure t to the nearest scheduled slot. A LATE
+    departure (delay) is normal; leaving EARLIER than a slot is rare — so
+    earliness costs double. This stops junk early-morning slots in today's
+    feed (e.g. a stray 04:15) from stealing yesterday's delayed 03:55 trip.
+    """
     if not dts:
         return None
-    return min(abs((d - t).total_seconds()) for d in dts)
+    best = None
+    for d in dts:
+        diff = (t - d).total_seconds()
+        cost = diff if diff >= 0 else -diff * 2.0
+        if best is None or cost < best:
+            best = cost
+    return best
 
 
 def _boundary_owner_is_this_day(conn, route_code: str, started_dt: datetime,
@@ -279,6 +291,19 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
                 terminus_dt = _parse(term_hit["passed_at"])
             elif len(term_side) >= 2:
                 terminus_dt = _linfit_predict(term_side, hi)
+            elif len(term_side) == 1 and route_duration:
+                # Single near-terminus passage (e.g. stop 35/36): extend by the
+                # route's typical per-stop pace for the 1-3 remaining stops.
+                # Tightly bounded (≤3 stops ≈ ≤ a few minutes), so the estimate
+                # stays close to reality — this also rescues circular routes,
+                # whose final stop doubles as the next trip's origin.
+                order, tdt = term_side[0]
+                remaining = hi - order
+                if 0 < remaining <= 3:
+                    pace_secs = route_duration * 60.0 / max(1, hi - lo)
+                    terminus_dt = tdt + timedelta(seconds=remaining * pace_secs)
+                else:
+                    terminus_dt = None
             else:
                 terminus_dt = None   # incomplete — never observed finishing
 

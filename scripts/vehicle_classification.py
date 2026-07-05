@@ -2,36 +2,49 @@
 vehicle_classification.py — maps an OASA vehicle number to its depot
 (αμαξοστάσιο) and vehicle type (τύπος οχήματος).
 
-RULE (per the fleet reference):
-  • The FIRST digit of the vehicle number is the depot (0-9; no depot 2).
-  • Vehicle type is found by:
-      1) Checking the FULL number against "specific depot" ranges
-         (Συγκεκριμένα αμαξοστάσια), then
-      2) Stripping the first digit and checking the remaining base against the
-         "any depot" ranges (Με οποιοδήποτε αμαξοστάσιο).
-
-Verified against observed vehicles: 79085→Λιόσια/Irisbus Citelis CNG,
-10562→Βοτανικός/N2, 54493→Μπραχάμι/MAN 12m leasing 2024,
-59727→Μπραχάμι/Irisbus Agora Diesel.
+RULE (fleet reference «Αμαξοστάσια ΝΕΟ»): digit COUNT decides the family —
+  • 4-digit numbers are TROLLEYS. First digit → depot:
+      2/6/7 → ΡΟΥΦ,  8/9 → Κόκκινος Μύλος
+    Type from the trolley full-number ranges below.
+  • 5-digit numbers are BUSES. First digit → depot:
+      1 Βοτανικός, 3 Πειραιάς, 4 Ράλλη, 5 Μπραχάμι, 6 Ανθούσα, 7 Λιόσια, 9 ΚΤΕΛ
+    Type: specific full-number ranges first, then any-depot base ranges
+    (base = number without the first digit).
+  NOTE: the same numeric range can mean different things per family, e.g.
+  2001-2140 → Yutong E12 as a 4-digit trolley AND X2001-X2140 Yutong E12 buses.
 """
 
 from __future__ import annotations
 
-DEPOTS = {
-    "0": "ΡΟΥΦ",
+BUS_DEPOTS = {
     "1": "Βοτανικός",
     "3": "Πειραιάς",
     "4": "Ράλλη",
     "5": "Μπραχάμι",
     "6": "Ανθούσα",
     "7": "Λιόσια",
-    "8": "Κόκκινος Μύλος",
     "9": "ΚΤΕΛ",
 }
 
-# ── Specific-depot ranges (full vehicle number) — checked FIRST ──
+TROLLEY_DEPOTS = {
+    "2": "ΡΟΥΦ",
+    "6": "ΡΟΥΦ",
+    "7": "ΡΟΥΦ",
+    "8": "Κόκκινος Μύλος",
+    "9": "Κόκκινος Μύλος",
+}
+
+# ── Trolleys (4-digit FULL numbers) ──
+TROLLEY_RANGES = [
+    (2001, 2140, "Yutong E12"),
+    (6001, 6112, "Neoplan N6014"),
+    (7001, 7112, "Vanhool 12m"),
+    (8001, 8091, "Neoplan N6216"),
+    (9001, 9051, "Neoplan n6221"),
+]
+
+# ── Buses: specific-depot ranges (FULL 5-digit number) — checked FIRST ──
 FULL_RANGES = [
-    (6001, 6112, "Neoplan N6014"),          # depot 0 ΡΟΥΦ (06001-06112), trolley
     (10001, 10220, "Solaris 8,6m"),
     (10541, 10729, "N2"),
     (10954, 10954, "N2"),
@@ -42,7 +55,9 @@ FULL_RANGES = [
     (16023, 16023, "Solaris Urbino 12m"),
     (16025, 16029, "MAN 12m leasing 2020"),
     (16094, 16132, "Citaro 12m leasing 2020"),
+    (30001, 30220, "Solaris 12m 8,6"),
     (30600, 30699, "Solaris 8,6m"),
+    (30600, 30700, "Solaris 12m 8,6"),
     (30701, 30991, "Irisbus Agora Diesel 12m"),
     (40401, 40719, "GN"),
     (40821, 40940, "Solaris Urbino 18m"),
@@ -50,13 +65,12 @@ FULL_RANGES = [
     (56031, 56087, "Volvo 12m leasing 2020"),
     (59701, 59991, "Irisbus Agora Diesel 12m"),
     (60001, 60220, "Solaris 12m 8,6"),
-    (60600, 60680, "Solaris 12m 8,6"),
+    (60600, 60700, "Solaris 12m 8,6"),
     (69001, 69200, "Irisbus Citelis CNG 12m"),
     (79001, 79200, "Irisbus Citelis CNG 12m"),
-    (89001, 89051, "Neoplan n6221"),         # depot 8 Κόκκινος Μύλος, trolley
 ]
 
-# ── Any-depot ranges (base = vehicle number WITHOUT the first depot digit) ──
+# ── Buses: any-depot ranges (base = 5-digit number WITHOUT the first digit) ──
 BASE_RANGES = [
     (1161, 1260, "Urbanway 18m"),
     (1261, 1460, "Citymood 12m"),
@@ -79,62 +93,45 @@ BASE_RANGES = [
     (6223, 6227, "Solaris Urbino 12m"),
     (6231, 6277, "Irisbus Crossway LE leasing 2020"),
     (6293, 6293, "Solaris Urbino 12m"),
-    (7001, 7112, "Vanhool 12m"),
-    (8001, 8091, "Neoplan N6216"),
 ]
 
 
-TROLLEY_DEPOTS = {"0", "8"}   # ΡΟΥΦ, Κόκκινος Μύλος — trolley depots
-
-
-def _in_ranges(value: int, ranges) -> str | None:
+def _in_ranges(n: int, ranges) -> str | None:
     for lo, hi, name in ranges:
-        if lo <= value <= hi:
+        if lo <= n <= hi:
             return name
     return None
 
 
-def classify(vehicle_no) -> tuple[str | None, str | None]:
-    """
-    Returns (depot_name, vehicle_type) for a vehicle number.
-    Either element may be None if it can't be determined.
-
-    Depots 0 (ΡΟΥΦ) and 8 (Κόκκινος Μύλος) are trolley depots: any vehicle
-    there is a trolley, so the type is marked accordingly — "(τρόλεϊ)" is
-    appended to a detected model, or the type is "Τρόλεϊ" if none is found.
-    """
-    if vehicle_no is None:
-        return None, None
+def classify(vehicle_no: str) -> tuple[str | None, str | None]:
+    """Return (depot, vehicle_type) — either may be None if unknown."""
     digits = "".join(ch for ch in str(vehicle_no) if ch.isdigit())
     if not digits:
         return None, None
 
-    first = digits[0]
-    depot = DEPOTS.get(first)
-
-    try:
-        full = int(digits)
-    except ValueError:
-        return depot, None
-
-    # 1) Specific-depot ranges (full number)
-    vtype = _in_ranges(full, FULL_RANGES)
-
-    # 2) Any-depot ranges (strip first digit → base)
-    if vtype is None and len(digits) >= 2:
+    # ── 4-digit → trolley ──
+    if len(digits) == 4:
+        depot = TROLLEY_DEPOTS.get(digits[0])
         try:
-            base = int(digits[1:])
-            vtype = _in_ranges(base, BASE_RANGES)
+            vtype = _in_ranges(int(digits), TROLLEY_RANGES)
+        except ValueError:
+            vtype = None
+        if vtype:
+            vtype += " (τρόλεϊ)"
+        elif depot:
+            vtype = "Τρόλεϊ"
+        return depot, vtype
+
+    # ── 5-digit → bus ──
+    if len(digits) == 5:
+        depot = BUS_DEPOTS.get(digits[0])
+        vtype = None
+        try:
+            vtype = _in_ranges(int(digits), FULL_RANGES)
+            if vtype is None:
+                vtype = _in_ranges(int(digits[1:]), BASE_RANGES)
         except ValueError:
             pass
+        return depot, vtype
 
-    # Trolley depots: whatever model is there is a trolley model
-    if first in TROLLEY_DEPOTS:
-        vtype = f"{vtype} (τρόλεϊ)" if vtype else "Τρόλεϊ"
-
-    return depot, vtype
-
-
-if __name__ == "__main__":
-    for v in ["79085", "10562", "54493", "59727", "11161", "31261", "12001"]:
-        print(v, "→", classify(v))
+    return None, None

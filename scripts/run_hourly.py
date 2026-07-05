@@ -78,7 +78,9 @@ def git_commit_and_push() -> bool:
 
         run(["git", "config", "user.name",  "athensbus-bot"])
         run(["git", "config", "user.email", "actions@users.noreply.github.com"])
-        run(["git", "add", "db/athensbus.db", "docs/data/"])
+        # Only the generated site data goes to git. The sqlite DB stays local:
+        # it grew past GitHub's 100MB file limit and pushes were rejected.
+        run(["git", "add", "docs/data/"])
 
         # Check if there's anything to commit
         result = subprocess.run(

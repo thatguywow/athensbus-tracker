@@ -27,6 +27,7 @@
       var(--bg);
     color:var(--paper);font-family:'Inter',system-ui,sans-serif;line-height:1.5;
     -webkit-font-smoothing:antialiased;
+    overflow-x:hidden;   /* horizontal table swipes must not drag the page */
   }
   ::selection{background:rgba(97,165,236,.30);}
 
@@ -132,7 +133,8 @@
   /* ── tables ── */
   #vehicle-table-wrap,#schedule-table-wrap,#kartelakia-wrap,#comparison-wrap{
     background:var(--bg2);border:1px solid var(--line);border-radius:var(--radius);
-    overflow-x:auto;-webkit-overflow-scrolling:touch;box-shadow:var(--shadow);
+    overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;
+    box-shadow:var(--shadow);
   }
   .data-table{width:100%;border-collapse:collapse;font-size:.84rem;min-width:520px;}
   .data-table th{background:var(--bg3);color:var(--slate);padding:.55rem .8rem;
