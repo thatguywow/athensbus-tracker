@@ -36,7 +36,8 @@ TROLLEY_DEPOTS = {
 
 # ── Trolleys (4-digit FULL numbers) ──
 TROLLEY_RANGES = [
-    (2001, 2140, "Yutong E12"),
+    (2001, 2140, "Yutong E12 2024"),
+    (2241, 2365, "Yutong E12 2026"),
     (6001, 6112, "Neoplan N6014"),
     (7001, 7112, "Vanhool 12m"),
     (8001, 8091, "Neoplan N6216"),
@@ -45,7 +46,7 @@ TROLLEY_RANGES = [
 
 # ── Buses: specific-depot ranges (FULL 5-digit number) — checked FIRST ──
 FULL_RANGES = [
-    (10001, 10220, "Solaris 8,6m"),
+    (10001, 10220, "Solaris 12m 8,6m"),
     (10541, 10729, "N2"),
     (10954, 10954, "N2"),
     (16005, 16005, "MAN 12m leasing 2020"),
@@ -74,8 +75,9 @@ FULL_RANGES = [
 BASE_RANGES = [
     (1161, 1260, "Urbanway 18m"),
     (1261, 1460, "Citymood 12m"),
-    (2001, 2140, "Yutong E12"),
+    (2001, 2140, "Yutong E12 2024"),
     (2141, 2240, "Yutong E9"),
+    (2241, 2365, "Yutong E12 2026"),
     (4431, 4480, "Citaro C2 leasing 2024"),
     (4481, 4530, "MAN 12m leasing 2024"),
     (4531, 4630, "MAN 18m leasing 2024"),

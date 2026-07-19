@@ -6,7 +6,6 @@ let currentDate   = null;
 let summaryData   = null;
 let vehicleData   = null;
 let schedData     = null;
-let kartData      = null;
 let depotData     = null;
 let availDates    = [];
 
@@ -84,29 +83,23 @@ async function loadDay(d){
   document.getElementById("date-select").value = d;
   document.getElementById("schedule-table-wrap").innerHTML =
     '<div class="empty-state">Επιλέξτε γραμμή.</div>';
-  document.getElementById("kartelakia-wrap").innerHTML =
-    '<div class="empty-state">Επιλέξτε γραμμή.</div>';
   document.getElementById("sched-route-select").style.display="none";
-  document.getElementById("kart-route-select").style.display="none";
 
   try{
-    const [summary, vehicles, sched, kart, depots] = await Promise.all([
+    const [summary, vehicles, sched, depots] = await Promise.all([
       loadJSON(dataPath("summary.json")),
       loadJSON(dataPath("vehicle_activity.json")).catch(()=>({vehicles:[]})),
       loadJSON(dataPath("schedule_distribution.json")).catch(()=>({trips:[]})),
-      loadJSON(dataPath("kartelakia.json")).catch(()=>({slots:[]})),
       loadJSON(dataPath("depots.json")).catch(()=>({depots:[]})),
     ]);
     summaryData = summary;
     vehicleData = vehicles;
     schedData   = sched;
-    kartData    = kart;
     depotData   = depots;
 
     renderSummary(summary);
     renderVehicles(vehicles, document.getElementById("veh-search").value);
-    buildLineSelectors(sched, kart);
-    renderComparison(sched, document.getElementById("cmp-search").value);
+    buildLineSelectors(sched);
     renderDepots(depots);
 
     const health = await loadJSON("data/pipeline_health.json").catch(()=>({recent_runs:[]}));
@@ -121,7 +114,6 @@ async function loadDay(d){
 // ── summary board ──────────────────────────────────────────────────────────
 function renderSummary(d){
   document.getElementById("stat-date").textContent       = d.service_date||"—";
-  document.getElementById("stat-actual").textContent     = fmtInt(d.system_actual_trips);
   document.getElementById("stat-scheduled").textContent  = fmtInt(d.system_scheduled_trips);
   document.getElementById("stat-routes").textContent     = fmtInt(d.route_count);
   document.getElementById("stat-vehicles").textContent   = fmtInt(d.total_vehicles);
@@ -205,7 +197,7 @@ function renderVehicles(data, filter){
 }
 
 // ── line selectors (shared logic) ──────────────────────────────────────────
-function buildLineSelectors(sched, kart){
+function buildLineSelectors(sched){
   // Group by the public line label (line_id), not the internal line_code —
   // OASA has several internal codes per public line, which produced duplicate
   // "Γραμμή X97" entries. One entry per label; selection filters by label.
@@ -215,11 +207,6 @@ function buildLineSelectors(sched, kart){
     populateRouteSelect("sched-route-select", id, sched.trips||[], rc=>renderScheduleTable(rc));
   });
 
-  const kartLines={};
-  (kart.slots||[]).forEach(t=>{ const id=t.line_id||t.line_code; if(id) kartLines[id]=id; });
-  buildSelect("kart-line-select", kartLines, id=>{
-    populateRouteSelect("kart-route-select", id, kart.slots||[], rc=>renderKartelakiaTable(rc));
-  });
 }
 
 function buildSelect(id, linesMap, onLineSelect){
@@ -311,44 +298,6 @@ function renderScheduleTable(routeCode){
   wrap.innerHTML=html+'</tbody></table>';
 }
 
-// ── kartelakia ─────────────────────────────────────────────────────────────
-function renderKartelakiaTable(routeCode){
-  const wrap=document.getElementById("kartelakia-wrap");
-  const slots=(kartData&&kartData.slots||[])
-    .filter(t=>t.route_code===routeCode)
-    .sort((a,b)=>depSortKey(a.scheduled_dep)-depSortKey(b.scheduled_dep));
-
-  if(!slots.length){
-    wrap.innerHTML='<div class="empty-state">Δεν υπάρχουν δεδομένα.</div>'; return;
-  }
-
-  // Group by slot number to show the pattern
-  const slotGroups={};
-  slots.forEach(s=>{
-    const k=s.slot_number||0;
-    if(!slotGroups[k]) slotGroups[k]=[];
-    slotGroups[k].push(s);
-  });
-  const slotCount=Object.keys(slotGroups).filter(k=>k>0).length;
-
-  let html=`<div class="summary-bar"><span>${slotCount}</span> καρτελάκια · <span>${slots.length}</span> προγραμματισμένα δρομολόγια</div>`;
-  html+='<table class="data-table"><thead><tr>'+
-    '<th>Πρόγραμμα</th><th>Καρτελάκι</th>'+
-    '</tr></thead><tbody>';
-
-  slots.forEach(s=>{
-    const slotNum=s.slot_number;
-    const slotHtml=slotNum
-      ? `<span class="slot-pill">Καρτελάκι ${slotNum}</span>`
-      : '<span class="slot-pill slot-unknown">—</span>';
-    html+=`<tr>
-      <td class="mono">${(s.scheduled_dep||"—").substring(0,5)}</td>
-      <td>${slotHtml}</td>
-    </tr>`;
-  });
-  wrap.innerHTML=html+'</tbody></table>';
-}
-
 // ── pipeline health ────────────────────────────────────────────────────────
 function renderHealth(data){
   const list=document.getElementById("health-list");
@@ -369,9 +318,6 @@ document.getElementById("veh-search").addEventListener("input",e=>{
   if(vehicleData) renderVehicles(vehicleData, e.target.value);
 });
 document.getElementById("veh-export").addEventListener("click", exportVehiclesXlsx);
-document.getElementById("cmp-search").addEventListener("input",e=>{
-  if(schedData) renderComparison(schedData, e.target.value);
-});
 
 // ── Αμαξοστάσια / Τύπος Οχήματος ────────────────────────────────────────────
 function renderDepots(data){
@@ -396,47 +342,6 @@ function renderDepots(data){
   wrap.innerHTML=h;
 }
 
-// ── three-way comparison: Προβλεπόμενα / Ημερήσιος / Εκτελεσμένα ────────────
-function renderComparison(sched, filter){
-  const wrap = document.getElementById("comparison-table-wrap");
-  const rows = (sched && sched.comparison) ? sched.comparison.slice() : [];
-  if(!rows.length){
-    wrap.innerHTML='<div class="empty-state">Δεν υπάρχουν δεδομένα σύγκρισης. '+
-      'Το κανονικό πρόγραμμα συγχρονίζεται στο επόμενο sync_schedules.</div>';
-    return;
-  }
-  const f=(filter||"").trim().toLowerCase();
-  const shown = f ? rows.filter(r=>
-    (r.line_id||"").toLowerCase().includes(f) ||
-    (r.route_name||"").toLowerCase().includes(f)) : rows;
-
-  shown.sort((a,b)=>(b.planned_cuts+b.failures)-(a.planned_cuts+a.failures));
-
-  let h='<table class="data-table"><thead><tr>'+
-    '<th>Γραμμή</th><th>Διαδρομή</th>'+
-    '<th style="text-align:right">Προβλεπόμενα</th>'+
-    '<th style="text-align:right">Ημερήσιος</th>'+
-    '<th style="text-align:right">Εκτελεσμένα</th>'+
-    '<th style="text-align:right">Περικοπές</th>'+
-    '<th style="text-align:right">Αποτυχίες</th></tr></thead><tbody>';
-  shown.forEach(r=>{
-    const cuts = r.planned_cuts>0
-      ? `<span style="color:var(--amber,#e0a458)">−${r.planned_cuts}</span>` : "0";
-    const fails = r.failures>0
-      ? `<span style="color:#e06b6b">−${r.failures}</span>` : "0";
-    h+=`<tr>
-      <td><strong>${r.line_id||"—"}</strong></td>
-      <td style="color:var(--slate);font-size:.8rem">${r.route_name||""} <span style="opacity:.6">(${r.direction})</span></td>
-      <td class="mono" style="text-align:right">${r.normal||"—"}</td>
-      <td class="mono" style="text-align:right">${r.daily||"—"}</td>
-      <td class="mono" style="text-align:right">${r.executed||0}</td>
-      <td class="mono" style="text-align:right">${cuts}</td>
-      <td class="mono" style="text-align:right">${fails}</td>
-    </tr>`;
-  });
-  h+='</tbody></table>';
-  wrap.innerHTML=h;
-}
 
 // ── init ───────────────────────────────────────────────────────────────────
 initDatePicker().catch(err=>{

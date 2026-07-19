@@ -131,7 +131,7 @@
   .btn-export:focus-visible{outline:none;box-shadow:var(--focus);}
 
   /* ── tables ── */
-  #vehicle-table-wrap,#schedule-table-wrap,#kartelakia-wrap,#comparison-wrap{
+  #vehicle-table-wrap,#schedule-table-wrap{
     background:var(--bg2);border:1px solid var(--line);border-radius:var(--radius);
     overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;
     box-shadow:var(--shadow);
@@ -209,7 +209,6 @@
     <div class="stat-row">
       <div class="stat"><div class="stat-label">Ημερομηνία</div><div class="stat-value mono" id="stat-date">—</div></div>
       <div class="stat"><div class="stat-label">Εκτέλεση</div><div class="stat-value mono" id="stat-completion">—</div></div>
-      <div class="stat"><div class="stat-label">Πραγματικά</div><div class="stat-value mono" id="stat-actual">—</div></div>
       <div class="stat"><div class="stat-label">Προγρ/να</div><div class="stat-value mono" id="stat-scheduled">—</div></div>
       <div class="stat"><div class="stat-label">Διαδρομές</div><div class="stat-value mono" id="stat-routes">—</div></div>
       <div class="stat"><div class="stat-label">Οχήματα</div><div class="stat-value mono" id="stat-vehicles">—</div></div>
@@ -221,9 +220,7 @@
   <div class="tabs">
     <div class="tab active" data-tab="vehicles">Οχήματα</div>
     <div class="tab" data-tab="schedule">Κατανομή Δρομολογίων</div>
-    <div class="tab" data-tab="comparison">Πρόγραμμα</div>
     <div class="tab" data-tab="depots">Αμαξοστάσια</div>
-    <div class="tab" data-tab="kartelakia">Καρτελάκια</div>
     <div class="tab" data-tab="health">Pipeline</div>
   </div>
 
@@ -240,22 +237,6 @@
       </div>
     </div>
     <div id="vehicle-table-wrap"><div class="empty-state">Φόρτωση…</div></div>
-  </div>
-
-  <!-- Πρόγραμμα (τριπλή σύγκριση) -->
-  <div class="tab-panel" id="tab-comparison">
-    <div class="panel-head">
-      <div class="panel-title">Προβλεπόμενα · Ημερήσιος · Εκτελεσμένα</div>
-      <div class="controls">
-        <input type="search" id="cmp-search" placeholder="Αναζήτηση γραμμής…">
-      </div>
-    </div>
-    <p style="font-size:.8rem;color:var(--slate);margin:.2rem 0 1rem;line-height:1.5;">
-      <strong>Προβλεπόμενα</strong>: το κανονικό πρόγραμμα. ·
-      <strong>Ημερήσιος</strong>: το αναθεωρημένο πλάνο της ημέρας (γνωστές ελλείψεις). ·
-      <strong>Εκτελεσμένα</strong>: τι όντως έγινε (κατά προσέγγιση).
-    </p>
-    <div id="comparison-table-wrap"><div class="empty-state">Φόρτωση…</div></div>
   </div>
 
   <!-- Αμαξοστάσια / Τύπος Οχήματος -->
@@ -282,17 +263,6 @@
     <div id="schedule-table-wrap"><div class="empty-state">Επιλέξτε γραμμή.</div></div>
   </div>
 
-  <!-- Καρτελάκια -->
-  <div class="tab-panel" id="tab-kartelakia">
-    <div class="panel-head">
-      <div class="panel-title">Καρτελάκια</div>
-      <div class="controls">
-        <select class="ctrl" id="kart-line-select"><option value="">— Γραμμή —</option></select>
-        <select class="ctrl" id="kart-route-select" style="display:none"><option value="">— Διαδρομή —</option></select>
-      </div>
-    </div>
-    <div id="kartelakia-wrap"><div class="empty-state">Επιλέξτε γραμμή.</div></div>
-  </div>
 
   <!-- Pipeline -->
   <div class="tab-panel" id="tab-health">

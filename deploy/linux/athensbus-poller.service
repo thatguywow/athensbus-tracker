@@ -1,0 +1,19 @@
+# systemd unit — poller. Εγκατάσταση:
+#   sudo cp athensbus-poller.service /etc/systemd/system/
+#   (διόρθωσε User και WorkingDirectory)
+#   sudo systemctl daemon-reload && sudo systemctl enable --now athensbus-poller
+[Unit]
+Description=Athens Bus Tracker - OASA poller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+WorkingDirectory=/opt/athensbus-tracker
+ExecStart=/usr/bin/python3 scripts/local_poller.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

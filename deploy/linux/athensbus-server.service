@@ -1,0 +1,21 @@
+# systemd unit — dashboard server. Εγκατάσταση:
+#   sudo cp athensbus-server.service /etc/systemd/system/
+#   (διόρθωσε User, WorkingDirectory και, αν θες, PORT/CYCLE_MINUTES)
+#   sudo systemctl daemon-reload && sudo systemctl enable --now athensbus-server
+[Unit]
+Description=Athens Bus Tracker - self-hosted dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+WorkingDirectory=/opt/athensbus-tracker
+Environment=PORT=8000
+Environment=CYCLE_MINUTES=15
+ExecStart=/usr/bin/python3 scripts/serve_site.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

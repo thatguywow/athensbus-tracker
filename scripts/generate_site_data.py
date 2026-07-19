@@ -88,13 +88,24 @@ def generate_for_date(conn, service_date: str):
         SELECT COUNT(*) c FROM normal_schedule WHERE schedule_date=?
     """, (service_date,)).fetchone()["c"]
 
+    # Execution % = scheduled slots that actually got a vehicle / all scheduled
+    # slots. Counting raw trips against slots breaks past 100% whenever the
+    # schedule shrinks mid-day (mirror) or extra/split trips exist; slot
+    # coverage is by construction bounded at 100%.
+    matched_slots = conn.execute("""
+        SELECT COUNT(DISTINCT route_code || '|' || scheduled_departure) c
+        FROM slot_assignments
+        WHERE service_date=? AND scheduled_departure IS NOT NULL
+    """, (service_date,)).fetchone()["c"]
+    completion = round(min(100.0, matched_slots/sys_sched*100), 1) if sys_sched else None
+
     write_json(os.path.join(ddir, "summary.json"), {
         "service_date":            service_date,
         "generated_at":            db.now_utc_iso(),
         "system_actual_trips":     sys_actual,
         "system_scheduled_trips":  sys_sched,
         "system_normal_trips":     sys_normal,
-        "system_completion_pct":   round(sys_actual/sys_sched*100,1) if sys_sched else None,
+        "system_completion_pct":   completion,
         "route_count":             len(routes_latest),
         "total_vehicles":          total_vehicles,
         "routes":                  routes_latest,
