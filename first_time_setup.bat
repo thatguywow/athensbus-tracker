@@ -1,5 +1,5 @@
 @echo off
-cd /d D:\athensbus-tracker
+cd /d "%~dp0"
 echo ============================================
 echo  ΑΘΗΝΑ ΛΕΩΦΟΡΕΙΑ - First Time Setup
 echo ============================================

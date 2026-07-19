@@ -19,6 +19,7 @@ leave a terminal open with run_poller.bat.
 from __future__ import annotations
 
 import logging
+from logging.handlers import RotatingFileHandler
 import sys
 import time
 import queue
@@ -36,7 +37,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("local_poller.log", encoding="utf-8"),
+        RotatingFileHandler("local_poller.log", maxBytes=5_000_000, backupCount=2, encoding="utf-8"),
     ],
 )
 log = logging.getLogger("local_poller")
@@ -57,6 +58,7 @@ PASS_TRUST_MINS      = 5     # a disappearance counts as a passage only if the
                              # further away = withdrawn/cancelled, not passed
 COMMIT_EVERY_SECS    = 2.0
 LOG_EVERY_SECS       = 60
+JOB_RUN_EVERY_SECS   = 900   # job_runs εγγραφή κάθε 15' (το log μένει ανά λεπτό)
 
 CHECKPOINT_DEPTH = EDGE_DEPTH   # get_terminus_stops uses this
 
@@ -384,15 +386,19 @@ def main():
     last_log = time.time()
 
     try:
+        last_job_run = 0.0
         while True:
             if time.time() - last_log >= LOG_EVERY_SECS:
                 log.info("two-speed: passages=%d  queue(stop=%d result=%d)",
                          stats["passages"], work_q.qsize(), result_q.qsize())
-                try:
-                    with db.job_run("local_poll") as run:
-                        run.detail = (f"passages={stats['passages']} qlag={work_q.qsize()}")
-                except Exception:
-                    pass
+                # job_runs: αραιά (κάθε 15′) — 1 εγγραφή/λεπτό πνίγει το Pipeline
+                if time.time() - last_job_run >= JOB_RUN_EVERY_SECS:
+                    try:
+                        with db.job_run("local_poll") as run:
+                            run.detail = (f"passages={stats['passages']} qlag={work_q.qsize()}")
+                    except Exception:
+                        pass
+                    last_job_run = time.time()
                 last_log = time.time()
             time.sleep(0.1)
     except KeyboardInterrupt:

@@ -20,6 +20,7 @@ Set up in Windows Task Scheduler:
 from __future__ import annotations
 
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import subprocess
 import sys
@@ -29,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import db
 import oasa_client as oasa
+import sync_master_data
 from sync_schedules import main as sync_schedules
 from compute_daily_report import main as compute_report
 from generate_site_data import main as generate_site
@@ -39,8 +41,8 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(),
         # Absolute path: Task Scheduler's CWD may differ from the repo root.
-        logging.FileHandler(str(Path(__file__).parent.parent / "run_hourly.log"),
-                            encoding="utf-8"),
+        RotatingFileHandler(str(Path(__file__).parent.parent / "run_hourly.log"),
+                            maxBytes=5_000_000, backupCount=2, encoding="utf-8"),
     ],
     # Imported modules (sync_schedules etc.) call basicConfig at import time,
     # which would otherwise make this call a no-op — the file handler was never
@@ -52,6 +54,22 @@ log = logging.getLogger("run_hourly")
 # Root of the repo (one level up from scripts/)
 REPO_ROOT = str(Path(__file__).parent.parent)
 
+
+
+def _master_sync_due(conn) -> bool:
+    """True αν ο τελευταίος επιτυχής master sync είναι >7 ημέρες πίσω (ή δεν
+    έχει γίνει ποτέ) — γραμμές/διαδρομές/στάσεις ανανεώνονται εβδομαδιαία."""
+    row = conn.execute(
+        "SELECT MAX(started_at) m FROM job_runs "
+        "WHERE job_name='sync_master_data' AND status='success'").fetchone()
+    if not row or not row["m"]:
+        return True
+    from datetime import datetime, timezone, timedelta
+    try:
+        last = datetime.fromisoformat(row["m"])
+    except ValueError:
+        return True
+    return datetime.now(timezone.utc) - last > timedelta(days=7)
 
 def schedule_already_synced_today(conn) -> bool:
     today = date.today().isoformat()
@@ -109,17 +127,21 @@ def main():
 
     conn = db.get_connection()
 
-    # Step 1: sync today's schedule — EVERY hour. The freeze-merge in
-    # sync_schedules makes this safe and idempotent: past times stay frozen,
-    # future times follow OASA's latest daily feed (mid-day revisions like
-    # X95's are picked up within the hour). The rarely-changing NORMAL
-    # timetable is only synced on the first run of the day.
-    first_sync_of_day = not schedule_already_synced_today(conn)
+    # Step 0: master data (γραμμές/διαδρομές/στάσεις) — αυτόματη εβδομαδιαία
+    # ανανέωση, ώστε νέες γραμμές, αλλαγές διαδρομών και οι εποχιακές
+    # μεταβάσεις (θερινό/χειμερινό) να πιάνονται χωρίς χειροκίνητο setup.
+    if _master_sync_due(conn):
+        log.info("Master data refresh (weekly)...")
+        try:
+            sync_master_data.main()
+        except Exception as e:
+            log.warning("Master sync failed (non-fatal): %s", e)
+
+    # Step 1: sync today's schedule — EVERY hour (silent mirror + safety nets).
     conn.close()
-    log.info("Syncing today's schedule (%s)...",
-             "full, first of day" if first_sync_of_day else "daily refresh")
+    log.info("Syncing today's schedule...")
     try:
-        sync_schedules(include_normal=first_sync_of_day)
+        sync_schedules.main()
     except Exception as e:
         log.warning("Schedule sync failed (non-fatal): %s", e)
 

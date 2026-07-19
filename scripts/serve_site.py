@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
 import threading
@@ -45,7 +46,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler(str(REPO_ROOT / "serve_site.log"), encoding="utf-8"),
+        RotatingFileHandler(str(REPO_ROOT / "serve_site.log"), maxBytes=5_000_000, backupCount=2, encoding="utf-8"),
     ],
     force=True,   # imported modules configure logging first; override them
 )
@@ -78,12 +79,6 @@ def start_web_server(port: int) -> ThreadingHTTPServer:
 _last_daily_sync_hour: str | None = None   # "YYYY-MM-DDTHH" of last daily sync
 
 
-def _schedule_synced_today(conn) -> bool:
-    today = date.today().isoformat()
-    row = conn.execute(
-        "SELECT COUNT(*) c FROM scheduled_trips WHERE schedule_date=?", (today,)
-    ).fetchone()
-    return (row["c"] or 0) > 0
 
 
 def run_cycle():
@@ -91,20 +86,39 @@ def run_cycle():
     global _last_daily_sync_hour
 
     import sync_schedules
+    import sync_master_data
     import compute_daily_report
     import generate_site_data
 
-    # 1) schedule sync — at most once per hour; normal (weekly) schedule only
-    #    on the first sync of the day. Ίδια λογική με το run_hourly.
+    # 0) master data (γραμμές/διαδρομές/στάσεις) — εβδομαδιαία ανανέωση, ώστε
+    #    νέες γραμμές/αλλαγές διαδρομών/εποχιακά προγράμματα να πιάνονται
+    #    αυτόματα. Ελαφρύς έλεγχος: μία ερώτηση στο job_runs.
+    conn = db.get_connection()
+    row = conn.execute(
+        "SELECT MAX(started_at) m FROM job_runs "
+        "WHERE job_name='sync_master_data' AND status='success'").fetchone()
+    conn.close()
+    due = True
+    if row and row["m"]:
+        try:
+            from datetime import timezone, timedelta
+            due = (datetime.now(timezone.utc)
+                   - datetime.fromisoformat(row["m"])) > timedelta(days=7)
+        except ValueError:
+            pass
+    if due:
+        log.info("Master data refresh (εβδομαδιαίο)...")
+        try:
+            sync_master_data.main()
+        except Exception as e:
+            log.warning("Master sync απέτυχε (μη μοιραίο): %s", e)
+
+    # 1) schedule sync — το πολύ μία φορά την ώρα (silent mirror + δίχτυα)
     hour_key = datetime.now().strftime("%Y-%m-%dT%H")
     if _last_daily_sync_hour != hour_key:
-        conn = db.get_connection()
-        first_of_day = not _schedule_synced_today(conn)
-        conn.close()
-        log.info("Sync προγράμματος (%s)...",
-                 "πλήρης, πρώτος της μέρας" if first_of_day else "ωριαίο refresh")
+        log.info("Sync προγράμματος...")
         try:
-            sync_schedules.main(include_normal=first_of_day)
+            sync_schedules.main()
             _last_daily_sync_hour = hour_key
         except Exception as e:
             log.warning("Sync απέτυχε (μη μοιραίο): %s", e)

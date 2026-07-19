@@ -59,6 +59,22 @@ journalctl -u athensbus-server -f
 > Ο ενσωματωμένος server σερβίρει ΜΟΝΟ στατικά αρχεία του `docs/` — η βάση
 > και τα scripts δεν εκτίθενται.
 
+## Χωρητικότητα & συντήρηση (μικροί δίσκοι, π.χ. VPS 20GB)
+
+Ενδεικτική κατανάλωση: βάση **~0,5-2GB** σε πλήρη λειτουργία (οι ακατέργαστες
+διελεύσεις καθαρίζονται αυτόματα στις 30 ημέρες), logs **≤15MB** συνολικά
+(αυτόματο rotation 5MB × 2 backups ανά αρχείο). Σε VPS 20GB (OS ~5GB) το
+περιθώριο είναι άνετο.
+
+Το SQLite όμως δεν «επιστρέφει» χώρο στο λειτουργικό — το αρχείο μένει στο
+μέγιστο μέγεθος που έπιασε. Προαιρετική μηνιαία συρρίκνωση:
+```bash
+sudo systemctl stop athensbus-poller athensbus-server
+python3 scripts/vacuum_db.py
+sudo systemctl start athensbus-poller athensbus-server
+```
+(Το docstring του `scripts/vacuum_db.py` έχει έτοιμη γραμμή cron.)
+
 ## Πού βλέπω τι γίνεται
 
 - `journalctl -u athensbus-poller -f` ή `local_poller.log`

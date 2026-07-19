@@ -83,10 +83,6 @@ def generate_for_date(conn, service_date: str):
         SELECT COUNT(DISTINCT vehicle_no) c FROM trips WHERE service_date=?
     """, (service_date,)).fetchone()["c"]
 
-    # System-wide normal (theoretical) trip count for three-way comparison
-    sys_normal = conn.execute("""
-        SELECT COUNT(*) c FROM normal_schedule WHERE schedule_date=?
-    """, (service_date,)).fetchone()["c"]
 
     # Execution % = scheduled slots that actually got a vehicle / all scheduled
     # slots. Counting raw trips against slots breaks past 100% whenever the
@@ -104,7 +100,6 @@ def generate_for_date(conn, service_date: str):
         "generated_at":            db.now_utc_iso(),
         "system_actual_trips":     sys_actual,
         "system_scheduled_trips":  sys_sched,
-        "system_normal_trips":     sys_normal,
         "system_completion_pct":   completion,
         "route_count":             len(routes_latest),
         "total_vehicles":          total_vehicles,
@@ -214,39 +209,9 @@ def generate_for_date(conn, service_date: str):
             "ended_at":      None,
         })
 
-    # Per-route three-way comparison: Normal / Daily / Executed
-    route_comparison = []
-    for r in conn.execute("""
-        SELECT r.route_code, r.line_code, l.line_id, r.descr AS route_name, r.route_type,
-            (SELECT COUNT(*) FROM normal_schedule ns
-             WHERE ns.route_code=r.route_code AND ns.schedule_date=?) AS normal_count,
-            (SELECT COUNT(DISTINCT st.departure_time) FROM scheduled_trips st
-             WHERE st.route_code=r.route_code AND st.schedule_date=?) AS daily_count,
-            (SELECT COUNT(*) FROM trips t
-             WHERE t.route_code=r.route_code AND t.service_date=?) AS executed_count
-        FROM routes r
-        LEFT JOIN lines l ON l.line_code=r.line_code
-    """, (service_date, service_date, service_date)).fetchall():
-        nc, dc, ec = r["normal_count"], r["daily_count"], r["executed_count"]
-        if not (nc or dc or ec):
-            continue
-        route_comparison.append({
-            "route_code":   r["route_code"],
-            "line_code":    r["line_code"],
-            "line_id":      r["line_id"] or r["line_code"],
-            "route_name":   r["route_name"],
-            "direction":    "Εξερχόμενη" if r["route_type"]=="1" else "Εισερχόμενη",
-            "normal":       nc,    # Προβλεπόμενα
-            "daily":        dc,    # Ημερήσιος προγραμματισμός
-            "executed":     ec,    # Εκτελεσμένα
-            "planned_cuts": (nc - dc) if (nc and dc is not None and nc >= dc) else 0,
-            "failures":     (dc - ec) if (dc and ec is not None and dc >= ec) else 0,
-        })
-
     write_json(os.path.join(ddir, "schedule_distribution.json"), {
         "date": service_date, "generated_at": db.now_utc_iso(),
         "trips": dist_rows,
-        "comparison": route_comparison,
     })
 
     # ── Depots / vehicle types: which vehicle types ran from each depot today ──
@@ -288,42 +253,6 @@ def generate_for_date(conn, service_date: str):
         "unclassified_count": len(unknown),
     })
 
-    # ── kartelakia (slot schedule) ────────────────────────────────────────────
-    # Per route: ordered list of scheduled departures with their STABLE καρτελάκι
-    # (ordinal position mod slot_count). Independent of whether a trip ran, so the
-    # pattern is consistent day to day. Where a trip executed, prefer its matched
-    # slot_assignment; otherwise fall back to the stable ordinal lookup.
-    slot_rows = []
-    for r in conn.execute("""
-        SELECT st.route_code, r.line_code, l.line_id,
-               r.descr AS route_name, r.route_type,
-               st.departure_time,
-               (SELECT slot_number FROM slot_assignments sa
-                JOIN trips t ON t.id=sa.trip_id
-                WHERE t.route_code=st.route_code AND t.service_date=st.schedule_date
-                  AND sa.scheduled_departure=st.departure_time
-                LIMIT 1) AS slot_number
-        FROM scheduled_trips st
-        LEFT JOIN routes r ON r.route_code=st.route_code
-        LEFT JOIN lines l ON l.line_code=r.line_code
-        WHERE st.schedule_date=?
-        GROUP BY st.route_code, st.departure_time
-        ORDER BY r.line_code, st.route_code, st.departure_time
-    """, (service_date,)).fetchall():
-        slot_rows.append({
-            "route_code":   r["route_code"],
-            "line_code":    r["line_code"],
-            "line_id":      r["line_id"] or r["line_code"],
-            "route_name":   r["route_name"],
-            "direction":    "Εξερχόμενη" if r["route_type"]=="1" else "Εισερχόμενη",
-            "scheduled_dep": r["departure_time"],
-            "slot_number":  r["slot_number"],
-            "slot_label":   f"Καρτελάκι {r['slot_number']}" if r["slot_number"] else "—",
-        })
-
-    write_json(os.path.join(ddir, "kartelakia.json"), {
-        "date": service_date, "generated_at": db.now_utc_iso(), "slots": slot_rows
-    })
 
     # ── pipeline health (shared, not date-specific) ───────────────────────────
     jobs = conn.execute("""
@@ -337,7 +266,7 @@ def generate_for_date(conn, service_date: str):
 
     print(f"  Generated data for {service_date}: "
           f"{len(routes_latest)} routes, {len(va_rows)} vehicle records, "
-          f"{len(dist_rows)} schedule entries, {len(slot_rows)} slot entries")
+          f"{len(dist_rows)} schedule entries")
 
 
 def main():
