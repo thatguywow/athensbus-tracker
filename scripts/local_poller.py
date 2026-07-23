@@ -253,7 +253,13 @@ def _writer_thread(result_q, stop_meta, stats, stop_event):
                 pass_dt = seen_dt + timedelta(minutes=info["btime2"])
                 miss_dt = datetime.fromisoformat(info["miss_at"])
                 if pass_dt > miss_dt:
-                    pass_dt = miss_dt   # passed before it first went missing
+                    # The vehicle passed somewhere in (last seen, first miss].
+                    # OASA's prediction overshoots that window, so instead of
+                    # pinning to the window END (systematic lateness up to a
+                    # full cycle), estimate the MIDPOINT: zero average bias,
+                    # half the worst-case error. Nothing else changes — same
+                    # passage, same ordering, just a better timestamp.
+                    pass_dt = seen_dt + (miss_dt - seen_dt) / 2
                 pass_iso = pass_dt.isoformat()
                 sd = _athens_date(pass_dt)
                 for (rc, stype, order) in stop_meta.get(stop_code, []):
