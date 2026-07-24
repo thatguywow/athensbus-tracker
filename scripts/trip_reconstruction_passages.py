@@ -171,6 +171,15 @@ def _split_trips(passages: list[dict], route_duration: float | None) -> list[lis
     gap_limit = (route_duration * 1.5) if route_duration else 90.0
     gap_limit = max(gap_limit, 60.0)
 
+    # Edge-cluster jitter: while a vehicle departs the origin (or closes on the
+    # terminus), the adjacent edge stops can record its passage seconds apart
+    # and OUT OF ORDER (each stop is polled at a different moment of the
+    # cycle). A tiny regression within a short window is measurement noise of
+    # the SAME trip — not a new one. Without this, one departure becomes two
+    # 1-point ghost trips that each grab a schedule slot.
+    JITTER_MINS = 3.0     # regressions within this window are noise…
+    ORDER_JITTER = 3      # …if the order drop stays inside the edge cluster
+
     trips: list[list[dict]] = []
     cur: list[dict] = []
     for p in passages:
@@ -179,7 +188,9 @@ def _split_trips(passages: list[dict], route_duration: float | None) -> list[lis
             continue
         prev = cur[-1]
         gap = (_parse(p["passed_at"]) - _parse(prev["passed_at"])).total_seconds() / 60
-        if p["stop_order"] <= prev["stop_order"] or gap > gap_limit:
+        regressed = p["stop_order"] <= prev["stop_order"]
+        jitter = (prev["stop_order"] - p["stop_order"]) <= ORDER_JITTER and gap <= JITTER_MINS
+        if (regressed and not jitter) or gap > gap_limit:
             trips.append(cur)
             cur = [p]
         else:
