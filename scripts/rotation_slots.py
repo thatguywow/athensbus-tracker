@@ -407,8 +407,22 @@ def assign_slots(conn, route_code: str, service_date: str,
     sched_mins = [_time_to_mins(g["departure_time"]) for g in grid]
 
     trip_rows = conn.execute("""
-        SELECT id, vehicle_no, started_at, ended_at FROM trips
-        WHERE route_code=? AND service_date=? ORDER BY started_at
+        SELECT id, vehicle_no, started_at, ended_at FROM trips t
+        WHERE route_code=? AND service_date=?
+          -- Only trips whose DEPARTURE was actually observed take part in
+          -- slot matching: at least one passage on the origin side of the
+          -- route. Tail-only fragments (e.g. just the last 2 stops of a lap
+          -- whose start was missed) have a fake "departure" equal to their
+          -- first sighting near the terminus — letting them grab a slot
+          -- produces phantom rows like "05:00 → dep 05:39". Their terminus
+          -- data still counts everywhere else; they just don't claim slots.
+          AND EXISTS (
+              SELECT 1 FROM trip_stop_times x
+              WHERE x.trip_id = t.id
+                AND x.stop_order <= (SELECT (MIN(stop_order)+MAX(stop_order))/2.0
+                                     FROM stops s WHERE s.route_code = t.route_code)
+          )
+        ORDER BY started_at
     """, (route_code, service_date)).fetchall()
 
     if not trip_rows:
