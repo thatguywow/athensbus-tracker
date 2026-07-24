@@ -186,6 +186,7 @@ def _split_trips(passages: list[dict], route_duration: float | None,
     ORDER_JITTER = 3         # …if the order drop stays inside the edge cluster
     TERMINAL_CLUSTER = 8.0   # minutes: arrival stragglers / dwell-ghost window
     young_limit = (route_duration * 0.5) if route_duration else 20.0
+    mature_mins = (route_duration * 0.5) if route_duration else 20.0
 
     trips: list[list[dict]] = []
     cur: list[dict] = []
@@ -199,17 +200,31 @@ def _split_trips(passages: list[dict], route_duration: float | None,
         regressed = p["stop_order"] <= prev["stop_order"]
         jitter = (prev["stop_order"] - p["stop_order"]) <= ORDER_JITTER and gap <= JITTER_MINS
 
-        # LOOP straggler: terminus-side point arriving while `cur` is still a
-        # young origin cluster → it is the previous trip's arrival tail.
+        # LOOP: a terminus-side point arriving while `cur` is still a young
+        # origin-only cluster cannot belong to `cur` (it could not possibly
+        # have crossed the route yet) — it closes the PREVIOUS lap.
         if (loop_mid is not None and trips
                 and p["stop_order"] > loop_mid
                 and all(q["stop_order"] <= loop_mid for q in cur)
                 and (pdt - _parse(cur[0]["passed_at"])).total_seconds() / 60 < young_limit):
-            prev_trip_last = trips[-1][-1]
-            if (prev_trip_last["stop_order"] > loop_mid
-                    and (pdt - _parse(prev_trip_last["passed_at"])).total_seconds() / 60
+            prev_trip = trips[-1]
+            prev_last = prev_trip[-1]
+            prev_has_arrival = any(q["stop_order"] > loop_mid for q in prev_trip)
+            attach = False
+            if (prev_last["stop_order"] > loop_mid
+                    and (pdt - _parse(prev_last["passed_at"])).total_seconds() / 60
                         <= TERMINAL_CLUSTER):
-                trips[-1].append(p)
+                attach = True    # (a) straggler of an arrival already under way
+            elif (not prev_has_arrival
+                  and (pdt - _parse(prev_trip[0]["passed_at"])).total_seconds() / 60
+                      >= mature_mins):
+                # (b) the previous lap left the origin long enough ago and never
+                # registered an arrival — this IS its arrival. Without this, the
+                # lap stays open ("—") and the fresh origin point plus these
+                # terminus points fake a one-minute lap.
+                attach = True
+            if attach:
+                prev_trip.append(p)
                 continue
 
         if (regressed and not jitter) or gap > gap_limit:
@@ -230,9 +245,13 @@ def _split_trips(passages: list[dict], route_duration: float | None,
                     and (_parse(t[-1]["passed_at"]) - _parse(t[0]["passed_at"]))
                         .total_seconds() / 60 <= JITTER_MINS):
                 prev_last = kept[-1][-1] if kept else None
+                delta = ((_parse(t[0]["passed_at"]) - _parse(prev_last["passed_at"]))
+                         .total_seconds() / 60) if prev_last is not None else None
+                # Must come AFTER the arrival: a cluster recorded BEFORE the
+                # previous lap's (late-registered) arrival is a real departure,
+                # not parking noise — hence delta >= 0.
                 if (prev_last is not None and prev_last["stop_order"] > loop_mid
-                        and (_parse(t[0]["passed_at"]) - _parse(prev_last["passed_at"]))
-                            .total_seconds() / 60 <= TERMINAL_CLUSTER):
+                        and delta is not None and 0 <= delta <= TERMINAL_CLUSTER):
                     continue   # parked-at-terminal noise → drop
             kept.append(t)
         trips = kept
@@ -331,9 +350,15 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
     distinct_vehicles = set()
 
     for vehicle_no, plist in by_vehicle.items():
-        for trip in _split_trips(plist, route_duration, loop_mid):
+        vehicle_trips = _split_trips(plist, route_duration, loop_mid)
+        for _ti, trip in enumerate(vehicle_trips):
             if not trip:
                 continue
+            # First passage of this vehicle's NEXT lap — an ESTIMATED arrival
+            # may never postdate it (the bus cannot still be arriving after it
+            # has been seen starting again).
+            next_first_dt = (_parse(vehicle_trips[_ti + 1][0]["passed_at"])
+                             if _ti + 1 < len(vehicle_trips) else None)
 
             origin_side = [(p["stop_order"], _parse(p["passed_at"]))
                            for p in trip if p["stop_order"] <= mid]
@@ -382,6 +407,17 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
                     terminus_dt = None
             else:
                 terminus_dt = None   # incomplete — never observed finishing
+
+            # Cap on ESTIMATES only: an extrapolated arrival that runs past the
+            # vehicle's next observed passage produced the "arrives 07:13 but
+            # departs 07:11" inversions. The cap never pulls the arrival before
+            # this lap's own last real passage — on loop routes the next lap's
+            # origin stop is physically passed BEFORE the arrival stops, so the
+            # raw next-passage time can legitimately precede the arrival.
+            if terminus_dt and term_hit is None and next_first_dt:
+                hard_cap = max(next_first_dt, last_dt)
+                if terminus_dt > hard_cap:
+                    terminus_dt = hard_cap
 
             # guard: arrival must be after departure
             if terminus_dt and terminus_dt <= started_dt:
