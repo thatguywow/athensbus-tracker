@@ -36,6 +36,7 @@ except Exception:
 
 log = logging.getLogger("trip_reconstruction_passages")
 
+LOOP_TERMINAL_METRES = 300   # first/last stop this close ⇒ loop route
 TRIP_GAP_MINUTES = 25   # gap between consecutive passages that splits trips
 OVERLAP_HOURS    = 3    # read past the 04:00 day end so 04:00-crossing trips stay whole
 MIN_DURATION_FRACTION = 0.3   # arrival implying < 30% of typical duration → incomplete
@@ -157,7 +158,8 @@ def _boundary_owner_is_this_day(conn, route_code: str, started_dt: datetime,
     return mine < theirs
 
 
-def _split_trips(passages: list[dict], route_duration: float | None) -> list[list[dict]]:
+def _split_trips(passages: list[dict], route_duration: float | None,
+                 loop_mid: float | None = None) -> list[list[dict]]:
     """
     Chain one vehicle's passages (already sorted by passed_at) into trips.
 
@@ -165,20 +167,25 @@ def _split_trips(passages: list[dict], route_duration: float | None) -> list[lis
     gap between the origin-side cluster and the terminus-side cluster is normally
     large (the whole traversal). Therefore we split a new trip when stop_order
     does NOT advance (a reset back toward the origin), and only use a time gap as
-    a secondary guard when it exceeds a generous span (≈1.5× the route duration),
-    which catches "advancing but clearly a different trip hours later" cases.
+    a secondary guard when it exceeds a generous span (≈1.5× the route duration).
+
+    loop_mid: set to the route midpoint for LOOP routes (first/last stop at the
+    same physical terminal). There, arrival passages and the next departure's
+    origin passage INTERLEAVE in time (…40 → 1 → 41…), which naively produces
+    45-second "laps" and back-to-back ghosts. Two loop rules fix this:
+      • straggler routing: a terminus-side point that lands right after a fresh
+        origin cluster, within TERMINAL_CLUSTER of the previous trip's last
+        terminus point, belongs to the PREVIOUS trip (it is its arrival tail);
+      • dwell ghosts: an origin-only micro-cluster recorded seconds after an
+        arrival (vehicle parked at the terminal) is noise — dropped.
     """
     gap_limit = (route_duration * 1.5) if route_duration else 90.0
     gap_limit = max(gap_limit, 60.0)
 
-    # Edge-cluster jitter: while a vehicle departs the origin (or closes on the
-    # terminus), the adjacent edge stops can record its passage seconds apart
-    # and OUT OF ORDER (each stop is polled at a different moment of the
-    # cycle). A tiny regression within a short window is measurement noise of
-    # the SAME trip — not a new one. Without this, one departure becomes two
-    # 1-point ghost trips that each grab a schedule slot.
-    JITTER_MINS = 3.0     # regressions within this window are noise…
-    ORDER_JITTER = 3      # …if the order drop stays inside the edge cluster
+    JITTER_MINS = 3.0        # tiny regressions within this window are noise…
+    ORDER_JITTER = 3         # …if the order drop stays inside the edge cluster
+    TERMINAL_CLUSTER = 8.0   # minutes: arrival stragglers / dwell-ghost window
+    young_limit = (route_duration * 0.5) if route_duration else 20.0
 
     trips: list[list[dict]] = []
     cur: list[dict] = []
@@ -187,9 +194,24 @@ def _split_trips(passages: list[dict], route_duration: float | None) -> list[lis
             cur = [p]
             continue
         prev = cur[-1]
-        gap = (_parse(p["passed_at"]) - _parse(prev["passed_at"])).total_seconds() / 60
+        pdt = _parse(p["passed_at"])
+        gap = (pdt - _parse(prev["passed_at"])).total_seconds() / 60
         regressed = p["stop_order"] <= prev["stop_order"]
         jitter = (prev["stop_order"] - p["stop_order"]) <= ORDER_JITTER and gap <= JITTER_MINS
+
+        # LOOP straggler: terminus-side point arriving while `cur` is still a
+        # young origin cluster → it is the previous trip's arrival tail.
+        if (loop_mid is not None and trips
+                and p["stop_order"] > loop_mid
+                and all(q["stop_order"] <= loop_mid for q in cur)
+                and (pdt - _parse(cur[0]["passed_at"])).total_seconds() / 60 < young_limit):
+            prev_trip_last = trips[-1][-1]
+            if (prev_trip_last["stop_order"] > loop_mid
+                    and (pdt - _parse(prev_trip_last["passed_at"])).total_seconds() / 60
+                        <= TERMINAL_CLUSTER):
+                trips[-1].append(p)
+                continue
+
         if (regressed and not jitter) or gap > gap_limit:
             trips.append(cur)
             cur = [p]
@@ -197,6 +219,23 @@ def _split_trips(passages: list[dict], route_duration: float | None) -> list[lis
             cur.append(p)
     if cur:
         trips.append(cur)
+
+    # LOOP dwell ghosts: origin-only micro-cluster seconds after an arrival
+    # (the vehicle is parked at the shared terminal, not departing).
+    if loop_mid is not None:
+        kept = []
+        for i, t in enumerate(trips):
+            if (i > 0 and len(t) <= 2
+                    and all(q["stop_order"] <= loop_mid for q in t)
+                    and (_parse(t[-1]["passed_at"]) - _parse(t[0]["passed_at"]))
+                        .total_seconds() / 60 <= JITTER_MINS):
+                prev_last = kept[-1][-1] if kept else None
+                if (prev_last is not None and prev_last["stop_order"] > loop_mid
+                        and (_parse(t[0]["passed_at"]) - _parse(prev_last["passed_at"]))
+                            .total_seconds() / 60 <= TERMINAL_CLUSTER):
+                    continue   # parked-at-terminal noise → drop
+            kept.append(t)
+        trips = kept
     return trips
 
 
@@ -226,6 +265,26 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
     if not bounds or bounds["lo"] is None:
         return {"route_code": route_code, "trips": 0, "departures": 0, "distinct_vehicles": 0}
     lo, hi = bounds["lo"], bounds["hi"]
+
+    # LOOP ROUTE DETECTION: some routes (e.g. 619) end at the same terminal
+    # they start from — not necessarily the same stop_code, but a neighbouring
+    # stop of the same terminal loop. Arrival and next-departure passages then
+    # interleave in time, which the splitter must handle specially.
+    loop_mid = None
+    ends = conn.execute(
+        "SELECT stop_order, stop_code, lat, lng FROM stops "
+        "WHERE route_code=? AND stop_order IN (?, ?)",
+        (route_code, lo, hi)).fetchall()
+    if len(ends) == 2:
+        a, b = ends[0], ends[1]
+        same = a["stop_code"] == b["stop_code"]
+        if not same and None not in (a["lat"], a["lng"], b["lat"], b["lng"]):
+            # crude metres: 1° lat ≈ 111km, 1° lng ≈ 88km at Athens' latitude
+            dx = (float(a["lat"]) - float(b["lat"])) * 111_000.0
+            dy = (float(a["lng"]) - float(b["lng"])) * 88_000.0
+            same = (dx * dx + dy * dy) ** 0.5 <= LOOP_TERMINAL_METRES
+        if same:
+            loop_mid = (lo + hi) / 2.0
     mid = (lo + hi) / 2.0
 
     # persistent route duration (for backward extrapolation when origin unseen)
@@ -272,7 +331,7 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
     distinct_vehicles = set()
 
     for vehicle_no, plist in by_vehicle.items():
-        for trip in _split_trips(plist, route_duration):
+        for trip in _split_trips(plist, route_duration, loop_mid):
             if not trip:
                 continue
 
@@ -288,7 +347,13 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
             if origin_hit:
                 started_dt = _parse(origin_hit["passed_at"])
             elif len(origin_side) >= 2:
-                started_dt = _linfit_predict(origin_side, lo) or origin_side[0][1]
+                # Guard: out-of-order edge passages (3 seen before 2) give the
+                # fit a negative slope, projecting the departure AFTER the
+                # vehicle was already observed. A departure can never postdate
+                # its own first passage — fall back to that observation.
+                earliest = min(t for _o, t in origin_side)
+                pred = _linfit_predict(origin_side, lo)
+                started_dt = pred if (pred and pred <= earliest) else earliest
             elif origin_side:
                 started_dt = origin_side[0][1]
             elif term_side and route_duration:
