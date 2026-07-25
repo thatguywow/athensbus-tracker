@@ -6,8 +6,11 @@ from __future__ import annotations
 
 import sqlite3
 import os
+import logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
+
+log = logging.getLogger(__name__)
 
 DB_PATH = os.environ.get("ATHENSBUS_DB_PATH", os.path.join(
     os.path.dirname(__file__), "..", "db", "athensbus.db"
@@ -49,6 +52,7 @@ def _migrate(conn):
     add_column("route_rotation", "median_trip_duration_mins", "REAL")
     add_column("route_rotation", "duration_samples", "TEXT")
 
+
     # stop_passages table (exact pass times via disappearance detection)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS stop_passages (
@@ -61,7 +65,7 @@ def _migrate(conn):
             passed_at    TEXT NOT NULL,
             service_date TEXT NOT NULL,
             recorded_at  TEXT NOT NULL,
-            UNIQUE(route_code, stop_code, vehicle_no, passed_at)
+            UNIQUE(route_code, stop_code, stop_order, vehicle_no, passed_at)
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_passages_route_date ON stop_passages(route_code, service_date)")
@@ -97,6 +101,69 @@ def _migrate(conn):
             UNIQUE(route_code, stop_order)
         )
     """)
+
+
+    # Loop-route fix: rebuild stop_passages if its UNIQUE key predates
+    # stop_order (see _migrate_passages_unique).
+    _migrate_passages_unique(conn)
+
+
+def _migrate_passages_unique(conn):
+    """
+    Rebuild stop_passages when its UNIQUE key still lacks stop_order.
+
+    Old key: (route_code, stop_code, vehicle_no, passed_at). On LOOP routes the
+    same stop_code is BOTH order 1 (origin) and order N (terminus), so the two
+    rows were identical under that key and INSERT OR IGNORE silently discarded
+    the terminus one — every lap lost its measured arrival. Runs once; on later
+    starts the check finds the new key and does nothing.
+    """
+    if not conn.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name='stop_passages'").fetchone():
+        return
+
+    needs = True
+    for idx in conn.execute("PRAGMA index_list(stop_passages)").fetchall():
+        name, unique = idx[1], idx[2]
+        if not unique:
+            continue
+        cols = [r[2] for r in conn.execute(f"PRAGMA index_info('{name}')").fetchall()]
+        if "stop_order" in cols and "passed_at" in cols:
+            needs = False
+            break
+    if not needs:
+        return
+
+    log.info("Migrating stop_passages to the stop_order-aware UNIQUE key…")
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stop_passages_new (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            route_code   TEXT NOT NULL,
+            stop_code    TEXT NOT NULL,
+            stop_type    TEXT NOT NULL,
+            stop_order   INTEGER,
+            vehicle_no   TEXT NOT NULL,
+            passed_at    TEXT NOT NULL,
+            service_date TEXT NOT NULL,
+            recorded_at  TEXT NOT NULL,
+            UNIQUE(route_code, stop_code, stop_order, vehicle_no, passed_at)
+        )""")
+    conn.execute("""
+        INSERT OR IGNORE INTO stop_passages_new
+            (route_code, stop_code, stop_type, stop_order,
+             vehicle_no, passed_at, service_date, recorded_at)
+        SELECT route_code, stop_code, stop_type, stop_order,
+               vehicle_no, passed_at, service_date, recorded_at
+        FROM stop_passages""")
+    conn.execute("DROP TABLE stop_passages")
+    conn.execute("ALTER TABLE stop_passages_new RENAME TO stop_passages")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_passages_route_date "
+                 "ON stop_passages(route_code, service_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_passages_vehicle "
+                 "ON stop_passages(vehicle_no, service_date)")
+    conn.commit()
+    log.info("stop_passages migration done.")
 
 
 def now_utc_iso() -> str:

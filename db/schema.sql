@@ -258,7 +258,11 @@ CREATE TABLE IF NOT EXISTS stop_passages (
     passed_at    TEXT NOT NULL,        -- ISO8601 UTC, OASA-predicted exact pass time
     service_date TEXT NOT NULL,
     recorded_at  TEXT NOT NULL,
-    UNIQUE(route_code, stop_code, vehicle_no, passed_at)
+    -- stop_order IS part of the key: on LOOP routes the same stop_code is both
+    -- the origin (order 1) and the terminus (order N). Without stop_order the
+    -- terminus row collided with the origin row and was silently dropped by
+    -- INSERT OR IGNORE — every lap lost its measured arrival.
+    UNIQUE(route_code, stop_code, stop_order, vehicle_no, passed_at)
 );
 CREATE INDEX IF NOT EXISTS idx_passages_route_date ON stop_passages(route_code, service_date);
 CREATE INDEX IF NOT EXISTS idx_passages_vehicle ON stop_passages(vehicle_no, service_date);
