@@ -549,8 +549,18 @@ def update_slot_definitions(conn, route_code: str, service_date: str,
 
 # ── orchestration ────────────────────────────────────────────────────────────
 
-def compute_all_slots(conn, service_date: str, computed_at: str) -> dict:
-    routes = conn.execute("SELECT route_code FROM routes").fetchall()
+def compute_all_slots(conn, service_date: str, computed_at: str,
+                      route_codes: list[str] | None = None) -> dict:
+    """
+    Slot computation is per route, so an incremental caller may pass the subset
+    whose inputs changed; the rest keep their (identical) stored assignments.
+    The vehicle-activity rebuild at the end always covers the whole day.
+    """
+    if route_codes is None:
+        routes = [dict(r) for r in
+                  conn.execute("SELECT route_code FROM routes").fetchall()]
+    else:
+        routes = [{"route_code": rc} for rc in route_codes]
     n_patterns = n_assigned = n_handoffs = 0
 
     for r in routes:

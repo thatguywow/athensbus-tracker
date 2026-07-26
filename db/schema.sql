@@ -293,3 +293,31 @@ CREATE TABLE IF NOT EXISTS segment_times (
     last_updated TEXT NOT NULL,
     UNIQUE(route_code, stop_order)
 );
+
+-- ── Data-quality audit ─────────────────────────────────────────────────────
+-- Physical-law violations found in the computed result. Bounded by design:
+-- per-day COUNTS live in audit_summary (a handful of rows), while individual
+-- examples in audit_findings are capped per type per day, so the tables stay
+-- in the low-MB range forever under the usual 30-day retention.
+CREATE TABLE IF NOT EXISTS audit_summary (
+    service_date  TEXT NOT NULL,
+    finding_type  TEXT NOT NULL,
+    count         INTEGER NOT NULL,
+    computed_at   TEXT NOT NULL,
+    PRIMARY KEY (service_date, finding_type)
+);
+
+CREATE TABLE IF NOT EXISTS audit_findings (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    service_date  TEXT NOT NULL,
+    finding_type  TEXT NOT NULL,
+    route_code    TEXT,
+    line_id       TEXT,
+    vehicle_no    TEXT,
+    trip_id       INTEGER,
+    detail        TEXT,
+    computed_at   TEXT NOT NULL,
+    UNIQUE(service_date, finding_type, route_code, trip_id, detail)
+);
+CREATE INDEX IF NOT EXISTS idx_audit_findings_date
+    ON audit_findings(service_date, finding_type);

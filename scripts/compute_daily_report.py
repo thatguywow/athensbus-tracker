@@ -7,12 +7,14 @@ Processes TODAY's data (not yesterday) since it runs every hour.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from datetime import date, timedelta, datetime, timezone
 
 import db
 from trip_reconstruction_passages import reconstruct_route_day_from_passages as reconstruct_route_day
 from rotation_slots import compute_all_slots
+from audit_day import run_audit, purge_audit
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("compute_daily_report")
@@ -38,6 +40,7 @@ def count_scheduled(conn, route_code: str, service_date: str) -> int:
 
 def purge_old_data(conn, retention_days: int) -> dict:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+    purge_audit(conn, cutoff[:10])
     p1 = conn.execute("DELETE FROM vehicle_pings WHERE ts_utc < ?", (cutoff,)).rowcount
     p2 = conn.execute("DELETE FROM terminus_observations WHERE observed_at < ?", (cutoff,)).rowcount
     p3 = conn.execute("DELETE FROM stop_passages WHERE passed_at < ?", (cutoff,)).rowcount
@@ -65,18 +68,118 @@ def main():
             prev = (date.fromisoformat(service_date) - timedelta(days=1)).isoformat()
             dates_to_compute.append(prev)
 
+    # Manual runs with an explicit date are authoritative → full recompute.
+    # ATHENSBUS_FULL_COMPUTE=1 forces it for automatic runs too.
+    full = (len(sys.argv) > 1
+            or os.environ.get("ATHENSBUS_FULL_COMPUTE") == "1")
     for service_date in dates_to_compute:
-        _compute_one_day(service_date, computed_at)
+        _compute_one_day(service_date, computed_at, full=full)
 
 
-def _compute_one_day(service_date: str, computed_at: str):
+def _routes_needing_recompute(conn, route_codes: list[str],
+                             service_date: str) -> list[str]:
+    """
+    Return the routes whose stored result for `service_date` can still differ
+    from a fresh computation — i.e. the routes whose INPUTS changed since the
+    last time they were computed. Everything else is skipped: reconstruction is
+    deterministic, so identical inputs necessarily yield identical output.
+
+    A route is stale when any of these holds:
+      1. it has no stored result yet (never computed for this day);
+      2. a passage inside the day's reconstruction window was recorded after
+         that result was computed (new/late data — including trips that only
+         finished after the 04:00 flip);
+      3. its OWN day's schedule changed after that result (the slot grid and
+         the boundary arbitration both read it);
+      4. a NEIGHBOURING day's schedule changed AND the route has passages in a
+         boundary zone — the only case where the other day's schedule can flip
+         a trip's ownership.
+
+    Cost: five set-queries per day instead of per-route probes.
+    """
+    from trip_reconstruction_passages import (passage_query_window,
+                                              boundary_zone_windows)
+
+    stale: set[str] = set()
+
+    # 1. never computed
+    for r in conn.execute("""
+            SELECT r.route_code FROM routes r
+            LEFT JOIN daily_route_stats d
+                   ON d.route_code = r.route_code AND d.service_date = ?
+            WHERE d.route_code IS NULL""", (service_date,)):
+        stale.add(r["route_code"])
+
+    # 2. passages recorded after the stored result
+    qs, qe = passage_query_window(service_date)
+    for r in conn.execute("""
+            SELECT DISTINCT p.route_code
+            FROM stop_passages p
+            JOIN daily_route_stats d
+              ON d.route_code = p.route_code AND d.service_date = ?
+            WHERE p.passed_at >= ? AND p.passed_at < ?
+              AND p.recorded_at > d.computed_at""", (service_date, qs, qe)):
+        stale.add(r["route_code"])
+
+    # 3. own-day schedule changed
+    for r in conn.execute("""
+            SELECT DISTINCT s.route_code
+            FROM scheduled_trips s
+            JOIN daily_route_stats d
+              ON d.route_code = s.route_code AND d.service_date = ?
+            WHERE s.schedule_date = ? AND s.last_synced > d.computed_at""",
+            (service_date, service_date)):
+        stale.add(r["route_code"])
+
+    # 4. neighbour-day schedule changed AND route active in a boundary zone
+    d0 = date.fromisoformat(service_date)
+    neighbours = [(d0 - timedelta(days=1)).isoformat(),
+                  (d0 + timedelta(days=1)).isoformat()]
+    changed_neighbour: set[str] = set()
+    for nd in neighbours:
+        for r in conn.execute("""
+                SELECT DISTINCT s.route_code
+                FROM scheduled_trips s
+                JOIN daily_route_stats d
+                  ON d.route_code = s.route_code AND d.service_date = ?
+                WHERE s.schedule_date = ? AND s.last_synced > d.computed_at""",
+                (service_date, nd)):
+            changed_neighbour.add(r["route_code"])
+    if changed_neighbour:
+        in_zone: set[str] = set()
+        for zs, ze in boundary_zone_windows(service_date):
+            for r in conn.execute(
+                    "SELECT DISTINCT route_code FROM stop_passages "
+                    "WHERE passed_at >= ? AND passed_at < ?", (zs, ze)):
+                in_zone.add(r["route_code"])
+        stale |= (changed_neighbour & in_zone)
+
+    known = set(route_codes)
+    return [rc for rc in route_codes if rc in stale and rc in known]
+
+
+def _compute_one_day(service_date: str, computed_at: str, full: bool = False):
 
     with db.job_run("compute_daily_report") as run:
         conn = db.get_connection()
         try:
             route_rows  = conn.execute("SELECT route_code FROM routes").fetchall()
-            route_codes = [r["route_code"] for r in route_rows]
-            log.info("Computing report for %s across %d routes", service_date, len(route_codes))
+            all_codes   = [r["route_code"] for r in route_rows]
+
+            # Incremental: recompute only routes whose inputs changed since
+            # their stored result. Deterministic ⇒ skipped routes would produce
+            # byte-identical output. `full` (explicit date / env override)
+            # forces the classic all-routes pass.
+            if full:
+                route_codes = all_codes
+                log.info("Computing report for %s across %d routes (full)",
+                         service_date, len(all_codes))
+            else:
+                route_codes = _routes_needing_recompute(conn, all_codes, service_date)
+                log.info("Computing report for %s: %d/%d routes changed "
+                         "(%d unchanged, skipped)", service_date,
+                         len(route_codes), len(all_codes),
+                         len(all_codes) - len(route_codes))
 
             total_trips = total_departures = 0
             errors = []
@@ -95,8 +198,20 @@ def _compute_one_day(service_date: str, computed_at: str):
             conn.commit()
 
             log.info("Computing rotation slots...")
-            slot_stats = compute_all_slots(conn, service_date, computed_at)
+            slot_stats = compute_all_slots(conn, service_date, computed_at,
+                                           route_codes=route_codes)
             conn.commit()
+
+            # Data-quality audit: reports impossible results, changes nothing.
+            # Always covers the WHOLE day, even in incremental mode — it is
+            # cheap (a handful of aggregate queries) and a violation can span
+            # two routes/trips of which only one was recomputed.
+            try:
+                audit_counts = run_audit(conn, service_date, computed_at)
+                conn.commit()
+            except Exception as e:
+                log.warning("Audit failed (non-fatal): %s", e)
+                audit_counts = {}
 
             for rc in route_codes:
                 try:
@@ -157,7 +272,8 @@ def _compute_one_day(service_date: str, computed_at: str):
                 f"slots_assigned={slot_stats['assigned']} "
                 f"handoffs={slot_stats['handoffs']} "
                 f"errors={len(errors)} "
-                f"purged_pings={purged['pings']}"
+                f"purged_pings={purged['pings']} "
+                f"audit_flags={sum(audit_counts.values()) if audit_counts else 0}"
             )
             if errors:
                 run.status = "partial"

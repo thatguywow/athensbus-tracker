@@ -259,9 +259,28 @@ def generate_for_date(conn, service_date: str):
         SELECT job_name, started_at, finished_at, status, detail
         FROM job_runs ORDER BY started_at DESC LIMIT 50
     """).fetchall()
+    # Data-quality audit: per-day counts of impossible results (see audit_day).
+    try:
+        audit = [dict(r) for r in conn.execute("""
+            SELECT service_date, finding_type, count
+            FROM audit_summary
+            WHERE service_date = ? AND count > 0
+            ORDER BY count DESC
+        """, (service_date,))]
+        examples = [dict(r) for r in conn.execute("""
+            SELECT service_date, finding_type, line_id, route_code,
+                   vehicle_no, detail
+            FROM audit_findings WHERE service_date = ?
+            ORDER BY finding_type LIMIT 40
+        """, (service_date,))]
+    except Exception:
+        audit, examples = [], []
+
     write_json(os.path.join(OUT_DIR, "pipeline_health.json"), {
         "generated_at": db.now_utc_iso(),
         "recent_runs":  [dict(r) for r in jobs],
+        "audit":        audit,
+        "audit_examples": examples,
     })
 
     print(f"  Generated data for {service_date}: "

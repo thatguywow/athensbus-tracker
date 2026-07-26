@@ -258,6 +258,31 @@ def _split_trips(passages: list[dict], route_duration: float | None,
     return trips
 
 
+def passage_query_window(service_date: str) -> tuple[str, str]:
+    """
+    The exact passage window this module reads for one service day (UTC ISO).
+    Exposed so incremental compute can detect changes over the SAME range —
+    if the window ever changes, detection follows automatically.
+    """
+    start_bound, end_bound = _athens_window(service_date)
+    day_start, day_end = _parse(start_bound), _parse(end_bound)
+    return ((day_start - timedelta(minutes=BOUNDARY_ZONE_MINS + 10)).isoformat(),
+            (day_end + timedelta(hours=OVERLAP_HOURS)).isoformat())
+
+
+def boundary_zone_windows(service_date: str) -> list[tuple[str, str]]:
+    """
+    The two ±BOUNDARY_ZONE windows (day start and day end) where a trip's
+    ownership can depend on the NEIGHBOURING day's schedule. Only passages
+    inside these windows make a neighbour-schedule change relevant.
+    """
+    start_bound, end_bound = _athens_window(service_date)
+    ds, de = _parse(start_bound), _parse(end_bound)
+    bz = timedelta(minutes=BOUNDARY_ZONE_MINS + 10)
+    return [((ds - bz).isoformat(), (ds + bz).isoformat()),
+            ((de - bz).isoformat(), (de + bz).isoformat())]
+
+
 def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str,
                                         computed_at: str) -> dict:
     """Reconstruct trips for one route/day from stop_passages. Idempotent."""
@@ -331,8 +356,7 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
     # whole) and slightly before the start (so a boundary-zone trip departing
     # e.g. 03:55 can be assembled whole here too, in case the schedule assigns
     # it to this day).
-    query_start = (day_start - timedelta(minutes=BOUNDARY_ZONE_MINS + 10)).isoformat()
-    query_end = (day_end + timedelta(hours=OVERLAP_HOURS)).isoformat()
+    query_start, query_end = passage_query_window(service_date)
     rows = conn.execute("""
         SELECT vehicle_no, stop_code, stop_order, passed_at
         FROM stop_passages
