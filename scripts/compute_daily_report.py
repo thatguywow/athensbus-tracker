@@ -15,6 +15,7 @@ import db
 from trip_reconstruction_passages import reconstruct_route_day_from_passages as reconstruct_route_day
 from rotation_slots import compute_all_slots
 from audit_day import run_audit, purge_audit
+from chain_consistency import tighten_chain
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("compute_daily_report")
@@ -196,6 +197,19 @@ def _compute_one_day(service_date: str, computed_at: str, full: bool = False):
                     conn.commit()
                     log.info("Trips: %d/%d routes", i, len(route_codes))
             conn.commit()
+
+            # Chain consistency: an estimate may never contradict a
+            # measurement (cross-route, per vehicle). Runs over the WHOLE day
+            # and reports which routes it touched, so the incremental pass
+            # includes them in slots/stats below.
+            try:
+                chain = tighten_chain(conn, service_date, computed_at)
+                conn.commit()
+                extra = [rc for rc in chain["routes"] if rc not in set(route_codes)]
+                if extra:
+                    route_codes = list(route_codes) + extra
+            except Exception as e:
+                log.warning("Chain consistency failed (non-fatal): %s", e)
 
             log.info("Computing rotation slots...")
             slot_stats = compute_all_slots(conn, service_date, computed_at,

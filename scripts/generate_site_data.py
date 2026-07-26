@@ -152,7 +152,13 @@ def generate_for_date(conn, service_date: str):
         SELECT t.route_code, r.line_code, l.line_id, r.descr AS route_name,
                r.route_type, sa.scheduled_departure, sa.slot_number,
                sa.departure_deviation_mins, t.vehicle_no,
-               t.started_at, t.terminus_arrived_at
+               t.started_at, t.terminus_arrived_at,
+               EXISTS (
+                   SELECT 1 FROM trip_stop_times x
+                   WHERE x.trip_id = t.id
+                     AND x.stop_order <= (SELECT (MIN(stop_order)+MAX(stop_order))/2.0
+                                          FROM stops s WHERE s.route_code = t.route_code)
+               ) AS dep_observed
         FROM trips t
         JOIN slot_assignments sa ON sa.trip_id=t.id
         LEFT JOIN routes r ON r.route_code=t.route_code
@@ -174,6 +180,9 @@ def generate_for_date(conn, service_date: str):
             "vehicle_no":    r["vehicle_no"],
             "deviation":     r["departure_deviation_mins"],
             "started_at":    r["started_at"],
+            # False ⇒ η αναχώρηση ΔΕΝ παρατηρήθηκε (υπολογισμένη από τη Λήξη):
+            # το δρομολόγιο έγινε, αλλά η ώρα είναι εκτίμηση — το UI τη σημαίνει.
+            "dep_observed":  bool(r["dep_observed"]),
             "ended_at":      r["terminus_arrived_at"],  # NULL for incomplete trips
         })
 
@@ -206,6 +215,7 @@ def generate_for_date(conn, service_date: str):
             "vehicle_no":    None,
             "deviation":     None,
             "started_at":    None,
+            "dep_observed":  True,
             "ended_at":      None,
         })
 

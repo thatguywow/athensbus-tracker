@@ -50,6 +50,7 @@ log = logging.getLogger("rotation_slots")
 
 MIN_HANDOFF_GAP_MINS = 10
 MAX_CYCLE_SAMPLES    = 200   # rolling window of cycle observations
+MAX_ESTIMATED_DEV_MINS = 25   # όριο απόκλισης για ΕΚΤΙΜΩΜΕΝΗ αναχώρηση
 
 # Asymmetric matching: buses rarely depart EARLY (≤ a few min) but often LATE.
 # So matching an observed departure to an earlier scheduled slot (= bus is late)
@@ -406,23 +407,24 @@ def assign_slots(conn, route_code: str, service_date: str,
 
     sched_mins = [_time_to_mins(g["departure_time"]) for g in grid]
 
+    # ALL trips take part in matching — a trip whose departure was never
+    # observed (driver entering past the origin, or a terminal that publishes
+    # no departures) still ran, so excluding it left genuine gaps in the
+    # distribution. Instead we GRADE it: `dep_observed` says whether the
+    # departure rests on an origin-side observation. Estimated ones keep the
+    # slot but store NULL deviation (we do not pretend to know how late it
+    # was) and are dropped if the estimate lands absurdly far from the slot.
     trip_rows = conn.execute("""
-        SELECT id, vehicle_no, started_at, ended_at FROM trips t
-        WHERE route_code=? AND service_date=?
-          -- Only trips whose DEPARTURE was actually observed take part in
-          -- slot matching: at least one passage on the origin side of the
-          -- route. Tail-only fragments (e.g. just the last 2 stops of a lap
-          -- whose start was missed) have a fake "departure" equal to their
-          -- first sighting near the terminus — letting them grab a slot
-          -- produces phantom rows like "05:00 → dep 05:39". Their terminus
-          -- data still counts everywhere else; they just don't claim slots.
-          AND EXISTS (
-              SELECT 1 FROM trip_stop_times x
-              WHERE x.trip_id = t.id
-                AND x.stop_order <= (SELECT (MIN(stop_order)+MAX(stop_order))/2.0
-                                     FROM stops s WHERE s.route_code = t.route_code)
-          )
-        ORDER BY started_at
+        SELECT t.id, t.vehicle_no, t.started_at, t.ended_at,
+               EXISTS (
+                   SELECT 1 FROM trip_stop_times x
+                   WHERE x.trip_id = t.id
+                     AND x.stop_order <= (SELECT (MIN(stop_order)+MAX(stop_order))/2.0
+                                          FROM stops s WHERE s.route_code = t.route_code)
+               ) AS dep_observed
+        FROM trips t
+        WHERE t.route_code=? AND t.service_date=?
+        ORDER BY t.started_at
     """, (route_code, service_date)).fetchall()
 
     if not trip_rows:
@@ -440,7 +442,15 @@ def assign_slots(conn, route_code: str, service_date: str,
         g = grid[sched_idx]
         slot_num   = g["slot_number"]
         sched_time = g["departure_time"]
-        deviation  = round(amins - sched_mins[sched_idx], 1)
+        dev_raw    = round(amins - sched_mins[sched_idx], 1)
+        if trip["dep_observed"]:
+            deviation = dev_raw
+        else:
+            # Estimated departure: keep the slot (the trip really ran) but do
+            # not claim to know the deviation. Reject only absurd placements.
+            if abs(dev_raw) > MAX_ESTIMATED_DEV_MINS:
+                continue
+            deviation = None
 
         conn.execute("""
             INSERT INTO slot_assignments

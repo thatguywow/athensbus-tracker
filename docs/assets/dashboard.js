@@ -289,7 +289,9 @@ function renderScheduleTable(routeCode){
     const durCell = (missed || incomplete) ? "—" : fmtDur(t.started_at, t.ended_at);
     html+=`<tr class="${missed?"missed-row":""}">
       <td class="mono">${(t.scheduled_dep||"—").substring(0,5)}</td>
-      <td class="mono">${missed?"—":fmtTime(t.started_at)}</td>
+      <td class="mono">${missed?"—":(t.dep_observed===false
+          ? `<span class="est" title="Υπολογισμένη: η αναχώρηση δεν παρατηρήθηκε (εκτίμηση από τη Λήξη)">~${fmtTime(t.started_at)}</span>`
+          : fmtTime(t.started_at))}</td>
       <td class="mono">${endCell}</td>
       <td class="mono">${durCell}</td>
       <td>${vehHtml}</td>
