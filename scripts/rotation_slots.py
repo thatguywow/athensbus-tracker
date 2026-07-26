@@ -120,6 +120,57 @@ def observe_cycle_times(conn, route_code: str, service_date: str) -> list[float]
     return cycles
 
 
+SAMPLE_DAYS = 30   # πόσες ημέρες κρατάμε δείγματα (ίδιο παράθυρο με το retention)
+
+
+def _load_buckets(raw) -> dict[str, list[float]]:
+    """
+    Samples are stored per SERVICE DAY: {"2026-07-25": [39.0, 40.0], ...}.
+
+    Why: compute runs ~96×/day, and the old code APPENDED today's samples on
+    every run. The 200-slot window filled with duplicates of the current day,
+    so the "learned" median was effectively one day old and drifted with every
+    cycle (measured: 40 → 39.5 → 39.2 → 39.1 …). Keying by day makes each run
+    REPLACE that day's bucket, so the median is genuinely multi-day and stable.
+
+    Accepts the legacy flat-list format transparently.
+    """
+    if not raw:
+        return {}
+    try:
+        v = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    if isinstance(v, list):
+        return {"legacy": [float(x) for x in v if isinstance(x, (int, float))]}
+    if isinstance(v, dict):
+        out = {}
+        for k, vals in v.items():
+            if isinstance(vals, list):
+                out[k] = [float(x) for x in vals if isinstance(x, (int, float))]
+        return out
+    return {}
+
+
+def _store_buckets(buckets: dict, service_date: str, todays: list) -> dict:
+    """Replace this day's bucket and trim to the newest SAMPLE_DAYS days."""
+    b = {k: list(v) for k, v in buckets.items()}
+    if todays:
+        b[service_date] = [round(float(x), 2) for x in todays]
+    else:
+        b.pop(service_date, None)          # recomputed as empty ⇒ really empty
+    days = sorted(k for k in b if k != "legacy")
+    for k in days[:-SAMPLE_DAYS]:
+        b.pop(k, None)
+    if "legacy" in b and len(days) >= 3:   # real history took over
+        b.pop("legacy")
+    return b
+
+
+def _flat(buckets: dict) -> list[float]:
+    return [x for vals in buckets.values() for x in vals]
+
+
 def measure_headway(conn, route_code: str, service_date: str) -> float | None:
     sched_rows = conn.execute("""
         SELECT departure_time FROM scheduled_trips
@@ -178,9 +229,9 @@ def _accumulate_segment_times(conn, route_code, service_date, computed_at):
         row = conn.execute(
             "SELECT samples FROM segment_times WHERE route_code=? AND stop_order=?",
             (route_code, stop_order)).fetchone()
-        existing = json.loads(row["samples"]) if (row and row["samples"]) else []
-        existing.extend(samples)
-        existing = existing[-MAX_CYCLE_SAMPLES:]
+        buckets = _store_buckets(_load_buckets(row["samples"] if row else None),
+                                 service_date, samples)
+        existing = _flat(buckets)
         median_mins = round(statistics.median(existing), 2) if existing else None
         conn.execute("""
             INSERT INTO segment_times (route_code, stop_order, median_mins, samples, last_updated)
@@ -189,7 +240,7 @@ def _accumulate_segment_times(conn, route_code, service_date, computed_at):
                 median_mins=excluded.median_mins,
                 samples=excluded.samples,
                 last_updated=excluded.last_updated
-        """, (route_code, stop_order, median_mins, json.dumps(existing), computed_at))
+        """, (route_code, stop_order, median_mins, json.dumps(buckets), computed_at))
 
 
 def update_route_rotation(conn, route_code: str, service_date: str,
@@ -208,13 +259,9 @@ def update_route_rotation(conn, route_code: str, service_date: str,
         "SELECT * FROM route_rotation WHERE route_code=?", (route_code,)
     ).fetchone()
 
-    if row:
-        samples = json.loads(row["cycle_samples"] or "[]")
-    else:
-        samples = []
-
-    samples.extend(today_cycles)
-    samples = samples[-MAX_CYCLE_SAMPLES:]   # keep rolling window
+    cycle_buckets = _store_buckets(_load_buckets(row["cycle_samples"] if row else None),
+                                   service_date, today_cycles)
+    samples = _flat(cycle_buckets)
 
     # Cycle estimate: median of accumulated samples, or fallback from durations
     if samples:
@@ -251,9 +298,9 @@ def update_route_rotation(conn, route_code: str, service_date: str,
     """, (route_code, service_date)).fetchall()
     today_durs = [round(r["d"],1) for r in dur_rows if r["d"] and 5 < r["d"] < 180]
 
-    dur_samples = json.loads(row["duration_samples"]) if (row and row["duration_samples"]) else []
-    dur_samples.extend(today_durs)
-    dur_samples = dur_samples[-MAX_CYCLE_SAMPLES:]
+    dur_buckets = _store_buckets(_load_buckets(row["duration_samples"] if row else None),
+                                 service_date, today_durs)
+    dur_samples = _flat(dur_buckets)
     if dur_samples:
         median_duration = round(statistics.median(dur_samples), 1)
     elif row and row["median_trip_duration_mins"]:
@@ -283,8 +330,8 @@ def update_route_rotation(conn, route_code: str, service_date: str,
             cycle_samples=excluded.cycle_samples,
             last_updated=excluded.last_updated
     """, (route_code, slot_count, cycle_mins, round(headway,2),
-          median_duration, json.dumps(dur_samples),
-          confidence, json.dumps(samples), computed_at))
+          median_duration, json.dumps(dur_buckets),
+          confidence, json.dumps(cycle_buckets), computed_at))
 
     # Also store per-day pattern for reference
     conn.execute("""

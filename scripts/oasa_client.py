@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
+import threading
+
 import requests
 
 BASE_URL        = "https://telematics.oasa.gr/api/"
@@ -27,13 +29,34 @@ BACKOFF_BASE    = 2.0
 log = logging.getLogger("oasa_client")
 
 
+# ── Keep-alive: one HTTP session per worker thread ──────────────────────────
+# Every call used to open a fresh TCP+TLS connection. At 25 requests/s the
+# handshakes dominated CPU on the single-core VPS (~83% of one core). A reused
+# session cuts that cost substantially and needs no extra requests.
+_local = threading.local()
+
+
+def _session() -> requests.Session:
+    s = getattr(_local, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Connection": "keep-alive",
+        })
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=4, pool_maxsize=8, max_retries=0)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _local.session = s
+    return s
+
+
+
 class OasaApiError(Exception):
     pass
 
 
-def _request(act: str, params: dict[str, str] | None = None,
-             timeout=DEFAULT_TIMEOUT) -> Any:
-    """Single request with retries. Returns parsed JSON or raises OasaApiError."""
 def _request(act: str, params: dict[str, str] | None = None,
              timeout=DEFAULT_TIMEOUT, retry_forbidden: bool = True,
              attempts: int | None = None) -> Any:
@@ -55,9 +78,8 @@ def _request(act: str, params: dict[str, str] | None = None,
             # GET is the native method for the telematics API and is far more
             # reliable than POST for getStopArrivals (confirmed empirically + it
             # is what fragkakis uses). A browser User-Agent avoids UA-based blocks.
-            resp = requests.get(
+            resp = _session().get(
                 BASE_URL, params=query, timeout=timeout,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
             )
             # 404 = no buses/arrivals for this route/stop right now (common at night).
             # Treat as a valid empty result, not an error — and don't retry.
