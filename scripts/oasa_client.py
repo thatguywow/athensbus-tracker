@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
+import ssl
 import threading
 
 import requests
@@ -29,11 +30,43 @@ BACKOFF_BASE    = 2.0
 log = logging.getLogger("oasa_client")
 
 
-# ── Keep-alive: one HTTP session per worker thread ──────────────────────────
-# Every call used to open a fresh TCP+TLS connection. At 25 requests/s the
-# handshakes dominated CPU on the single-core VPS (~83% of one core). A reused
-# session cuts that cost substantially and needs no extra requests.
+# ── Connection setup: one session per worker, ONE shared TLS context ────────
+# The OASA server answers with `Connection: close`, so every request needs a
+# fresh TCP+TLS connection — that part we cannot avoid. What we CAN avoid is
+# rebuilding the TLS context each time: profiling the poller on the VPS showed
+# `load_verify_locations` burning 115 ms of CPU PER REQUEST (~50% of all CPU),
+# because urllib3 re-read the whole CA bundle for every new connection. The CA
+# bundle never changes, so it is loaded ONCE here and shared by every
+# connection. Certificate verification stays fully enabled — we just stop
+# re-parsing the same trust store 25 times a second.
+_SSL_CONTEXT = ssl.create_default_context()
+
 _local = threading.local()
+
+
+class _SharedContextAdapter(requests.adapters.HTTPAdapter):
+    """HTTPAdapter that hands urllib3 the pre-built TLS context."""
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs["ssl_context"] = _SSL_CONTEXT
+        return super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, *args, **kwargs):
+        kwargs["ssl_context"] = _SSL_CONTEXT
+        return super().proxy_manager_for(*args, **kwargs)
+
+    def cert_verify(self, conn, url, verify, cert):
+        # requests hands urllib3 the CA-bundle PATH for every connection, and
+        # urllib3 then calls load_verify_locations() on it — even when a ready
+        # context was supplied. That re-parse is the 115 ms/request seen in the
+        # profile. Our shared context already holds the system trust store, so
+        # clear the per-connection paths: verification is unchanged, the trust
+        # store is simply not re-read for each of the 25 requests per second.
+        super().cert_verify(conn, url, verify, cert)
+        if verify:
+            conn.ca_certs = None
+            conn.ca_cert_dir = None
+            conn.ca_cert_data = None
 
 
 def _session() -> requests.Session:
@@ -44,7 +77,7 @@ def _session() -> requests.Session:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "Connection": "keep-alive",
         })
-        adapter = requests.adapters.HTTPAdapter(
+        adapter = _SharedContextAdapter(
             pool_connections=4, pool_maxsize=8, max_retries=0)
         s.mount("https://", adapter)
         s.mount("http://", adapter)
