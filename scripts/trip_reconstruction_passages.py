@@ -38,6 +38,7 @@ log = logging.getLogger("trip_reconstruction_passages")
 
 LOOP_TERMINAL_METRES = 300   # first/last stop this close ⇒ loop route
 LOOP_DWELL_MINS = 3.0        # κενό στην αφετηρία κυκλικής πάνω από αυτό ⇒ στάθμευση, όχι αναχώρηση
+LOOP_MIN_DURATION_FRACTION = 0.7   # αν ο κανόνας στάθμευσης δώσει διάρκεια < 70% της τυπικής ⇒ μη αξιόπιστη
 TRIP_GAP_MINUTES = 25   # gap between consecutive passages that splits trips
 OVERLAP_HOURS    = 3    # read past the 04:00 day end so 04:00-crossing trips stay whole
 MIN_DURATION_FRACTION = 0.3   # arrival implying < 30% of typical duration → incomplete
@@ -405,6 +406,8 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
             # is derived from THOSE and the `lo` passage is dropped from the
             # origin-side fit. Short gaps (< LOOP_DWELL_MINS) mean the bus left
             # right away, so nothing changes there.
+            dwell_applied = False
+            terminal_event_dt = None
             if loop_mid is not None and origin_hit and origin_side:
                 oh_dt = _parse(origin_hit["passed_at"])
                 later = [(o, t) for o, t in origin_side
@@ -412,6 +415,8 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
                 if later:
                     origin_side = later
                     origin_hit = None          # it was an arrival, not a start
+                    dwell_applied = True
+                    terminal_event_dt = oh_dt
 
             if origin_hit:
                 started_dt = _parse(origin_hit["passed_at"])
@@ -470,6 +475,22 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
                 hard_cap = max(next_first_dt, last_dt)
                 if terminus_dt > hard_cap:
                     terminus_dt = hard_cap
+
+            # PLAUSIBILITY of the dwell-derived departure: measured on 619,
+            # order 1 @ 11:14 then order 3 @ 12:07 then order 40 @ 12:32 — a
+            # ~50′ route cannot be covered in 25′, so those 12:07 points are not
+            # a departure (OASA briefly predicts the vehicle's NEXT trip while
+            # it is still parked). When the dwell rule yields a duration below
+            # LOOP_MIN_DURATION_FRACTION of the route's own median, fall back to
+            # "arrival − typical duration", never earlier than the terminal
+            # event that closed the previous lap.
+            if (dwell_applied and terminus_dt and started_dt and route_duration):
+                dur_mins = (terminus_dt - started_dt).total_seconds() / 60
+                if dur_mins < route_duration * LOOP_MIN_DURATION_FRACTION:
+                    est = terminus_dt - timedelta(minutes=route_duration)
+                    if terminal_event_dt and est < terminal_event_dt:
+                        est = terminal_event_dt
+                    started_dt = est
 
             # guard: arrival must be after departure
             if terminus_dt and terminus_dt <= started_dt:
