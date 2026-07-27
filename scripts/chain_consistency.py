@@ -35,7 +35,69 @@ from bisect import bisect_left, bisect_right
 log = logging.getLogger(__name__)
 
 
+def _drop_contained_fragments(conn, service_date: str) -> set[str]:
+    """
+    Remove re-detection fragments: a 1-2 point trip with no measured arrival
+    whose whole observed span sits INSIDE another trip of the SAME vehicle.
+
+    Measured on 619: while vehicle 71284 was running 17:05→17:58, a lone
+    passage (order 3 @ 17:35) reappeared in the predictions and opened a
+    second "trip". A bus cannot run two laps at once, so the fragment is a
+    duplicate detection of the lap already in progress — it stole a schedule
+    slot and broke the alternation between the line's two vehicles.
+
+    Deliberately strict: complete trips, trips with a measured arrival, and
+    trips that merely overlap at the edges are never touched.
+    """
+    rows = [dict(r) for r in conn.execute("""
+        SELECT t.id, t.route_code, t.vehicle_no, t.terminus_arrived_at,
+               (SELECT COUNT(*) FROM trip_stop_times x
+                 WHERE x.trip_id = t.id AND x.method='passage') n_pts,
+               (SELECT MIN(x.passed_at) FROM trip_stop_times x
+                 WHERE x.trip_id = t.id AND x.method='passage') first_obs,
+               (SELECT MAX(x.passed_at) FROM trip_stop_times x
+                 WHERE x.trip_id = t.id AND x.method='passage') last_obs
+        FROM trips t WHERE t.service_date = ?
+    """, (service_date,))]
+
+    by_vehicle: dict[str, list[dict]] = {}
+    for r in rows:
+        by_vehicle.setdefault(r["vehicle_no"], []).append(r)
+
+    doomed: list[dict] = []
+    for trips in by_vehicle.values():
+        for t in trips:
+            # Only thin fragments qualify: a real lap leaves more evidence.
+            if t["n_pts"] > 2 or not t["first_obs"]:
+                continue
+            for other in trips:
+                if other["id"] == t["id"] or not other["first_obs"]:
+                    continue
+                # STRICT overlap: two laps of one bus cannot run at the same
+                # time. Touching at a single instant (lap A's arrival is lap
+                # B's departure — normal on loop routes) is NOT an overlap.
+                overlaps = (t["first_obs"] < other["last_obs"]
+                            and t["last_obs"] > other["first_obs"])
+                if overlaps and other["n_pts"] > t["n_pts"]:
+                    doomed.append(t)
+                    break
+
+    affected: set[str] = set()
+    for t in doomed:
+        conn.execute("DELETE FROM slot_assignments WHERE trip_id=?", (t["id"],))
+        conn.execute("UPDATE vehicle_departures SET trip_id=NULL WHERE trip_id=?", (t["id"],))
+        conn.execute("DELETE FROM trip_stop_times WHERE trip_id=?", (t["id"],))
+        conn.execute("DELETE FROM trips WHERE id=?", (t["id"],))
+        affected.add(t["route_code"])
+    if doomed:
+        log.info("Chain consistency: %d θραύσματα επανα-ανίχνευσης αφαιρέθηκαν "
+                 "(%d διαδρομές)", len(doomed), len(affected))
+    return affected
+
+
 def tighten_chain(conn, service_date: str, computed_at: str) -> dict:
+    dropped_routes = _drop_contained_fragments(conn, service_date)
+
     # Every observed passage of every vehicle on this service day.
     obs: dict[str, list[str]] = {}
     for r in conn.execute("""
@@ -104,4 +166,6 @@ def tighten_chain(conn, service_date: str, computed_at: str) -> dict:
     if affected:
         log.info("Chain consistency: %d αναχωρήσεις, %d λήξεις σφίχτηκαν "
                  "(%d διαδρομές)", n_dep, n_arr, len(affected))
-    return {"routes": affected, "departures": n_dep, "arrivals": n_arr}
+    return {"routes": affected | dropped_routes,
+            "departures": n_dep, "arrivals": n_arr,
+            "dropped": len(dropped_routes)}

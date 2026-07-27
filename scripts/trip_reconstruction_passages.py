@@ -363,7 +363,11 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
         SELECT vehicle_no, stop_code, stop_order, passed_at
         FROM stop_passages
         WHERE route_code=? AND passed_at>=? AND passed_at<?
-        ORDER BY vehicle_no, passed_at
+        -- Tie-break on stop_order DESC: on a loop route the arrival (order N)
+        -- and the next lap's presence at the same physical stop (order 1) are
+        -- written with the SAME timestamp. Reading the arrival first lets it
+        -- close the finished lap, instead of both landing in a new one.
+        ORDER BY vehicle_no, passed_at, stop_order DESC
     """, (route_code, query_start, query_end)).fetchall()
 
     by_vehicle: dict[str, list[dict]] = defaultdict(list)
