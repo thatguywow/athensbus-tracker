@@ -79,9 +79,28 @@ def match_cost(actual_mins: float, scheduled_mins: float) -> float:
     return EARLY_GRACE_MINS + (early - EARLY_GRACE_MINS) * EARLY_PENALTY
 
 
+SERVICE_DAY_START_MINS = 4 * 60   # η βάρδια ξεκινά 04:00 τοπική ώρα
+
+
+def _service_mins(mins: float) -> float:
+    """
+    Convert minutes-since-midnight to minutes-since-SERVICE-DAY-START.
+
+    The service day runs 04:00→04:00, so a 00:20 departure belongs to the END
+    of the day (1460′), not the beginning (20′). The slot layer used raw
+    midnight minutes, which put night slots FIRST in the grid while the night
+    trips came LAST chronologically — and since alignment is order-preserving,
+    every post-midnight trip was left unmatched (its slot showed as a gap) and
+    the first morning trip could be captured by a night slot (e.g. "03:55 →
+    04:06"). Shifting both sides onto the service-day scale fixes both.
+    """
+    return mins + 1440 if mins < SERVICE_DAY_START_MINS else mins
+
+
 def _time_to_mins(t: str) -> float:
-    h, m, s = t.split(":")
-    return int(h)*60 + int(m) + int(s)/60
+    """Scheduled HH:MM:SS → minutes since service-day start."""
+    h, m, sec = t.split(":")
+    return _service_mins(int(h)*60 + int(m) + int(sec)/60)
 
 
 def _iso_to_mins_since_midnight(iso: str) -> float:
@@ -90,7 +109,7 @@ def _iso_to_mins_since_midnight(iso: str) -> float:
     except ImportError:
         from backports.zoneinfo import ZoneInfo
     dt = datetime.fromisoformat(iso).astimezone(ZoneInfo("Europe/Athens"))
-    return dt.hour*60 + dt.minute + dt.second/60
+    return _service_mins(dt.hour*60 + dt.minute + dt.second/60)
 
 
 # ── Phase 1: slot count (persistent, accumulated) ────────────────────────────
@@ -179,7 +198,7 @@ def measure_headway(conn, route_code: str, service_date: str) -> float | None:
     """, (route_code, service_date)).fetchall()
     if len(sched_rows) < 2:
         return None
-    times = [_time_to_mins(r["departure_time"]) for r in sched_rows]
+    times = sorted(_time_to_mins(r["departure_time"]) for r in sched_rows)
     gaps = [times[i+1]-times[i] for i in range(len(times)-1)
             if 0 < times[i+1]-times[i] < 60]
     return statistics.median(gaps) if gaps else None
@@ -359,8 +378,12 @@ def build_slot_grid(conn, route_code: str, service_date: str,
         SELECT departure_time FROM scheduled_trips
         WHERE route_code=? AND schedule_date=? AND departure_time IS NOT NULL
         GROUP BY departure_time
-        ORDER BY departure_time
     """, (route_code, service_date)).fetchall()
+
+    # Sort on the SERVICE-DAY clock: 04:15 … 23:50, 00:20, 03:55 — night
+    # departures close the day instead of opening it. Alphabetical order put
+    # them first, which broke both slot numbering and the ordered alignment.
+    sched_rows = sorted(sched_rows, key=lambda r: _time_to_mins(r["departure_time"]))
 
     grid = []
     for i, r in enumerate(sched_rows):

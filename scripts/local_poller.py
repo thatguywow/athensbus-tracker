@@ -50,15 +50,15 @@ log = logging.getLogger("local_poller")
 # if you see no 403s, lower it if 403s are heavy.
 EDGE_DEPTH      = 3      # first/last K stops per route (where accuracy matters)
 ENABLE_MIDDLE   = False  # also poll middle stops (fragkakis-style); off until needed
-TARGET_RATE     = 40     # max total requests/sec — the main knob. Raised from
-                         # 25 after the TLS fix cut poller CPU from 89% to 19%
-                         # of one core. Cycle: ~1265 stops / 40 = ~32s (was 51s),
+TARGET_RATE     = 55     # max total requests/sec — the main knob. 25 → 40 → 55
+                         # after the TLS fix cut poller CPU from 89% to 19% of
+                         # one core (36% at 40/s, no 403s). Cycle ≈ 29s,
                          # which matters for COVERAGE too: stops 2-3 sit 1-2 min
                          # past the origin, so a shorter cycle turns "sometimes
                          # caught" into "almost always caught". Lower again if
                          # 403s stop being rare.
-STOP_WORKERS    = 16     # getStopArrivals fetch threads. At p50≈0.26s each
-                         # worker sustains ~3.8 req/s, so 40/s needs ≥11; 16
+STOP_WORKERS    = 24     # getStopArrivals fetch threads. At p50≈0.26s each
+                         # worker sustains ~3.8 req/s, so 55/s needs ≥15; 24
                          # leaves headroom for slow responses. BURST_CAP stays
                          # at 5 — OASA tolerates a faster STEADY rate, not bursts.
 DISAPPEAR_GUARD_MINS = 10
