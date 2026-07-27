@@ -69,7 +69,100 @@ COMMIT_EVERY_SECS    = 2.0
 LOG_EVERY_SECS       = 60
 JOB_RUN_EVERY_SECS   = 900   # job_runs εγγραφή κάθε 15' (το log μένει ανά λεπτό)
 
+ORIGIN_DEPTH_MAX = 8     # πόσο βαθιά ψάχνουμε αποδοτικές στάσεις στην αφετηρία
+YIELD_KEEP       = 0.30  # διελεύσεις/δρομολόγιο ≥ αυτό ⇒ η στάση κρατιέται
+YIELD_DROP       = 0.10  # < αυτό (μετρημένο) ⇒ υποβιβασμός σε scout
+MIN_TRIPS_FOR_YIELD = 5  # λιγότερα δρομολόγια 7 ημερών ⇒ δεν κρίνουμε ακόμα
+SCOUT_EVERY      = 10    # οι υποβιβασμένες στάσεις ελέγχονται 1 κύκλο στους 10
+
 CHECKPOINT_DEPTH = EDGE_DEPTH   # get_terminus_stops uses this
+
+
+def measure_origin_yield(conn, days: int = 7) -> dict:
+    """
+    (route_code, stop_code) → passages per trip over the last `days`.
+
+    Some terminals publish no departure predictions at all: on lines 815, Α5,
+    224, 140, Α8… the origin stop yields ZERO passages while the terminus
+    yields hundreds, so 24-36% of their trips have no observed departure. The
+    stop is polled thousands of times a day for nothing. This metric lets the
+    poller spend that budget on the first stops that DO answer.
+
+    Keyed on stop_code (not stop_order) so a route reshuffle cannot corrupt the
+    history.
+    """
+    trips = {r["route_code"]: r["n"] for r in conn.execute("""
+        SELECT route_code, COUNT(*) n FROM trips
+        WHERE service_date >= date('now', ?) GROUP BY route_code
+    """, (f"-{days} day",))}
+    out: dict[tuple, float] = {}
+    for r in conn.execute("""
+        SELECT route_code, stop_code, COUNT(*) n FROM stop_passages
+        WHERE passed_at >= date('now', ?) GROUP BY route_code, stop_code
+    """, (f"-{days} day",)):
+        t = trips.get(r["route_code"], 0)
+        if t >= MIN_TRIPS_FOR_YIELD:
+            out[(r["route_code"], r["stop_code"])] = r["n"] / t
+    # `judgeable`: routes with enough trips for a silent stop to MEAN something.
+    judgeable = {rc for rc, n in trips.items() if n >= MIN_TRIPS_FOR_YIELD}
+    return {"yield": out, "judgeable": judgeable}
+
+
+def select_origin_stops(conn, route_code: str, lo: int, hi: int,
+                        metrics: dict) -> tuple[list, list]:
+    """
+    Choose which origin-side stops to poll for one route: (main, scout).
+
+    Key distinction: a stop inside the CURRENTLY polled depth (first EDGE_DEPTH)
+    with no passages has been asked thousands of times and answered nothing —
+    that is a MEASURED zero, not missing data. Stops beyond that depth have
+    never been polled, so they are unknown and worth exploring.
+
+    • main  — first EDGE_DEPTH stops that either produce passages (≥ YIELD_KEEP)
+      or are still unexplored.
+    • scout — stops measured dead. Polled once every SCOUT_EVERY cycles so they
+      return automatically if OASA starts publishing departures there.
+
+    A route whose origin side is entirely unexplored keeps the classic
+    first-EDGE_DEPTH choice, so a fresh install behaves exactly as before.
+    """
+    cands = [(r["stop_code"], r["stop_order"]) for r in conn.execute(
+        "SELECT stop_code, stop_order FROM stops WHERE route_code=? "
+        "AND stop_order>=? AND stop_order<=? ORDER BY stop_order",
+        (route_code, lo, min(lo + ORIGIN_DEPTH_MAX - 1, hi)))]
+    if not cands:
+        return [], []
+
+    yields = metrics.get("yield", {})
+    judgeable = route_code in metrics.get("judgeable", set())
+    polled_depth = lo + EDGE_DEPTH - 1
+    scored = []
+    for sc, order in cands:
+        y = yields.get((route_code, sc))
+        if y is None and order <= polled_depth and judgeable:
+            # Polled all week on a route that ran trips, yet silent ⇒ measured
+            # dead. Without `judgeable` a quiet route would look dead too.
+            y = 0.0
+        scored.append((sc, order, y))
+
+    # Nothing measurable yet (no trips in the window) → classic behaviour.
+    if all(y is None for _sc, _o, y in scored):
+        return [sc for sc, _o in cands[:EDGE_DEPTH]], []
+
+    main, scout = [], []
+    for sc, _order, y in scored:
+        if len(main) >= EDGE_DEPTH:
+            if y is not None and y < YIELD_DROP:
+                scout.append(sc)
+            continue
+        if y is None or y >= YIELD_KEEP:
+            main.append(sc)            # productive, or unexplored
+        else:
+            scout.append(sc)           # measured dead → scout only
+    if not main:                       # never leave a route unwatched
+        main = [sc for sc, _o in cands[:EDGE_DEPTH]]
+        scout = []
+    return main, scout
 
 
 def get_terminus_stops(conn) -> list[dict]:
@@ -78,7 +171,13 @@ def get_terminus_stops(conn) -> list[dict]:
     route. Near-origin stops let us back-calculate the true departure time
     (the origin itself gives no arrival prediction on non-circular routes),
     and near-terminus stops give the arrival time.
+
+    The origin side is chosen ADAPTIVELY (see select_origin_stops): dead
+    terminals are demoted to a low-frequency scout list and the freed budget
+    goes to the first stops that answer. The terminus side is unchanged — it
+    works everywhere.
     """
+    metrics = measure_origin_yield(conn)
     rows = conn.execute("""
         SELECT route_code,
                MIN(stop_order) AS first_order,
@@ -88,38 +187,47 @@ def get_terminus_stops(conn) -> list[dict]:
     """).fetchall()
 
     checkpoints = []
+    scouts = []
     for r in rows:
         lo, hi, n = r["first_order"], r["last_order"], r["n"]
         if n < 3:
             continue
-        wanted = set()
+        rc = r["route_code"]
+        main_codes, scout_codes = select_origin_stops(conn, rc, lo, hi, metrics)
+        order_of = {row["stop_code"]: row["stop_order"] for row in conn.execute(
+            "SELECT stop_code, stop_order FROM stops WHERE route_code=?", (rc,))}
+
+        for sc in main_codes:
+            order = order_of.get(sc, lo)
+            checkpoints.append({
+                "route_code": rc, "stop_code": sc,
+                "stop_type": "origin" if order == lo else "near_origin",
+                "stop_order": order,
+            })
+        for sc in scout_codes:
+            order = order_of.get(sc, lo)
+            scouts.append({
+                "route_code": rc, "stop_code": sc,
+                "stop_type": "origin" if order == lo else "near_origin",
+                "stop_order": order,
+            })
+
+        # terminus side: unchanged
         for k in range(CHECKPOINT_DEPTH):
-            wanted.add(lo + k)        # first K
-            wanted.add(hi - k)        # last K
-        for order in sorted(wanted):
-            if order < lo or order > hi:
+            order = hi - k
+            if order < lo or order in (order_of.get(sc) for sc in main_codes):
                 continue
             sc = conn.execute(
                 "SELECT stop_code FROM stops WHERE route_code=? AND stop_order=?",
-                (r["route_code"], order)
-            ).fetchone()
+                (rc, order)).fetchone()
             if not sc:
                 continue
-            if order == lo:
-                stype = "origin"
-            elif order == hi:
-                stype = "terminus"
-            elif order <= lo + CHECKPOINT_DEPTH - 1:
-                stype = "near_origin"
-            else:
-                stype = "near_terminus"
             checkpoints.append({
-                "route_code": r["route_code"],
-                "stop_code":  sc["stop_code"],
-                "stop_type":  stype,
+                "route_code": rc, "stop_code": sc["stop_code"],
+                "stop_type": "terminus" if order == hi else "near_terminus",
                 "stop_order": order,
             })
-    return checkpoints
+    return checkpoints, scouts
 
 
 def get_middle_stops(conn) -> list[dict]:
@@ -150,7 +258,8 @@ def build_stop_meta(stops: list[dict]) -> dict:
     return dict(meta)
 
 
-def _feeder(cycle_stops: list[str], work_q: queue.Queue, stop_event: threading.Event):
+def _feeder(cycle_stops: list[str], work_q: queue.Queue, stop_event: threading.Event,
+            scout_stops: list[str] | None = None):
     """
     Round-robin feed: hand the next stop to the workers, blocking when the small
     work queue is full. This makes the poll rate self-pace to actual worker
@@ -159,11 +268,22 @@ def _feeder(cycle_stops: list[str], work_q: queue.Queue, stop_event: threading.E
     """
     if not cycle_stops:
         return
-    i, n = 0, len(cycle_stops)
+    scout_stops = scout_stops or []
+    i, n, passes = 0, len(cycle_stops), 0
     while not stop_event.is_set():
         try:
             work_q.put(cycle_stops[i % n], timeout=1.0)
             i += 1
+            if i % n == 0:                       # completed a full cycle
+                passes += 1
+                if scout_stops and passes % SCOUT_EVERY == 0:
+                    # Demoted stops get one pass in SCOUT_EVERY: if OASA starts
+                    # publishing departures there, the yield rises and they are
+                    # promoted back on the next rebuild. ~1% of the budget.
+                    for sc in scout_stops:
+                        if stop_event.is_set():
+                            break
+                        work_q.put(sc, timeout=1.0)
         except queue.Full:
             continue
 
@@ -361,7 +481,7 @@ def main():
     conn = db.get_connection()
     route_codes = [r["route_code"] for r in
                    conn.execute("SELECT route_code FROM routes").fetchall()]
-    edges = get_terminus_stops(conn)
+    edges, scouts = get_terminus_stops(conn)
     middles = get_middle_stops(conn) if ENABLE_MIDDLE else []
     conn.close()
 
@@ -369,15 +489,17 @@ def main():
         log.error("No routes in DB. Run first_time_setup first.")
         sys.exit(1)
 
-    stop_meta = build_stop_meta(edges + middles)
+    stop_meta = build_stop_meta(edges + scouts + middles)
     edge_codes = sorted({s["stop_code"] for s in edges})
     middle_codes = sorted({s["stop_code"] for s in middles}) if ENABLE_MIDDLE else []
     cycle_stops = edge_codes + middle_codes   # round-robin set
+    scout_codes = sorted({s["stop_code"] for s in scouts} - set(cycle_stops))
 
     interval = len(cycle_stops) / max(1, TARGET_RATE)   # emergent per-stop interval
     log.info("Two-speed poller: %d routes | %d edge + %d middle stops | "
-             "rate cap %d/s → each stop polled ~every %.0fs",
-             len(route_codes), len(edge_codes), len(middle_codes), TARGET_RATE, interval)
+             "%d scout (1 πέρασμα στα %d) | rate cap %d/s → κάθε στάση ~κάθε %.0fs",
+             len(route_codes), len(edge_codes), len(middle_codes),
+             len(scout_codes), SCOUT_EVERY, TARGET_RATE, interval)
     if interval > DISAPPEAR_GUARD_MINS * 60:
         log.warning("Stops poll every ~%.0fs > %dmin guard → passages may be missed. "
                     "Raise TARGET_RATE or lower EDGE_DEPTH.", interval, DISAPPEAR_GUARD_MINS)
@@ -392,7 +514,8 @@ def main():
     for _ in range(STOP_WORKERS):
         threading.Thread(target=_stop_worker, args=(work_q, result_q, limiter, stop_event),
                          daemon=True).start()
-    threading.Thread(target=_feeder, args=(cycle_stops, work_q, stop_event),
+    threading.Thread(target=_feeder,
+                     args=(cycle_stops, work_q, stop_event, scout_codes),
                      daemon=True).start()
     writer = threading.Thread(target=_writer_thread,
                               args=(result_q, stop_meta, stats, stop_event), daemon=True)
