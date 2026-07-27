@@ -37,6 +37,7 @@ except Exception:
 log = logging.getLogger("trip_reconstruction_passages")
 
 LOOP_TERMINAL_METRES = 300   # first/last stop this close ⇒ loop route
+LOOP_DWELL_MINS = 3.0        # κενό στην αφετηρία κυκλικής πάνω από αυτό ⇒ στάθμευση, όχι αναχώρηση
 TRIP_GAP_MINUTES = 25   # gap between consecutive passages that splits trips
 OVERLAP_HOURS    = 3    # read past the 04:00 day end so 04:00-crossing trips stay whole
 MIN_DURATION_FRACTION = 0.3   # arrival implying < 30% of typical duration → incomplete
@@ -393,6 +394,25 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
 
             # ── DEPARTURE ──
             origin_hit = next((p for p in trip if p["stop_order"] == lo), None)
+
+            # LOOP DWELL: on a loop route the origin stop IS the terminus stop,
+            # so the passage recorded at `lo` is the TERMINAL EVENT — the bus
+            # arriving from the previous lap. If it then sat there (measured on
+            # 619: order 1 at 07:00, order 3 at 07:27 — 27 minutes later), that
+            # passage is NOT the departure: taking it as one folded the whole
+            # dwell into the trip duration (88′ instead of ~45′). When later
+            # origin-side passages exist beyond LOOP_DWELL_MINS, the departure
+            # is derived from THOSE and the `lo` passage is dropped from the
+            # origin-side fit. Short gaps (< LOOP_DWELL_MINS) mean the bus left
+            # right away, so nothing changes there.
+            if loop_mid is not None and origin_hit and origin_side:
+                oh_dt = _parse(origin_hit["passed_at"])
+                later = [(o, t) for o, t in origin_side
+                         if t > oh_dt + timedelta(minutes=LOOP_DWELL_MINS)]
+                if later:
+                    origin_side = later
+                    origin_hit = None          # it was an arrival, not a start
+
             if origin_hit:
                 started_dt = _parse(origin_hit["passed_at"])
             elif len(origin_side) >= 2:
@@ -404,7 +424,15 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
                 pred = _linfit_predict(origin_side, lo)
                 started_dt = pred if (pred and pred <= earliest) else earliest
             elif origin_side:
-                started_dt = origin_side[0][1]
+                # Single origin-side point: step back to `lo` with the route's
+                # typical per-stop pace (a couple of stops ⇒ seconds-level
+                # correction), instead of pretending the trip began there.
+                o, t = origin_side[0]
+                if route_duration and o > lo:
+                    pace = route_duration * 60.0 / max(1, hi - lo)
+                    started_dt = t - timedelta(seconds=(o - lo) * pace)
+                else:
+                    started_dt = t
             elif term_side and route_duration:
                 started_dt = term_side[-1][1] - timedelta(minutes=route_duration)
             else:
