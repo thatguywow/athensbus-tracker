@@ -38,7 +38,14 @@ log = logging.getLogger("trip_reconstruction_passages")
 
 LOOP_TERMINAL_METRES = 300   # first/last stop this close ⇒ loop route
 LOOP_DWELL_MINS = 3.0        # κενό στην αφετηρία κυκλικής πάνω από αυτό ⇒ στάθμευση, όχι αναχώρηση
-LOOP_MIN_DURATION_FRACTION = 0.7   # αν ο κανόνας στάθμευσης δώσει διάρκεια < 70% της τυπικής ⇒ μη αξιόπιστη
+LOOP_MIN_DURATION_FRACTION = 0.7   # Ο κανόνας στάθμευσης ανατρέπεται όταν δίνει
+                                   # διάρκεια < 70% της ΜΑΘΗΜΕΝΗΣ τυπικής. Απαιτεί
+                                   # ΣΩΣΤΗ διάμεσο: όσο η route_rotation είχε μάθει
+                                   # διάρκειες ΜΕ τη στάθμευση μέσα (118′ αντί ~90′),
+                                   # το δίχτυ τράβαγε γνήσιες βόλτες προς το παλιό
+                                   # φουσκωμένο νούμερο. Αν λείπει η διάμεσος (μετά
+                                   # από μηδενισμό), το δίχτυ ΔΕΝ ενεργεί — οι
+                                   # διάρκειες μένουν όπως μετρήθηκαν.
 TRIP_GAP_MINUTES = 25   # gap between consecutive passages that splits trips
 OVERLAP_HOURS    = 3    # read past the 04:00 day end so 04:00-crossing trips stay whole
 MIN_DURATION_FRACTION = 0.3   # arrival implying < 30% of typical duration → incomplete
