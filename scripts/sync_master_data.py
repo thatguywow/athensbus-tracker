@@ -111,6 +111,67 @@ def upsert_stops(conn, route_code: str, stops: list[dict], synced_at: str) -> in
     return n
 
 
+TERMINAL_EDGE_DEPTH = 2   # πόσες ακραίες στάσεις/διαδρομή ελέγχουμε για τερματικό
+
+
+def sync_terminals(conn, synced_at: str) -> int:
+    """
+    Store each edge stop's TERMINAL identity (OASA `isTerminal`).
+
+    Two routes whose ends share the same terminal_id end at the same physical
+    place — the arrival of one is the departure event of the other. That single
+    fact drives the loop/sibling handling in the reconstruction, replacing a
+    300 m distance guess with the operator's own answer.
+
+    Only the first/last TERMINAL_EDGE_DEPTH stops of each route are queried
+    (~1.4k stops instead of 31k), and only those not already known, so a repeat
+    run costs almost nothing. Runs as part of master sync ⇒ new or changed
+    routes pick up their terminals automatically.
+    """
+    wanted = {r["stop_code"] for r in conn.execute(f"""
+        WITH b AS (SELECT route_code, MIN(stop_order) lo, MAX(stop_order) hi
+                   FROM stops GROUP BY route_code)
+        SELECT DISTINCT s.stop_code FROM stops s JOIN b ON b.route_code=s.route_code
+        WHERE s.stop_order < b.lo + {TERMINAL_EDGE_DEPTH}
+           OR s.stop_order > b.hi - {TERMINAL_EDGE_DEPTH}
+    """)}
+    known = {r["stop_code"] for r in conn.execute(
+        "SELECT stop_code FROM stop_terminals")}
+    todo = sorted(wanted - known)
+    if not todo:
+        log.info("Terminals: %d already known, nothing to fetch", len(known))
+        return 0
+
+    log.info("Terminals: fetching %d edge stops (%d already known)",
+             len(todo), len(known))
+    n = 0
+    for i, sc in enumerate(todo, 1):
+        try:
+            rows = oasa._request("getStopNameAndXY", {"p1": sc},
+                                 attempts=2, retry_forbidden=True) or []
+        except Exception:
+            rows = []
+        tid = None
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+            tid = rows[0].get("isTerminal")
+        conn.execute("""
+            INSERT INTO stop_terminals (stop_code, terminal_id, last_synced)
+            VALUES (?,?,?)
+            ON CONFLICT(stop_code) DO UPDATE SET
+                terminal_id=excluded.terminal_id, last_synced=excluded.last_synced
+        """, (sc, str(tid) if tid not in (None, "", "0") else None, synced_at))
+        n += 1
+        if i % 200 == 0:
+            conn.commit()
+            log.info("  terminals: %d/%d", i, len(todo))
+            time.sleep(0.2)
+    conn.commit()
+    got = conn.execute("SELECT COUNT(*) FROM stop_terminals "
+                       "WHERE terminal_id IS NOT NULL").fetchone()[0]
+    log.info("Terminals: %d stops stored, %d marked as terminal", n, got)
+    return n
+
+
 def main():
     db.ensure_schema()
     synced_at = db.now_utc_iso()
@@ -160,6 +221,11 @@ def main():
                 if i % 25 == 0:
                     log.info("Progress: %d/%d lines processed", i, len(line_codes))
                     time.sleep(0.2)  # be a little polite to the upstream API
+
+            try:
+                sync_terminals(conn, synced_at)
+            except Exception as e:
+                log.warning("Terminal sync failed (non-fatal): %s", e)
 
             run.detail = (
                 f"lines={n_lines} routes={total_routes} stops={total_stops} "

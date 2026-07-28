@@ -323,21 +323,36 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
     # they start from — not necessarily the same stop_code, but a neighbouring
     # stop of the same terminal loop. Arrival and next-departure passages then
     # interleave in time, which the splitter must handle specially.
+    # TERMINAL-ANCHORED ORIGIN: if this route's origin stop is an OASA terminal
+    # (authoritative `isTerminal`, synced by sync_master_data), the passage seen
+    # there is the TERMINAL EVENT — a bus arriving from its previous lap, which
+    # on a shared terminal may even be the sibling direction. The dwell logic
+    # below then applies: that passage is an arrival, and the real departure
+    # comes from the later origin-side passages. This covers loop routes AND
+    # bidirectional pairs sharing a terminal, with no cross-route lookups.
     loop_mid = None
-    ends = conn.execute(
-        "SELECT stop_order, stop_code, lat, lng FROM stops "
-        "WHERE route_code=? AND stop_order IN (?, ?)",
-        (route_code, lo, hi)).fetchall()
-    if len(ends) == 2:
-        a, b = ends[0], ends[1]
-        same = a["stop_code"] == b["stop_code"]
-        if not same and None not in (a["lat"], a["lng"], b["lat"], b["lng"]):
-            # crude metres: 1° lat ≈ 111km, 1° lng ≈ 88km at Athens' latitude
-            dx = (float(a["lat"]) - float(b["lat"])) * 111_000.0
-            dy = (float(a["lng"]) - float(b["lng"])) * 88_000.0
-            same = (dx * dx + dy * dy) ** 0.5 <= LOOP_TERMINAL_METRES
-        if same:
-            loop_mid = (lo + hi) / 2.0
+    term_row = conn.execute("""
+        SELECT t.terminal_id FROM stops s
+        JOIN stop_terminals t ON t.stop_code = s.stop_code
+        WHERE s.route_code=? AND s.stop_order=?""", (route_code, lo)).fetchone()
+    if term_row and term_row["terminal_id"]:
+        loop_mid = (lo + hi) / 2.0
+    else:
+        # Fallback while terminals are not yet synced: same stop code at both
+        # ends, or ends within LOOP_TERMINAL_METRES of each other.
+        ends = conn.execute(
+            "SELECT stop_order, stop_code, lat, lng FROM stops "
+            "WHERE route_code=? AND stop_order IN (?, ?)",
+            (route_code, lo, hi)).fetchall()
+        if len(ends) == 2:
+            a, b = ends[0], ends[1]
+            same = a["stop_code"] == b["stop_code"]
+            if not same and None not in (a["lat"], a["lng"], b["lat"], b["lng"]):
+                dx = (float(a["lat"]) - float(b["lat"])) * 111_000.0
+                dy = (float(a["lng"]) - float(b["lng"])) * 88_000.0
+                same = (dx * dx + dy * dy) ** 0.5 <= LOOP_TERMINAL_METRES
+            if same:
+                loop_mid = (lo + hi) / 2.0
     mid = (lo + hi) / 2.0
 
     # persistent route duration (for backward extrapolation when origin unseen)

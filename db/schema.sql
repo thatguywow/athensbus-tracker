@@ -321,3 +321,14 @@ CREATE TABLE IF NOT EXISTS audit_findings (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_findings_date
     ON audit_findings(service_date, finding_type);
+
+-- ── Terminal identity per stop (from OASA getStopNameAndXY → isTerminal) ────
+-- Two routes whose ends share the same terminal_id physically end at the SAME
+-- place: the arrival of one and the departure of the other are one event. This
+-- is the authoritative replacement for the 300m distance heuristic, and it is
+-- refreshed automatically by sync_master_data (weekly or manual).
+CREATE TABLE IF NOT EXISTS stop_terminals (
+    stop_code    TEXT PRIMARY KEY,
+    terminal_id  TEXT,
+    last_synced  TEXT NOT NULL
+);
