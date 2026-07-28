@@ -111,7 +111,11 @@ def upsert_stops(conn, route_code: str, stops: list[dict], synced_at: str) -> in
     return n
 
 
-TERMINAL_EDGE_DEPTH = 2   # πόσες ακραίες στάσεις/διαδρομή ελέγχουμε για τερματικό
+TERMINAL_EDGE_DEPTH = 2      # πόσες ακραίες στάσεις/διαδρομή ελέγχουμε για τερματικό
+TERMINAL_PACE_SECS  = 0.15   # ρυθμός κλήσεων: ο poller τρέχει ήδη στα 55/s, οπότε
+                             # χωρίς pacing οι κλήσεις των τερματικών προκάλεσαν
+                             # μαζικά 403 (952/1400 πέρασαν). Με 0.15s το sync
+                             # παίρνει ~3′ και συνυπάρχει ήρεμα με τον poller.
 
 
 def sync_terminals(conn, synced_at: str) -> int:
@@ -146,14 +150,15 @@ def sync_terminals(conn, synced_at: str) -> int:
              len(todo), len(known))
     n = 0
     for i, sc in enumerate(todo, 1):
+        time.sleep(TERMINAL_PACE_SECS)
         try:
             rows = oasa._request("getStopNameAndXY", {"p1": sc},
-                                 attempts=2, retry_forbidden=True) or []
+                                 attempts=3, retry_forbidden=True) or []
         except Exception:
-            rows = []
-        tid = None
-        if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-            tid = rows[0].get("isTerminal")
+            rows = []          # δεν αποθηκεύεται ⇒ ξαναδοκιμάζεται στο επόμενο sync
+        if not (isinstance(rows, list) and rows and isinstance(rows[0], dict)):
+            continue           # αποτυχία/κενό ⇒ καμία εγγραφή, retry αργότερα
+        tid = rows[0].get("isTerminal")
         conn.execute("""
             INSERT INTO stop_terminals (stop_code, terminal_id, last_synced)
             VALUES (?,?,?)
@@ -164,7 +169,6 @@ def sync_terminals(conn, synced_at: str) -> int:
         if i % 200 == 0:
             conn.commit()
             log.info("  terminals: %d/%d", i, len(todo))
-            time.sleep(0.2)
     conn.commit()
     got = conn.execute("SELECT COUNT(*) FROM stop_terminals "
                        "WHERE terminal_id IS NOT NULL").fetchone()[0]
