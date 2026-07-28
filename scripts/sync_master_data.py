@@ -112,6 +112,9 @@ def upsert_stops(conn, route_code: str, stops: list[dict], synced_at: str) -> in
 
 
 TERMINAL_EDGE_DEPTH = 2      # πόσες ακραίες στάσεις/διαδρομή ελέγχουμε για τερματικό
+TERMINAL_REFRESH_DAYS = 30   # κάθε πόσο ξαναρωτάμε μια στάση που ήδη ξέρουμε,
+                             # ώστε αλλαγές του ΟΑΣΑ (στάση που γίνεται ή παύει
+                             # να είναι τερματικό) να μη μας ξεφεύγουν
 TERMINAL_PACE_SECS  = 0.15   # ρυθμός κλήσεων: ο poller τρέχει ήδη στα 55/s, οπότε
                              # χωρίς pacing οι κλήσεις των τερματικών προκάλεσαν
                              # μαζικά 403 (952/1400 πέρασαν). Με 0.15s το sync
@@ -139,8 +142,14 @@ def sync_terminals(conn, synced_at: str) -> int:
         WHERE s.stop_order < b.lo + {TERMINAL_EDGE_DEPTH}
            OR s.stop_order > b.hi - {TERMINAL_EDGE_DEPTH}
     """)}
+    # Known = a definite answer that is still FRESH. NULL rows are leftovers of
+    # a failed lookup (retry), and answers older than TERMINAL_REFRESH_DAYS are
+    # re-asked so OASA's own changes propagate. Roughly 950/30 ≈ 30 stops a day
+    # — negligible, and it means nothing is ever frozen.
     known = {r["stop_code"] for r in conn.execute(
-        "SELECT stop_code FROM stop_terminals")}
+        "SELECT stop_code FROM stop_terminals "
+        "WHERE terminal_id IS NOT NULL AND last_synced >= datetime('now', ?)",
+        (f"-{TERMINAL_REFRESH_DAYS} day",))}
     todo = sorted(wanted - known)
     if not todo:
         log.info("Terminals: %d already known, nothing to fetch", len(known))
@@ -159,19 +168,22 @@ def sync_terminals(conn, synced_at: str) -> int:
         if not (isinstance(rows, list) and rows and isinstance(rows[0], dict)):
             continue           # αποτυχία/κενό ⇒ καμία εγγραφή, retry αργότερα
         tid = rows[0].get("isTerminal")
+        # '' = checked and NOT a terminal — distinct from a FAILED lookup, which
+        # stores nothing at all and is retried on the next sync. Python treats
+        # '' as falsy, so the reconstruction's terminal test is unaffected.
         conn.execute("""
             INSERT INTO stop_terminals (stop_code, terminal_id, last_synced)
             VALUES (?,?,?)
             ON CONFLICT(stop_code) DO UPDATE SET
                 terminal_id=excluded.terminal_id, last_synced=excluded.last_synced
-        """, (sc, str(tid) if tid not in (None, "", "0") else None, synced_at))
+        """, (sc, str(tid) if tid not in (None, "", "0") else "", synced_at))
         n += 1
         if i % 200 == 0:
             conn.commit()
             log.info("  terminals: %d/%d", i, len(todo))
     conn.commit()
     got = conn.execute("SELECT COUNT(*) FROM stop_terminals "
-                       "WHERE terminal_id IS NOT NULL").fetchone()[0]
+                       "WHERE terminal_id IS NOT NULL AND terminal_id <> ''").fetchone()[0]
     log.info("Terminals: %d stops stored, %d marked as terminal", n, got)
     return n
 
