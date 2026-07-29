@@ -19,6 +19,8 @@ import oasa_client as oasa
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("sync_schedules")
 
+DAILY_PACE_SECS = 0.1   # ρυθμός κλήσεων ημερήσιου προγράμματος (βλ. σχόλιο στη main)
+
 # Valid service window — anything outside this is an OASA data artifact
 SERVICE_START = time(0, 0)        # accept the whole service day…
 SERVICE_END   = time(23, 59, 59)  # …including after-midnight night buses (00:00–03:59)
@@ -103,6 +105,11 @@ def main():
 
             for i, line_code in enumerate(line_codes, 1):
                 try:
+                    # Pacing: the poller now runs at 55 req/s, so 476 unpaced
+                    # schedule calls on top of it pushed us over OASA's limit and
+                    # the job kept finishing as `partial` (403s on some lines).
+                    # 0.1s per line costs ~45s once an hour and removes the noise.
+                    _time.sleep(DAILY_PACE_SECS)
                     sched = oasa.get_daily_schedule(line_code)
                 except Exception as e:
                     failed.append(line_code)

@@ -145,6 +145,22 @@ function exportVehiclesXlsx(){
     ws["!cols"] = [{wch:10},{wch:24}];
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Οχήματα");
+
+    // Second sheet: the Αμαξοστάσια tab exactly as shown on the page —
+    // depot name with its day total, then its vehicle types by count, in the
+    // same order. Same button, same file, no extra click.
+    const depots = (depotData && depotData.depots) ? depotData.depots : [];
+    if(depots.length){
+      const drows = [];
+      depots.forEach((d,i)=>{
+        drows.push([d.depot+":", d.total]);
+        (d.types||[]).forEach(t=>drows.push([t.count, t.type]));
+        if(i < depots.length-1) drows.push([]);   // κενή γραμμή ανάμεσα
+      });
+      const ws2 = XLSX.utils.aoa_to_sheet(drows);
+      ws2["!cols"] = [{wch:16},{wch:34}];
+      XLSX.utils.book_append_sheet(wb, ws2, "Αμαξοστάσια");
+    }
     XLSX.writeFile(wb, base+".xlsx");
     return;
   }

@@ -330,6 +330,15 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
     # below then applies: that passage is an arrival, and the real departure
     # comes from the later origin-side passages. This covers loop routes AND
     # bidirectional pairs sharing a terminal, with no cross-route lookups.
+    # LEARNED SEGMENTS: median observed travel time origin→stop for this route,
+    # collected by rotation_slots but never read until now. Back-calculating a
+    # departure with a UNIFORM pace systematically underestimates the first few
+    # stops (boarding, city-centre traffic), which pushed departures too late
+    # and made durations look shorter than reality — visible on 421 inbound.
+    segments = {r["stop_order"]: r["median_mins"] for r in conn.execute(
+        "SELECT stop_order, median_mins FROM segment_times "
+        "WHERE route_code=? AND median_mins IS NOT NULL", (route_code,))}
+
     loop_mid = None
     term_row = conn.execute("""
         SELECT t.terminal_id FROM stops s
@@ -446,6 +455,15 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
 
             if origin_hit:
                 started_dt = _parse(origin_hit["passed_at"])
+            elif origin_side and segments.get(min(o for o, _t in origin_side)):
+                # Learned segment: the earliest observed origin-side stop has a
+                # measured origin→stop median, so subtract exactly that.
+                o = min(oo for oo, _t in origin_side)
+                t = min(tt for oo, tt in origin_side if oo == o)
+                started_dt = t - timedelta(minutes=segments[o])
+                earliest = min(tt for _o, tt in origin_side)
+                if started_dt > earliest:
+                    started_dt = earliest
             elif len(origin_side) >= 2:
                 # Guard: out-of-order edge passages (3 seen before 2) give the
                 # fit a negative slope, projecting the departure AFTER the
@@ -455,9 +473,8 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
                 pred = _linfit_predict(origin_side, lo)
                 started_dt = pred if (pred and pred <= earliest) else earliest
             elif origin_side:
-                # Single origin-side point: step back to `lo` with the route's
-                # typical per-stop pace (a couple of stops ⇒ seconds-level
-                # correction), instead of pretending the trip began there.
+                # No learned segment yet: step back with the route's uniform
+                # per-stop pace (less accurate, hence the segment path above).
                 o, t = origin_side[0]
                 if route_duration and o > lo:
                     pace = route_duration * 60.0 / max(1, hi - lo)
