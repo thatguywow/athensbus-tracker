@@ -201,10 +201,13 @@ function buildLineSelectors(sched){
   // Group by the public line label (line_id), not the internal line_code —
   // OASA has several internal codes per public line, which produced duplicate
   // "Γραμμή X97" entries. One entry per label; selection filters by label.
+  // Prefer the full catalogue (every route of every line, even variants that
+  // ran no service today) and fall back to the day's trips for older data.
+  const source = (sched.routes && sched.routes.length) ? sched.routes : (sched.trips||[]);
   const schedLines={};
-  (sched.trips||[]).forEach(t=>{ const id=t.line_id||t.line_code; if(id) schedLines[id]=id; });
+  source.forEach(t=>{ const id=t.line_id||t.line_code; if(id) schedLines[id]=id; });
   buildSelect("sched-line-select", schedLines, id=>{
-    populateRouteSelect("sched-route-select", id, sched.trips||[], rc=>renderScheduleTable(rc));
+    populateRouteSelect("sched-route-select", id, source, rc=>renderScheduleTable(rc));
   });
 
 }
@@ -231,7 +234,8 @@ function populateRouteSelect(id, lineId, trips, onRouteSelect){
   const routes={};
   trips.filter(t=>(t.line_id||t.line_code)===lineId).forEach(t=>{
     if(!routes[t.route_code])
-      routes[t.route_code]={label:(t.route_name||t.route_code)+" ("+t.direction+")",
+      routes[t.route_code]={label:(t.route_name||t.route_code)+
+                              (t.direction && t.direction!=="—" ? " ("+t.direction+")" : ""),
                             dir:t.direction};
   });
   // Εξερχόμενη (outbound) first, then Εισερχόμενη — consistent across all lines

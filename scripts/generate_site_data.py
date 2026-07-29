@@ -219,9 +219,31 @@ def generate_for_date(conn, service_date: str):
             "ended_at":      None,
         })
 
+    # Full catalogue of every route of every line — including variants that did
+    # not run today (rare exceptions with one trip, seasonal or event-only
+    # branches). The dropdown is built from THIS, so a variant is always
+    # selectable; if it had no service its table is simply empty.
+    catalogue = [{
+        "line_id":    r["line_id"],
+        "line_code":  r["line_code"],
+        "route_code": r["route_code"],
+        "route_name": r["descr"] or r["route_code"],
+        "direction":  ("Εξερχόμενη" if (r["descr"] or "").strip().endswith(">")
+                       else None),
+    } for r in conn.execute("""
+        SELECT r.route_code, r.line_code, r.descr, l.line_id
+        FROM routes r JOIN lines l ON l.line_code = r.line_code
+        ORDER BY l.line_id, r.route_code
+    """)]
+    # Direction comes from the trips when known, so reuse it where available.
+    dir_by_route = {t["route_code"]: t["direction"] for t in dist_rows if t.get("direction")}
+    for row in catalogue:
+        row["direction"] = dir_by_route.get(row["route_code"]) or "—"
+
     write_json(os.path.join(ddir, "schedule_distribution.json"), {
         "date": service_date, "generated_at": db.now_utc_iso(),
         "trips": dist_rows,
+        "routes": catalogue,
     })
 
     # ── Depots / vehicle types: which vehicle types ran from each depot today ──

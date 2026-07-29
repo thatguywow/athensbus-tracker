@@ -51,6 +51,7 @@ log = logging.getLogger("rotation_slots")
 MIN_HANDOFF_GAP_MINS = 10
 MAX_CYCLE_SAMPLES    = 200   # rolling window of cycle observations
 MAX_ESTIMATED_DEV_MINS = 25   # όριο απόκλισης για ΕΚΤΙΜΩΜΕΝΗ αναχώρηση
+MAX_HEADWAY_MINS       = 240  # μέγιστο διάστημα που μετρά ως headway (νυχτερινές/αραιές)
 
 # Asymmetric matching: buses rarely depart EARLY (≤ a few min) but often LATE.
 # So matching an observed departure to an earlier scheduled slot (= bus is late)
@@ -199,8 +200,13 @@ def measure_headway(conn, route_code: str, service_date: str) -> float | None:
     if len(sched_rows) < 2:
         return None
     times = sorted(_time_to_mins(r["departure_time"]) for r in sched_rows)
+    # Accept gaps up to MAX_HEADWAY_MINS. The old 60′ ceiling silently excluded
+    # sparse services: line 500 (ΚΗΦΙΣΙΑ–ΠΕΙΡΑΙΑΣ, night) runs 5 departures over
+    # 4.5 hours, so EVERY gap was ≥60′, no headway could be measured, no slot
+    # grid was built and the line showed 0% coverage even though its trips were
+    # recorded. The median stays robust against the odd long break.
     gaps = [times[i+1]-times[i] for i in range(len(times)-1)
-            if 0 < times[i+1]-times[i] < 60]
+            if 0 < times[i+1]-times[i] <= MAX_HEADWAY_MINS]
     return statistics.median(gaps) if gaps else None
 
 
