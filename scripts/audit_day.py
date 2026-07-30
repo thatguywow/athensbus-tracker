@@ -26,6 +26,7 @@ MAX_EXAMPLES = 50          # per finding type per day
 FAST_FRACTION = 0.5        # duration < 50% of the route median ⇒ suspicious
 SLOW_FRACTION = 2.0        # duration > 200% of the route median ⇒ suspicious
 MIN_MEDIAN_MINS = 10.0     # ignore routes without a usable median
+ESTIMATE_BIAS_MINS = 2.0   # πόσο σφάλμα εκτίμησης αναχώρησης αξίζει καταγραφή
 
 TYPES = (
     "vehicle_overlap",       # same vehicle, two trips overlapping in time
@@ -34,6 +35,7 @@ TYPES = (
     "duration_too_long",     # implausibly slow lap
     "slot_double_cover",     # one scheduled slot matched by two trips
     "no_departure_observed", # trip whose start was never seen (partial trip)
+    "departure_estimate_bias", # measured vs back-calculated departure (calibration)
 )
 
 
@@ -166,6 +168,65 @@ def run_audit(conn, service_date: str, computed_at: str) -> dict:
         [{"route_code": p["route_code"], "line_id": p["line_id"],
           "vehicle_no": p["vehicle_no"], "trip_id": p["trip_id"],
           "detail": f"πρώτη θέαση {p['started_at'][11:16]}"} for p in partial])
+
+    # ── 7. CALIBRATION: how wrong would our estimate have been? ──
+    # On trips where the origin WAS observed we also have the near-origin
+    # passages, so we can replay the back-calculation and compare it with the
+    # truth. That turns "the estimate feels better now" into a number, per
+    # route, and is the feedback loop for the learned segment times.
+    bias = []
+    for r in _rows(conn, """
+            SELECT t.id trip_id, t.route_code, l.line_id, t.vehicle_no,
+                   (SELECT x.passed_at FROM trip_stop_times x
+                     WHERE x.trip_id=t.id AND x.method='passage'
+                       AND x.stop_order = (SELECT MIN(stop_order) FROM stops s4
+                                           WHERE s4.route_code=t.route_code)
+                     LIMIT 1) origin_at,
+                   (SELECT MIN(stop_order) FROM stops s WHERE s.route_code=t.route_code) lo,
+                   (SELECT x.stop_order FROM trip_stop_times x
+                     WHERE x.trip_id=t.id AND x.method='passage'
+                       AND x.stop_order > (SELECT MIN(stop_order) FROM stops s2
+                                           WHERE s2.route_code=t.route_code)
+                     ORDER BY x.stop_order LIMIT 1) nxt_order,
+                   (SELECT x.passed_at FROM trip_stop_times x
+                     WHERE x.trip_id=t.id AND x.method='passage'
+                       AND x.stop_order > (SELECT MIN(stop_order) FROM stops s2
+                                           WHERE s2.route_code=t.route_code)
+                     ORDER BY x.stop_order LIMIT 1) nxt_at
+            FROM trips t
+            JOIN routes r ON r.route_code = t.route_code
+            JOIN lines  l ON l.line_code  = r.line_code
+            WHERE t.service_date = ?
+              AND EXISTS (SELECT 1 FROM trip_stop_times x
+                          WHERE x.trip_id=t.id AND x.method='passage'
+                            AND x.stop_order = (SELECT MIN(stop_order) FROM stops s3
+                                                WHERE s3.route_code=t.route_code))
+        """, (service_date,)):
+        if not (r["nxt_order"] and r["nxt_at"] and r["origin_at"]):
+            continue
+        seg = conn.execute("SELECT median_mins FROM segment_times "
+                           "WHERE route_code=? AND stop_order=?",
+                           (r["route_code"], r["nxt_order"])).fetchone()
+        if not (seg and seg["median_mins"]):
+            continue
+        from datetime import datetime, timedelta
+        try:
+            est = (datetime.fromisoformat(r["nxt_at"])
+                   - timedelta(minutes=seg["median_mins"]))
+            # Compare against the MEASURED origin passage, never against
+            # trips.started_at: the reconstruction may itself have used this
+            # estimate, which would make the comparison circular and always 0.
+            err = (est - datetime.fromisoformat(r["origin_at"])).total_seconds() / 60
+        except (ValueError, TypeError):
+            continue
+        if abs(err) >= ESTIMATE_BIAS_MINS:
+            bias.append({"route_code": r["route_code"], "line_id": r["line_id"],
+                         "vehicle_no": r["vehicle_no"], "trip_id": r["trip_id"],
+                         "detail": (f"{r['origin_at'][11:16]} εκτίμηση "
+                                    f"{'+' if err > 0 else ''}{err:.1f}′ "
+                                    f"(από order {r['nxt_order']})")})
+    counts["departure_estimate_bias"] = _record(
+        conn, service_date, "departure_estimate_bias", computed_at, bias)
 
     total = sum(counts.values())
     log.info("Audit %s: %s (σύνολο %d)",

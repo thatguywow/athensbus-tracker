@@ -210,7 +210,8 @@ def measure_headway(conn, route_code: str, service_date: str) -> float | None:
     return statistics.median(gaps) if gaps else None
 
 
-def _accumulate_segment_times(conn, route_code, service_date, computed_at):
+def _accumulate_segment_times(conn, route_code, service_date, computed_at,
+                              route_duration: float | None = None):
     """
     For each vehicle that passed the ORIGIN (stop_order = min) and one or more
     near-origin stops on the same trip, record the origin→stop travel time.
@@ -247,7 +248,13 @@ def _accumulate_segment_times(conn, route_code, service_date, computed_at):
             if p["stop_order"] <= lo:
                 continue
             dt_min = (datetime.fromisoformat(p["passed_at"]) - t0).total_seconds()/60
-            if 0 < dt_min < 25:   # plausible near-origin segment
+            # Collect for EVERY observed stop, not just near-origin ones: the
+            # reconstruction now also needs origin→stop times on the TERMINUS
+            # side, to estimate an arrival as route_duration − segment(stop)
+            # instead of assuming a uniform pace (terminal approaches are
+            # usually faster than the route average). Upper bound follows the
+            # route's own duration with slack for congested days.
+            if 0 < dt_min < max(25.0, (route_duration or 25.0) * 1.5):
                 new_samples.setdefault(p["stop_order"], []).append(round(dt_min, 2))
 
     for stop_order, samples in new_samples.items():
@@ -305,12 +312,17 @@ def update_route_rotation(conn, route_code: str, service_date: str,
 
     slot_count = max(1, round(cycle_mins / headway))
 
-    # ── Accumulate per-segment travel times (origin → near-origin stops) ──
-    # When a vehicle was seen passing the ORIGIN and also a near-origin stop on
-    # the same trip, the time difference is the real segment time. Median across
-    # days gives an accurate offset for departure back-calculation.
+    # ── Accumulate per-segment travel times (origin → every observed stop) ──
+    # When a vehicle was seen passing the ORIGIN and also another stop on the
+    # same trip, the difference is the real segment time. The median across days
+    # gives an accurate offset both for departure back-calculation (origin side)
+    # and for arrival estimation (terminus side, as duration − segment).
+    prev = conn.execute("SELECT median_trip_duration_mins FROM route_rotation "
+                        "WHERE route_code=?", (route_code,)).fetchone()
+    known_duration = prev["median_trip_duration_mins"] if prev else None
     try:
-        _accumulate_segment_times(conn, route_code, service_date, computed_at)
+        _accumulate_segment_times(conn, route_code, service_date, computed_at,
+                                  known_duration)
     except Exception:
         pass
 

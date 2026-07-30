@@ -37,6 +37,7 @@ except Exception:
 log = logging.getLogger("trip_reconstruction_passages")
 
 LOOP_TERMINAL_METRES = 300   # first/last stop this close ⇒ loop route
+LINFIT_MIN_SPAN = 4     # εύρος στάσεων ώστε η παλινδρόμηση να προτιμηθεί έναντι μαθημένου τμήματος
 LOOP_DWELL_MINS = 3.0        # κενό στην αφετηρία κυκλικής πάνω από αυτό ⇒ στάθμευση, όχι αναχώρηση
 LOOP_MIN_DURATION_FRACTION = 0.7   # Ο κανόνας στάθμευσης ανατρέπεται όταν δίνει
                                    # διάρκεια < 70% της ΜΑΘΗΜΕΝΗΣ τυπικής. Απαιτεί
@@ -455,9 +456,18 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
 
             if origin_hit:
                 started_dt = _parse(origin_hit["passed_at"])
-            elif origin_side and segments.get(min(o for o, _t in origin_side)):
+            elif (origin_side and segments.get(min(o for o, _t in origin_side))
+                  and not (len(origin_side) >= 2
+                           and max(o for o, _t in origin_side)
+                               - min(o for o, _t in origin_side) >= LINFIT_MIN_SPAN)):
                 # Learned segment: the earliest observed origin-side stop has a
-                # measured origin→stop median, so subtract exactly that.
+                # measured origin→stop median, so subtract exactly that. Used in
+                # preference to the linear fit UNLESS the observed points span
+                # several stops — with two adjacent stops (≈1 min apart) the fit
+                # derives its slope from a 60-second base with ±30 s noise per
+                # point, i.e. ~±100% slope error, which extrapolation multiplies.
+                # A 30-day median is far steadier. With a wide span the fit is
+                # well conditioned AND reflects today's traffic, so it wins.
                 o = min(oo for oo, _t in origin_side)
                 t = min(tt for oo, tt in origin_side if oo == o)
                 started_dt = t - timedelta(minutes=segments[o])
@@ -501,8 +511,16 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
                 order, tdt = term_side[0]
                 remaining = hi - order
                 if 0 < remaining <= 3:
-                    pace_secs = route_duration * 60.0 / max(1, hi - lo)
-                    terminus_dt = tdt + timedelta(seconds=remaining * pace_secs)
+                    seg = segments.get(order)
+                    if seg is not None and route_duration - seg >= 0:
+                        # Learned: time from origin to this stop is measured, so
+                        # what remains to the terminus is duration − segment.
+                        # Uniform pace over-estimates the tail, because terminal
+                        # approaches are faster than the route average.
+                        terminus_dt = tdt + timedelta(minutes=route_duration - seg)
+                    else:
+                        pace_secs = route_duration * 60.0 / max(1, hi - lo)
+                        terminus_dt = tdt + timedelta(seconds=remaining * pace_secs)
                 else:
                     terminus_dt = None
             else:
