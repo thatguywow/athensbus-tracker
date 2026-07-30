@@ -64,17 +64,48 @@ def _parse(iso: str) -> datetime:
     return dt
 
 
-def _linfit_predict(points: list[tuple[int, datetime]], x_target: int):
+def _stop_distances(conn, route_code: str) -> dict:
+    """
+    #15 DIST: cumulative metres along the route for each stop_order.
+
+    Interpolating on stop ORDER assumes every interval is equally long. In
+    reality two stops can be 200 m apart downtown and 2 km apart on an avenue,
+    so an order-based fit or pace mis-places the projection badly on routes with
+    uneven spacing. Straight-line distance between consecutive stops is a much
+    better x-axis, and the coordinates are already in our stops table.
+    """
+    rows = conn.execute(
+        "SELECT stop_order, lat, lng FROM stops WHERE route_code=? "
+        "ORDER BY stop_order", (route_code,)).fetchall()
+    out, total, prev = {}, 0.0, None
+    for r in rows:
+        if r["lat"] is None or r["lng"] is None:
+            return {}                       # incomplete geometry ⇒ fall back
+        if prev is not None:
+            dx = (float(r["lat"]) - prev[0]) * 111_000.0
+            dy = (float(r["lng"]) - prev[1]) * 88_000.0
+            total += (dx * dx + dy * dy) ** 0.5
+        out[r["stop_order"]] = total
+        prev = (float(r["lat"]), float(r["lng"]))
+    return out if total > 0 else {}
+
+
+def _linfit_predict(points: list[tuple[int, datetime]], x_target: int,
+                    xmap: dict | None = None):
     """
     Least-squares fit of time (seconds) vs stop_order, predict time at x_target.
     points: list of (stop_order, datetime). Needs >=2 distinct stop_orders.
     Returns a datetime or None.
     """
-    xs = [p[0] for p in points]
+    # With xmap the fit runs on DISTANCE (metres) instead of stop index.
+    def _x(o):
+        return xmap.get(o, o) if xmap else o
+
+    xs = [_x(p[0]) for p in points]
     if len(set(xs)) < 2:
         return None
     t0 = min(p[1] for p in points)
-    xy = [(x, (t - t0).total_seconds()) for x, t in points]
+    xy = [(_x(x), (t - t0).total_seconds()) for x, t in points]
     n = len(xy)
     sx = sum(x for x, _ in xy)
     sy = sum(y for _, y in xy)
@@ -83,9 +114,9 @@ def _linfit_predict(points: list[tuple[int, datetime]], x_target: int):
     denom = n*sxx - sx*sx
     if abs(denom) < 1e-9:
         return None
-    b = (n*sxy - sx*sy) / denom      # seconds per stop_order
+    b = (n*sxy - sx*sy) / denom      # seconds per unit of x (stop index or metre)
     a = (sy - b*sx) / n
-    return t0 + timedelta(seconds=a + b*x_target)
+    return t0 + timedelta(seconds=a + b*_x(x_target))
 
 
 def _athens_window(service_date: str) -> tuple[str, str]:
@@ -366,6 +397,7 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
     # departure with a UNIFORM pace systematically underestimates the first few
     # stops (boarding, city-centre traffic), which pushed departures too late
     # and made durations look shorter than reality — visible on 421 inbound.
+    distances = _stop_distances(conn, route_code)
     segments = {r["stop_order"]: r["median_mins"] for r in conn.execute(
         "SELECT stop_order, median_mins FROM segment_times "
         "WHERE route_code=? AND median_mins IS NOT NULL", (route_code,))}
@@ -510,15 +542,21 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
                 # vehicle was already observed. A departure can never postdate
                 # its own first passage — fall back to that observation.
                 earliest = min(t for _o, t in origin_side)
-                pred = _linfit_predict(origin_side, lo)
+                pred = _linfit_predict(origin_side, lo, distances)
                 started_dt = pred if (pred and pred <= earliest) else earliest
             elif origin_side:
                 # No learned segment yet: step back with the route's uniform
                 # per-stop pace (less accurate, hence the segment path above).
                 o, t = origin_side[0]
                 if route_duration and o > lo:
-                    pace = route_duration * 60.0 / max(1, hi - lo)
-                    started_dt = t - timedelta(seconds=(o - lo) * pace)
+                    if distances and distances.get(hi):
+                        # Distance-weighted: the share of the route actually
+                        # covered, not the share of stop indices.
+                        frac = (distances.get(o, 0) - distances.get(lo, 0)) / distances[hi]
+                        started_dt = t - timedelta(minutes=route_duration * max(0.0, frac))
+                    else:
+                        pace = route_duration * 60.0 / max(1, hi - lo)
+                        started_dt = t - timedelta(seconds=(o - lo) * pace)
                 else:
                     started_dt = t
             elif term_side and route_duration:
@@ -531,7 +569,7 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
             if term_hit:
                 terminus_dt = _parse(term_hit["passed_at"])
             elif len(term_side) >= 2:
-                terminus_dt = _linfit_predict(term_side, hi)
+                terminus_dt = _linfit_predict(term_side, hi, distances)
             elif len(term_side) == 1 and route_duration:
                 # Single near-terminus passage (e.g. stop 35/36): extend by the
                 # route's typical per-stop pace for the 1-3 remaining stops.
@@ -548,6 +586,9 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
                         # Uniform pace over-estimates the tail, because terminal
                         # approaches are faster than the route average.
                         terminus_dt = tdt + timedelta(minutes=route_duration - seg)
+                    elif distances and distances.get(hi):
+                        frac = (distances[hi] - distances.get(order, 0)) / distances[hi]
+                        terminus_dt = tdt + timedelta(minutes=route_duration * max(0.0, frac))
                     else:
                         pace_secs = route_duration * 60.0 / max(1, hi - lo)
                         terminus_dt = tdt + timedelta(seconds=remaining * pace_secs)
