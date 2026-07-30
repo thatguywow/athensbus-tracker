@@ -332,3 +332,16 @@ CREATE TABLE IF NOT EXISTS stop_terminals (
     terminal_id  TEXT,
     last_synced  TEXT NOT NULL
 );
+
+-- ── Scout promotions (#8) ─────────────────────────────────────────────────
+-- A demoted origin stop is polled once every SCOUT_EVERY cycles, so its
+-- measured yield is ~10× lower than a normally polled stop and it would never
+-- clear the promotion threshold on its own. When a scout poll shows a vehicle
+-- about to pass (small btime2), that is direct evidence the stop works: record
+-- it here and the next stop-selection promotes it back immediately.
+CREATE TABLE IF NOT EXISTS stop_promotions (
+    route_code  TEXT NOT NULL,
+    stop_code   TEXT NOT NULL,
+    seen_at     TEXT NOT NULL,
+    PRIMARY KEY (route_code, stop_code)
+);

@@ -52,6 +52,9 @@ MIN_HANDOFF_GAP_MINS = 10
 MAX_CYCLE_SAMPLES    = 200   # rolling window of cycle observations
 MAX_ESTIMATED_DEV_MINS = 25   # όριο απόκλισης για ΕΚΤΙΜΩΜΕΝΗ αναχώρηση
 MAX_HEADWAY_MINS       = 240  # μέγιστο διάστημα που μετρά ως headway (νυχτερινές/αραιές)
+SEGMENT_CAP_MINS       = 45   # απόλυτο πλαφόν χρόνου τμήματος (πάνω = ανωμαλία)
+DWELL_GUARD_MINS       = 3    # κενό αφετηρία→επόμενη στάση πάνω από αυτό ⇒ στάθμευση,
+                              # το δρομολόγιο ΔΕΝ διδάσκει χρόνους τμημάτων
 
 # Asymmetric matching: buses rarely depart EARLY (≤ a few min) but often LATE.
 # So matching an observed departure to an earlier scheduled slot (= bus is late)
@@ -244,6 +247,19 @@ def _accumulate_segment_times(conn, route_code, service_date, computed_at,
         if not origin_p:
             continue
         t0 = datetime.fromisoformat(origin_p["passed_at"])
+
+        # DWELL CONTAMINATION GUARD: on loop/terminal-anchored routes the
+        # passage at the origin IS the terminal event — the bus arriving from
+        # its previous lap. Measuring from it folds 20-30 minutes of dwell into
+        # every segment, and since segments now feed departure/arrival
+        # estimation, that inflation feeds straight back into trip durations.
+        # If the next origin-side passage comes long after the origin one, the
+        # bus was parked, so this trip teaches us nothing about segment times.
+        nxt = next((p for p in ps
+                    if p["stop_order"] > lo
+                    and datetime.fromisoformat(p["passed_at"]) > t0), None)
+        if nxt and (datetime.fromisoformat(nxt["passed_at"]) - t0).total_seconds() / 60 > DWELL_GUARD_MINS:
+            continue
         for p in ps:
             if p["stop_order"] <= lo:
                 continue
@@ -254,7 +270,11 @@ def _accumulate_segment_times(conn, route_code, service_date, computed_at,
             # instead of assuming a uniform pace (terminal approaches are
             # usually faster than the route average). Upper bound follows the
             # route's own duration with slack for congested days.
-            if 0 < dt_min < max(25.0, (route_duration or 25.0) * 1.5):
+            # A segment can never meaningfully exceed the route's own duration:
+            # anything longer is a breakdown, a jam or a driver break, and those
+            # outliers would slowly inflate the medians.
+            cap = min((route_duration or 25.0) * 1.2, SEGMENT_CAP_MINS)
+            if 0 < dt_min < max(25.0, cap):
                 new_samples.setdefault(p["stop_order"], []).append(round(dt_min, 2))
 
     for stop_order, samples in new_samples.items():

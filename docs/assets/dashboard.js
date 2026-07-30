@@ -99,7 +99,25 @@ async function loadDay(d){
 
     renderSummary(summary);
     renderVehicles(vehicles, document.getElementById("veh-search").value);
+    // Keep the line/direction the user was looking at when the day changes —
+    // switching days is almost always a comparison, and re-picking both every
+    // time was needless friction. Falls back silently if that route did not
+    // run on the newly selected day.
+    const keepLine  = document.getElementById("sched-line-select").value;
+    const keepRoute = document.getElementById("sched-route-select").value;
     buildLineSelectors(sched);
+    if(keepLine){
+      const ls = document.getElementById("sched-line-select");
+      if([...ls.options].some(o=>o.value===keepLine)){
+        ls.value = keepLine;
+        ls.dispatchEvent(new Event("change"));
+        const rs = document.getElementById("sched-route-select");
+        if(keepRoute && [...rs.options].some(o=>o.value===keepRoute)){
+          rs.value = keepRoute;
+          rs.dispatchEvent(new Event("change"));
+        }
+      }
+    }
     renderDepots(depots);
 
     const health = await loadJSON("data/pipeline_health.json").catch(()=>({recent_runs:[]}));

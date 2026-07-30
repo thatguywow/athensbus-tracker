@@ -38,6 +38,8 @@ log = logging.getLogger("trip_reconstruction_passages")
 
 LOOP_TERMINAL_METRES = 300   # first/last stop this close ⇒ loop route
 LINFIT_MIN_SPAN = 4     # εύρος στάσεων ώστε η παλινδρόμηση να προτιμηθεί έναντι μαθημένου τμήματος
+MIN_TRIP_GAP_MINUTES = 20    # #3: κάτω όριο για το κενό που σπάει δρομολόγιο
+MAX_BOUNDARY_ZONE_MINS = 45  # #6: πλαφόν ζώνης συνόρων (μισό headway, έως 45′)
 LOOP_DWELL_MINS = 3.0        # κενό στην αφετηρία κυκλικής πάνω από αυτό ⇒ στάθμευση, όχι αναχώρηση
 LOOP_MIN_DURATION_FRACTION = 0.7   # Ο κανόνας στάθμευσης ανατρέπεται όταν δίνει
                                    # διάρκεια < 70% της ΜΑΘΗΜΕΝΗΣ τυπικής. Απαιτεί
@@ -149,6 +151,29 @@ def _nearest_secs(dts: list[datetime], t: datetime):
     return best
 
 
+def _boundary_zone_mins(conn, route_code: str, sched_date: str) -> float:
+    """
+    #6: how far from 04:00 the ownership arbitration still applies.
+
+    A flat ±20′ suits a 10-minute headway but is far too tight for night or
+    suburban services: with a 60′ headway, a bus leaving 03:40 plainly belongs
+    to yesterday's 03:55 slot, yet it fell outside the zone and was judged by
+    clock time alone. The zone now scales with the route's own headway.
+    """
+    dts = _sched_datetimes(conn, route_code, sched_date)
+    if len(dts) < 3:
+        return BOUNDARY_ZONE_MINS
+    times = sorted(dts)
+    gaps = [(times[i + 1] - times[i]).total_seconds() / 60
+            for i in range(len(times) - 1)]
+    gaps = [g for g in gaps if 0 < g <= 240]
+    if not gaps:
+        return BOUNDARY_ZONE_MINS
+    import statistics as _st
+    headway = _st.median(gaps)
+    return min(max(BOUNDARY_ZONE_MINS, headway * 0.5), MAX_BOUNDARY_ZONE_MINS)
+
+
 def _boundary_owner_is_this_day(conn, route_code: str, started_dt: datetime,
                                 this_date: str, other_date: str,
                                 default_this: bool) -> bool:
@@ -189,8 +214,13 @@ def _split_trips(passages: list[dict], route_duration: float | None,
       • dwell ghosts: an origin-only micro-cluster recorded seconds after an
         arrival (vehicle parked at the terminal) is noise — dropped.
     """
+    # #3 ADAPTIVE GAP: with edge-only tracking the gap between the origin and
+    # terminus clusters IS the traversal, so the limit must exceed the route's
+    # own duration — 1.5× gives slack for a congested day. The old hard floor of
+    # 60′ made short routes far too permissive (a 10-minute route tolerated six
+    # consecutive trips as one); the floor is now MIN_TRIP_GAP_MINUTES.
     gap_limit = (route_duration * 1.5) if route_duration else 90.0
-    gap_limit = max(gap_limit, 60.0)
+    gap_limit = max(gap_limit, MIN_TRIP_GAP_MINUTES)
 
     JITTER_MINS = 3.0        # tiny regressions within this window are noise…
     ORDER_JITTER = 3         # …if the order drop stays inside the edge cluster
@@ -572,7 +602,8 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
             # boundary (±BOUNDARY_ZONE_MINS), the day whose schedule has the
             # nearest slot wins — so a delayed 03:55 slot leaving 04:05 stays on
             # yesterday, and an early 04:00 slot leaving 03:57 moves to today.
-            zone = timedelta(minutes=BOUNDARY_ZONE_MINS)
+            zone = timedelta(minutes=_boundary_zone_mins(conn, route_code,
+                                                         service_date))
             in_day = day_start <= started_dt < day_end
             if abs(started_dt - day_end) <= zone:
                 nxt = (date.fromisoformat(service_date) + timedelta(days=1)).isoformat()

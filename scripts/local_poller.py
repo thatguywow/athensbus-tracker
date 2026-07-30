@@ -74,6 +74,9 @@ YIELD_KEEP       = 0.30  # διελεύσεις/δρομολόγιο ≥ αυτ�
 YIELD_DROP       = 0.10  # < αυτό (μετρημένο) ⇒ υποβιβασμός σε scout
 MIN_TRIPS_FOR_YIELD = 5  # λιγότερα δρομολόγια 7 ημερών ⇒ δεν κρίνουμε ακόμα
 SCOUT_EVERY      = 10    # οι υποβιβασμένες στάσεις ελέγχονται 1 κύκλο στους 10
+SCOUT_PROMOTE_BTIME = 2  # #8: scout στάση που δείχνει όχημα ≤2′ μακριά αποδεικνύει
+                         # ότι δουλεύει ⇒ προάγεται αμέσως (η αραιή δειγματοληψία
+                         # δεν θα την άφηνε ποτέ να περάσει το κατώφλι απόδοσης)
 
 CHECKPOINT_DEPTH = EDGE_DEPTH   # get_terminus_stops uses this
 
@@ -105,7 +108,10 @@ def measure_origin_yield(conn, days: int = 7) -> dict:
             out[(r["route_code"], r["stop_code"])] = r["n"] / t
     # `judgeable`: routes with enough trips for a silent stop to MEAN something.
     judgeable = {rc for rc, n in trips.items() if n >= MIN_TRIPS_FOR_YIELD}
-    return {"yield": out, "judgeable": judgeable}
+    promoted = {(r["route_code"], r["stop_code"]) for r in conn.execute(
+        "SELECT route_code, stop_code FROM stop_promotions "
+        "WHERE seen_at >= date('now', ?)", (f"-{days} day",))}
+    return {"yield": out, "judgeable": judgeable, "promoted": promoted}
 
 
 def select_origin_stops(conn, route_code: str, lo: int, hi: int,
@@ -135,6 +141,7 @@ def select_origin_stops(conn, route_code: str, lo: int, hi: int,
 
     yields = metrics.get("yield", {})
     judgeable = route_code in metrics.get("judgeable", set())
+    promoted = metrics.get("promoted", set())
     polled_depth = lo + EDGE_DEPTH - 1
     scored = []
     for sc, order in cands:
@@ -155,8 +162,8 @@ def select_origin_stops(conn, route_code: str, lo: int, hi: int,
             if y is not None and y < YIELD_DROP:
                 scout.append(sc)
             continue
-        if y is None or y >= YIELD_KEEP:
-            main.append(sc)            # productive, or unexplored
+        if (route_code, sc) in promoted or y is None or y >= YIELD_KEEP:
+            main.append(sc)            # promoted by evidence, productive, or unexplored
         else:
             scout.append(sc)           # measured dead → scout only
     if not main:                       # never leave a route unwatched
@@ -338,7 +345,12 @@ def _stop_worker(work_q, result_q, limiter, stop_event):
                 except (ValueError, TypeError):
                     bt = 0
                 current[veh] = {"btime2": bt, "route_code": str(a.get("route_code") or "")}
-            result_q.put(("arrival", stop_code, current, poll_iso))
+            # #8: a stop that shows a vehicle about to pass is demonstrably
+            # productive. The writer records it, and the next stop selection
+            # promotes it back out of the scout list.
+            close = sorted({v["route_code"] for v in current.values()
+                            if v["btime2"] <= SCOUT_PROMOTE_BTIME and v["route_code"]})
+            result_q.put(("arrival", stop_code, current, poll_iso, close))
         except Exception:
             pass
         finally:
@@ -431,8 +443,18 @@ def _writer_thread(result_q, stop_meta, stats, stop_event):
         if item is not None:
             try:
                 if item[0] == "arrival":
-                    _, stop_code, current, poll_iso = item
+                    _, stop_code, current, poll_iso = item[:4]
+                    close = item[4] if len(item) > 4 else ()
                     handle_arrival(stop_code, current, poll_iso)
+                    for rc in close:      # #8 scout promotion evidence
+                        try:
+                            conn.execute(
+                                "INSERT INTO stop_promotions (route_code, stop_code, seen_at) "
+                                "VALUES (?,?,?) ON CONFLICT(route_code, stop_code) "
+                                "DO UPDATE SET seen_at=excluded.seen_at",
+                                (rc, stop_code, poll_iso))
+                        except Exception:
+                            pass
             except Exception as e:
                 log.error("writer error: %s", e)
             finally:

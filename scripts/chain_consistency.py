@@ -99,13 +99,22 @@ def tighten_chain(conn, service_date: str, computed_at: str) -> dict:
     dropped_routes = _drop_contained_fragments(conn, service_date)
 
     # Every observed passage of every vehicle on this service day.
+    # #9 CROSS-DAY: a vehicle finishing at 03:50 and starting again at 04:10
+    # crosses the service-day boundary, so a day-limited timeline cannot see
+    # the conflict. Observations from the adjacent days are included when
+    # building each vehicle's timeline — they only ever TIGHTEN estimates,
+    # never create or move trips of another day.
+    from datetime import date as _date, timedelta as _td
+    d0 = _date.fromisoformat(service_date)
+    days = [(d0 - _td(days=1)).isoformat(), service_date,
+            (d0 + _td(days=1)).isoformat()]
     obs: dict[str, list[str]] = {}
     for r in conn.execute("""
             SELECT t.vehicle_no vn, x.passed_at pa
             FROM trip_stop_times x
             JOIN trips t ON t.id = x.trip_id
-            WHERE t.service_date = ? AND x.method = 'passage'
-            ORDER BY t.vehicle_no, x.passed_at""", (service_date,)):
+            WHERE t.service_date IN (?,?,?) AND x.method = 'passage'
+            ORDER BY t.vehicle_no, x.passed_at""", days):
         obs.setdefault(r["vn"], []).append(r["pa"])
 
     trips = conn.execute("""
