@@ -12,3 +12,5 @@ venv/
 local_poller.log
 db/*.db
 run_hourly.log
+serve_site.log
+rate_probe_results.json
