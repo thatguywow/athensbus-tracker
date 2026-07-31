@@ -14,3 +14,7 @@ db/*.db
 run_hourly.log
 serve_site.log
 rate_probe_results.json
+gps_collection.log
+vacuum.log
+backup.log
+backups/
