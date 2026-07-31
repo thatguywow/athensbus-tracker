@@ -37,20 +37,76 @@ DEFAULT_REMOTE_DB = "/opt/athensbus-tracker/db/athensbus.db"
 
 # Τρέχει ΣΤΟΝ VPS. Ανοίγει τη βάση read-only (mode=ro) ώστε να μην μπορεί να
 # πειράξει τίποτα ακόμη κι αν κάτι πάει στραβά, και βγάζει gzip στο stdout.
+#
+# ΔΕΝ φέρνει μόνο διελεύσεις. Η ανακατασκευή χρειάζεται και:
+#   scheduled_trips  — αλλιώς δεν γίνεται καμία ανάθεση καρτελακιού
+#   route_rotation   — η μαθημένη median_trip_duration_mins τροφοδοτεί ΚΑΘΕ
+#                      εφεδρική εκτίμηση αναχώρησης/άφιξης
+#   segment_times    — οι μαθημένοι χρόνοι τμημάτων origin→στάση
+# Χωρίς αυτά η τοπική ανακατασκευή τρέχει ακρωτηριασμένη και η σύγκριση με τον
+# VPS γίνεται άδικη: θα συγκρίναμε τη GPS χωρίς ιστορικό με την εξαφάνιση ΜΕ
+# ιστορικό δεκάδων ημερών.
 _REMOTE = r'''
 import sqlite3, sys, gzip, json
 c = sqlite3.connect("file:%s?mode=ro", uri=True)
+sd = "%s"
 out = gzip.GzipFile(fileobj=sys.stdout.buffer, mode="wb")
-n = 0
-for r in c.execute("""
-        SELECT route_code, stop_code, stop_type, stop_order, vehicle_no,
-               passed_at, service_date, recorded_at
-        FROM stop_passages WHERE service_date = ?""", ("%s",)):
-    out.write((json.dumps(r) + "\n").encode())
-    n += 1
+counts = {}
+
+def dump(tag, sql, args=()):
+    n = 0
+    for r in c.execute(sql, args):
+        out.write((json.dumps([tag] + list(r)) + "\n").encode())
+        n += 1
+    counts[tag] = n
+
+dump("passage", """SELECT route_code, stop_code, stop_type, stop_order,
+                          vehicle_no, passed_at, service_date, recorded_at
+                   FROM stop_passages WHERE service_date = ?""", (sd,))
+dump("sched", """SELECT route_code, schedule_date, departure_time,
+                        raw_sdd_code, last_synced
+                 FROM scheduled_trips WHERE schedule_date = ?""", (sd,))
+dump("rotation", """SELECT route_code, slot_count, median_cycle_mins,
+                           median_headway_mins, median_trip_duration_mins,
+                           duration_samples, confidence_days, cycle_samples,
+                           last_updated FROM route_rotation""")
+dump("segment", """SELECT route_code, stop_order, median_mins, samples,
+                          last_updated FROM segment_times""")
 out.close()
-sys.stderr.write("rows=%%d\n" %% n)
+sys.stderr.write(json.dumps(counts) + "\n")
 '''
+
+# Πού πάει κάθε γραμμή, ανά ετικέτα.
+_TARGETS = {
+    "passage": ("""INSERT OR IGNORE INTO stop_passages
+                     (route_code, stop_code, stop_type, stop_order, vehicle_no,
+                      passed_at, service_date, recorded_at, method)
+                   VALUES (?,?,?,?,?,?,?,?,'disappearance')""", 8),
+    "sched":   ("""INSERT OR IGNORE INTO scheduled_trips
+                     (route_code, schedule_date, departure_time, raw_sdd_code,
+                      last_synced) VALUES (?,?,?,?,?)""", 5),
+    "rotation": ("""INSERT INTO route_rotation
+                     (route_code, slot_count, median_cycle_mins,
+                      median_headway_mins, median_trip_duration_mins,
+                      duration_samples, confidence_days, cycle_samples,
+                      last_updated) VALUES (?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(route_code) DO UPDATE SET
+                      slot_count=excluded.slot_count,
+                      median_cycle_mins=excluded.median_cycle_mins,
+                      median_headway_mins=excluded.median_headway_mins,
+                      median_trip_duration_mins=excluded.median_trip_duration_mins,
+                      duration_samples=excluded.duration_samples,
+                      confidence_days=excluded.confidence_days,
+                      cycle_samples=excluded.cycle_samples,
+                      last_updated=excluded.last_updated""", 9),
+    "segment": ("""INSERT INTO segment_times
+                     (route_code, stop_order, median_mins, samples, last_updated)
+                   VALUES (?,?,?,?,?)
+                   ON CONFLICT(route_code, stop_order) DO UPDATE SET
+                     median_mins=excluded.median_mins,
+                     samples=excluded.samples,
+                     last_updated=excluded.last_updated""", 5),
+}
 
 
 def fetch(host: str, remote_db: str, service_date: str) -> list[list]:
@@ -74,25 +130,23 @@ def fetch(host: str, remote_db: str, service_date: str) -> list[list]:
 
 def store(rows: list[list]) -> dict:
     conn = db.get_connection()
+    stats: dict[str, int] = {}
     try:
-        before = conn.execute(
-            "SELECT COUNT(*) FROM stop_passages WHERE "
-            "COALESCE(method,'disappearance')='disappearance'").fetchone()[0]
         for r in rows:
-            # method='disappearance' ρητά: ό,τι έρχεται από τον VPS προέρχεται
-            # από τον poller του getStopArrivals, και θέλουμε να ξεχωρίζει από
-            # τις τοπικές διελεύσεις GPS στη σύγκριση.
-            conn.execute("""
-                INSERT OR IGNORE INTO stop_passages
-                    (route_code, stop_code, stop_type, stop_order, vehicle_no,
-                     passed_at, service_date, recorded_at, method)
-                VALUES (?,?,?,?,?,?,?,?,'disappearance')""", r)
+            tag, payload = r[0], r[1:]
+            target = _TARGETS.get(tag)
+            if target is None:
+                continue
+            sql, ncols = target
+            if len(payload) != ncols:
+                continue
+            try:
+                conn.execute(sql, payload)
+                stats[tag] = stats.get(tag, 0) + 1
+            except Exception:
+                stats[tag + "_failed"] = stats.get(tag + "_failed", 0) + 1
         conn.commit()
-        after = conn.execute(
-            "SELECT COUNT(*) FROM stop_passages WHERE "
-            "COALESCE(method,'disappearance')='disappearance'").fetchone()[0]
-        return {"received": len(rows), "inserted": after - before,
-                "already_present": len(rows) - (after - before)}
+        return stats
     finally:
         conn.close()
 
@@ -107,11 +161,14 @@ def main():
     db.ensure_schema()
     rows = fetch(args.host, args.remote_db, args.service_date)
     if not rows:
-        print("Καμία διέλευση για αυτή την ημέρα — τίποτα να εισαχθεί.")
+        print("Τίποτα δεν επιστράφηκε για αυτή την ημέρα.")
         return
     res = store(rows)
-    print(f"Εισήχθησαν {res['inserted']:,} νέες "
-          f"({res['already_present']:,} υπήρχαν ήδη)")
+    label = {"passage": "διελεύσεις", "sched": "προγραμματισμένα",
+             "rotation": "route_rotation", "segment": "segment_times"}
+    print("Εισήχθησαν:")
+    for k, v in sorted(res.items()):
+        print(f"  {label.get(k, k):<18} {v:>8,}")
     print(f"\nΤώρα: python scripts/compare_methods.py {args.service_date} --reconstruct")
 
 
