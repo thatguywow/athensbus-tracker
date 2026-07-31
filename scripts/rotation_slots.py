@@ -509,6 +509,15 @@ def align_trips_to_slots(actual_deps: list[float],
 
 def assign_slots(conn, route_code: str, service_date: str,
                  slot_count: int, computed_at: str) -> dict:
+    # Οι αλλαγές βάρδιας ΞΑΝΑΫΠΟΛΟΓΙΖΟΝΤΑΙ σε κάθε πέρασμα, άρα οι παλιές πρέπει
+    # να φύγουν πρώτα. Χωρίς αυτό το compute τρέχει ~96 φορές τη μέρα και
+    # ΠΡΟΣΘΕΤΕΙ ξανά τις ίδιες εγγραφές: μετρημένο στην παραγωγή 1.505.513
+    # σειρές, 94,35% διπλές, 202 MB — το 45% ΟΛΗΣ της βάσης. Κανένα άλλο σημείο
+    # του κώδικα δεν άγγιζε ποτέ αυτόν τον πίνακα (ούτε η purge_old_data), οπότε
+    # μεγάλωνε χωρίς όριο, ~210.000 σειρές/ημέρα.
+    conn.execute("DELETE FROM slot_handoffs WHERE route_code=? AND service_date=?",
+                 (route_code, service_date))
+
     grid = build_slot_grid(conn, route_code, service_date, slot_count)
     if not grid:
         return {"assigned": 0, "handoffs": 0}
