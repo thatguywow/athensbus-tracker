@@ -39,10 +39,21 @@ def count_scheduled(conn, route_code: str, service_date: str) -> int:
     return r["c"] if r else 0
 
 
+# Τα ακατέργαστα στίγματα GPS είναι ΔΙΑΓΝΩΣΤΙΚΑ, όχι πηγή αλήθειας: ο poller
+# βγάζει τις διελεύσεις στη ροή και αυτές αποθηκεύονται μόνιμα. Κρατώντας τα
+# στίγματα 30 ημέρες όπως όλα τα υπόλοιπα, ο πίνακας θα έφτανε ~2,3 εκατ.
+# σειρές/ημέρα × 30 ≈ 69 εκατ. σειρές — αρκετό για να γεμίσει ο δίσκος ενός
+# μικρού VPS. Δύο ημέρες φτάνουν για επανεκτέλεση και έλεγχο.
+PING_RETENTION_HOURS = float(os.environ.get("ATHENSBUS_PING_RETENTION_HOURS", "48"))
+
+
 def purge_old_data(conn, retention_days: int) -> dict:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
     purge_audit(conn, cutoff[:10])
-    p1 = conn.execute("DELETE FROM vehicle_pings WHERE ts_utc < ?", (cutoff,)).rowcount
+    ping_cutoff = (datetime.now(timezone.utc)
+                   - timedelta(hours=PING_RETENTION_HOURS)).isoformat()
+    p1 = conn.execute("DELETE FROM vehicle_pings WHERE ts_utc < ?",
+                      (ping_cutoff,)).rowcount
     p2 = conn.execute("DELETE FROM terminus_observations WHERE observed_at < ?", (cutoff,)).rowcount
     p3 = conn.execute("DELETE FROM stop_passages WHERE passed_at < ?", (cutoff,)).rowcount
     return {"pings": p1, "terminus_obs": p2, "passages": p3}
@@ -99,7 +110,15 @@ def _routes_needing_recompute(conn, route_codes: list[str],
     Cost: five set-queries per day instead of per-route probes.
     """
     from trip_reconstruction_passages import (passage_query_window,
-                                              boundary_zone_windows)
+                                              boundary_zone_windows,
+                                              passage_method_sql)
+
+    # Οι διελεύσεις που ΔΕΝ διαβάζει η ανακατασκευή δεν κάνουν τίποτα
+    # μπαγιάτικο: αν έτρεχαν και οι δύο μέθοδοι, κάθε γραφή GPS θα σήμαινε
+    # ολόκληρη τη διαδρομή για επανυπολογισμό χωρίς να αλλάζει τίποτα στο
+    # αποτέλεσμα — δηλαδή πλήρης επανυπολογισμός κάθε 15 λεπτά σε αδύναμο VPS.
+    m_alias = passage_method_sql("p")
+    m_plain = passage_method_sql()
 
     stale: set[str] = set()
 
@@ -113,13 +132,14 @@ def _routes_needing_recompute(conn, route_codes: list[str],
 
     # 2. passages recorded after the stored result
     qs, qe = passage_query_window(service_date)
-    for r in conn.execute("""
+    for r in conn.execute(f"""
             SELECT DISTINCT p.route_code
             FROM stop_passages p
             JOIN daily_route_stats d
               ON d.route_code = p.route_code AND d.service_date = ?
             WHERE p.passed_at >= ? AND p.passed_at < ?
-              AND p.recorded_at > d.computed_at""", (service_date, qs, qe)):
+              AND p.recorded_at > d.computed_at {m_alias}""",
+            (service_date, qs, qe)):
         stale.add(r["route_code"])
 
     # 3. own-day schedule changed
@@ -151,7 +171,8 @@ def _routes_needing_recompute(conn, route_codes: list[str],
         for zs, ze in boundary_zone_windows(service_date):
             for r in conn.execute(
                     "SELECT DISTINCT route_code FROM stop_passages "
-                    "WHERE passed_at >= ? AND passed_at < ?", (zs, ze)):
+                    f"WHERE passed_at >= ? AND passed_at < ? {m_plain}",
+                    (zs, ze)):
                 in_zone.add(r["route_code"])
         stale |= (changed_neighbour & in_zone)
 

@@ -354,9 +354,76 @@ def boundary_zone_windows(service_date: str) -> list[tuple[str, str]]:
             ((de - bz).isoformat(), (de + bz).isoformat())]
 
 
+def _passage_source() -> str:
+    """
+    Ποια μέθοδο διελεύσεων διαβάζει η ανακατασκευή.
+
+    Από τη στιγμή που γράφουν ΚΑΙ οι δύο μέθοδοι στον ίδιο πίνακα, το φιλτράρισμα
+    παύει να είναι προαιρετικό: χωρίς αυτό, κάθε στάση εμφανίζεται δύο φορές με
+    ελαφρώς διαφορετική ώρα, ο splitter βλέπει το stop_order να «μην προχωρά»
+    και σπάει το δρομολόγιο στη μέση. Προεπιλογή: η ΥΠΑΡΧΟΥΣΑ συμπεριφορά, ώστε
+    τίποτα να μην αλλάζει μέχρι να το ζητήσει ρητά κάποιος.
+
+      disappearance  (προεπιλογή) — μόνο η κλασική μέθοδος
+      gps                          — μόνο διελεύσεις από στίγματα
+      both                         — και οι δύο, με προτεραιότητα στο GPS
+    """
+    import os
+    v = (os.environ.get("ATHENSBUS_PASSAGE_SOURCE") or "disappearance").lower()
+    return v if v in ("disappearance", "gps", "both") else "disappearance"
+
+
+def passage_method_sql(alias: str = "") -> str:
+    """
+    Το κομμάτι WHERE που περιορίζει στις διελεύσεις της ενεργής πηγής.
+
+    Κοινό, ώστε κάθε σημείο που διαβάζει stop_passages να συμφωνεί με την
+    ανακατασκευή. Ένα ξεχασμένο σημείο δεν βγάζει σφάλμα — απλώς μετράει
+    διελεύσεις που κανείς δεν χρησιμοποιεί, και οι αποφάσεις που παίρνει
+    (τι είναι μπαγιάτικο, ποια στάση αποδίδει) γίνονται λάθος στα σιωπηλά.
+    """
+    p = f"{alias}." if alias else ""
+    src = _passage_source()
+    if src == "gps":
+        return f"AND {p}method='gps'"
+    if src == "both":
+        return ""
+    return f"AND COALESCE({p}method,'disappearance')='disappearance'"
+
+
+# Δύο διελεύσεις της ίδιας στάσης/οχήματος πιο κοντά από αυτό είναι η ΙΔΙΑ
+# φυσική διέλευση ιδωμένη από τις δύο μεθόδους — όχι δύο περάσματα.
+_DEDUP_WINDOW_S = 900.0
+
+
+def _dedup_prefer_gps(rows: list[dict]) -> list[dict]:
+    """Κρατά τη GPS εκδοχή όταν οι δύο μέθοδοι περιγράφουν την ίδια διέλευση."""
+    gps = [r for r in rows if r.get("method") == "gps"]
+    if not gps:
+        return rows
+    by_key: dict[tuple, list[datetime]] = defaultdict(list)
+    for r in gps:
+        by_key[(r["vehicle_no"], r["stop_order"])].append(_parse(r["passed_at"]))
+
+    out = []
+    for r in rows:
+        if r.get("method") == "gps":
+            out.append(r)
+            continue
+        t = _parse(r["passed_at"])
+        near = by_key.get((r["vehicle_no"], r["stop_order"]), ())
+        if any(abs((t - g).total_seconds()) <= _DEDUP_WINDOW_S for g in near):
+            continue          # το GPS ήδη περιγράφει αυτή τη διέλευση
+        out.append(r)
+    out.sort(key=lambda r: (r["vehicle_no"], r["passed_at"], -r["stop_order"]))
+    return out
+
+
 def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str,
-                                        computed_at: str) -> dict:
+                                        computed_at: str,
+                                        source: str | None = None) -> dict:
     """Reconstruct trips for one route/day from stop_passages. Idempotent."""
+    source = source or _passage_source()
     # ── cleanup (same contract as GPS version) ──
     old_ids = [r["id"] for r in conn.execute(
         "SELECT id FROM trips WHERE route_code=? AND service_date=?",
@@ -453,10 +520,18 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
     # e.g. 03:55 can be assembled whole here too, in case the schedule assigns
     # it to this day).
     query_start, query_end = passage_query_window(service_date)
-    rows = conn.execute("""
-        SELECT vehicle_no, stop_code, stop_order, passed_at
+    # COALESCE: οι σειρές που γράφτηκαν πριν προστεθεί η στήλη `method` έχουν
+    # NULL και είναι, εξ ορισμού, της κλασικής μεθόδου.
+    method_sql = {
+        "disappearance": "AND COALESCE(method,'disappearance')='disappearance'",
+        "gps":           "AND method='gps'",
+        "both":          "",
+    }[source]
+    rows = conn.execute(f"""
+        SELECT vehicle_no, stop_code, stop_order, passed_at,
+               COALESCE(method,'disappearance') AS method
         FROM stop_passages
-        WHERE route_code=? AND passed_at>=? AND passed_at<?
+        WHERE route_code=? AND passed_at>=? AND passed_at<? {method_sql}
         -- Tie-break on stop_order DESC: on a loop route the arrival (order N)
         -- and the next lap's presence at the same physical stop (order 1) are
         -- written with the SAME timestamp. Reading the arrival first lets it
@@ -464,11 +539,13 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
         ORDER BY vehicle_no, passed_at, stop_order DESC
     """, (route_code, query_start, query_end)).fetchall()
 
+    rows = [dict(r) for r in rows if r["stop_order"] is not None]
+    if source == "both":
+        rows = _dedup_prefer_gps(rows)
+
     by_vehicle: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
-        if r["stop_order"] is None:
-            continue
-        by_vehicle[r["vehicle_no"]].append(dict(r))
+        by_vehicle[r["vehicle_no"]].append(r)
 
     n_trips = n_departures = 0
     distinct_vehicles = set()
