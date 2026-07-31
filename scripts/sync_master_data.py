@@ -188,9 +188,28 @@ def sync_terminals(conn, synced_at: str) -> int:
     return n
 
 
+# Ρυθμός κλήσεων master sync. Μέχρι τώρα δεν υπήρχε ΚΑΝΕΝΑ όριο: οι κλήσεις
+# webGetRoutes/webGetStops έβγαιναν όσο γρήγορα προλάβαινε ο βρόχος, με μόνο
+# ένα sleep(0.2) ανά 25 γραμμές, ΚΑΙ με τις προεπιλογές του _request (4
+# προσπάθειες, retry στα 403). Το probe δείχνει καθαρή ζώνη έως ~20/s· στα 8/s
+# η εβδομαδιαία δουλειά αργεί λίγα λεπτά παραπάνω και δεν ενοχλεί τον poller.
+MASTER_PACE_RATE = 8.0
+
+
 def main():
     db.ensure_schema()
     synced_at = db.now_utc_iso()
+
+    # Υποσύνολο γραμμών για τοπική ανάπτυξη/δοκιμές:
+    #     python scripts/sync_master_data.py --lines 1151,1152
+    # Χωρίς όρισμα, συμπεριφορά ακριβώς όπως πριν (όλο το δίκτυο).
+    only_lines: set[str] | None = None
+    if "--lines" in sys.argv:
+        idx = sys.argv.index("--lines")
+        if idx + 1 < len(sys.argv):
+            only_lines = {c.strip() for c in sys.argv[idx + 1].split(",") if c.strip()}
+
+    limiter = oasa._SimpleLimiter(MASTER_PACE_RATE)
 
     with db.job_run("sync_master_data") as run:
         conn = db.get_connection()
@@ -206,6 +225,10 @@ def main():
                 for l in lines
                 if l.get("LineCode") or l.get("line_code")
             ]
+            if only_lines is not None:
+                line_codes = [c for c in line_codes if c in only_lines]
+                log.info("ΥΠΟΣΥΝΟΛΟ: %d γραμμές (%s)",
+                         len(line_codes), ",".join(sorted(line_codes)))
 
             total_routes = 0
             total_stops = 0
@@ -213,6 +236,7 @@ def main():
             failed_routes = []
 
             for i, line_code in enumerate(line_codes, 1):
+                limiter.acquire()
                 try:
                     routes = oasa.web_get_routes(line_code)
                 except Exception as e:
@@ -225,6 +249,7 @@ def main():
                 total_routes += len(route_codes)
 
                 for route_code in route_codes:
+                    limiter.acquire()
                     try:
                         stops = oasa.web_get_stops(route_code)
                         n_stops = upsert_stops(conn, route_code, stops, synced_at)
@@ -243,8 +268,23 @@ def main():
             except Exception as e:
                 log.warning("Terminal sync failed (non-fatal): %s", e)
 
+            # Γεωμετρία διαδρομών: ανανεώνεται ΜΑΖΙ με στάσεις/διαδρομές, γιατί
+            # αλλάζει μαζί τους (ο ΟΑΣΑ σημειώνει «temporary detour due to
+            # roadworks» στις περιγραφές). Παλιά πολυγραμμή = λάθος αποστάσεις
+            # σε κάθε προβολή στίγματος, χωρίς κανένα ορατό σφάλμα.
+            shapes = {}
+            try:
+                import sync_shapes
+                all_routes = [r["route_code"] for r in
+                              conn.execute("SELECT route_code FROM routes "
+                                           "ORDER BY route_code")]
+                shapes = sync_shapes.sync_all(conn, all_routes, synced_at, limiter)
+            except Exception as e:
+                log.warning("Shape sync failed (non-fatal): %s", e)
+
             run.detail = (
                 f"lines={n_lines} routes={total_routes} stops={total_stops} "
+                f"shapes={shapes.get('ok', 0)} "
                 f"failed_lines={len(failed_lines)} failed_routes={len(failed_routes)}"
             )
             if failed_lines or failed_routes:
