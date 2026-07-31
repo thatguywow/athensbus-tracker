@@ -48,15 +48,35 @@ log = logging.getLogger("local_poller")
 # seconds. The feeder self-paces to worker throughput — the queue never backs
 # up. TARGET_RATE is the single knob: raise for denser polling (more accuracy)
 # if you see no 403s, lower it if 403s are heavy.
+import os
+
 EDGE_DEPTH      = 3      # first/last K stops per route (where accuracy matters)
 ENABLE_MIDDLE   = False  # also poll middle stops (fragkakis-style); off until needed
-TARGET_RATE     = 55     # max total requests/sec — the main knob. 25 → 40 → 55
-                         # after the TLS fix cut poller CPU from 89% to 19% of
-                         # one core (36% at 40/s, no 403s). Cycle ≈ 29s,
-                         # which matters for COVERAGE too: stops 2-3 sit 1-2 min
-                         # past the origin, so a shorter cycle turns "sometimes
-                         # caught" into "almost always caught". Lower again if
-                         # 403s stop being rare.
+# Ρυθμιζόμενο χωρίς επεξεργασία κώδικα: ATHENSBUS_TARGET_RATE.
+# ΜΕΤΡΗΣΗ (scripts/probe_rate_limits.py): το ποσοστό 403 ανά ρυθμό είναι
+#   10/s → 0.0%   20/s → 0.2%   30/s → 1.1%   45/s → 4.3%
+# Δηλαδή στα 55/s ένα αισθητό ποσοστό των κλήσεων απορρίπτεται — και κάθε
+# χαμένη κλήση είναι μια χαμένη ευκαιρία να δούμε μια εξαφάνιση, άρα χαμένη
+# διέλευση. Ο υψηλός ρυθμός ΚΟΣΤΙΖΕΙ δεδομένα αντί να τα αγοράζει.
+# Ιστορικό της τιμής: 25 → 40 → 55, αφού η διόρθωση TLS έριξε το CPU του poller
+# από 89% σε 19% ενός πυρήνα. Η αύξηση δικαιολογήθηκε τότε από το CPU — αλλά το
+# CPU δεν ήταν ποτέ ο περιοριστικός παράγοντας· ο ΟΑΣΑ ήταν.
+TARGET_RATE     = float(os.environ.get("ATHENSBUS_TARGET_RATE", "55"))
+
+# ── GPS υποσύστημα (προαιρετικό) ────────────────────────────────────────────
+# ATHENSBUS_GPS_RATE > 0 ενεργοποιεί παράλληλο βρόχο getBusLocation. ΕΚΤΟΣ
+# λειτουργίας από προεπιλογή: τίποτα δεν αλλάζει αν δεν ζητηθεί ρητά.
+#
+# ΠΡΟΣΟΧΗ ΣΤΟ ΣΥΝΟΛΟ: το όριο του ΟΑΣΑ φαίνεται να είναι ανά IP, όχι ανά
+# endpoint, οπότε ο συνολικός ρυθμός είναι TARGET_RATE + ATHENSBUS_GPS_RATE.
+# Από τη μέτρηση (probe_rate_limits.py) η καθαρή ζώνη είναι ~20/s ΣΥΝΟΛΙΚΑ.
+#
+# Πρόταση για μέγιστη ακρίβεια σε πλήρες δίκτυο (~715 διαδρομές):
+#     ATHENSBUS_GPS_RATE=18   → κύκλος GPS ~40s (ο ΟΑΣΑ ανανεώνει ~35s)
+#     ATHENSBUS_TARGET_RATE=5 → οι στάσεις γίνονται δεύτερη γνώμη, όχι κύρια πηγή
+# Σύνολο 23/s αντί για 55/s: λιγότερα από τα μισά αιτήματα, πολλαπλάσια δεδομένα.
+GPS_RATE = float(os.environ.get("ATHENSBUS_GPS_RATE", "0"))
+
 STOP_WORKERS    = 24     # getStopArrivals fetch threads. At p50≈0.26s each
                          # worker sustains ~3.8 req/s, so 55/s needs ≥15; 24
                          # leaves headroom for slow responses. BURST_CAP stays
@@ -99,9 +119,17 @@ def measure_origin_yield(conn, days: int = 7) -> dict:
         WHERE service_date >= date('now', ?) GROUP BY route_code
     """, (f"-{days} day",))}
     out: dict[tuple, float] = {}
+    # ΜΟΝΟ διελεύσεις από ανίχνευση εξαφάνισης. Η μετρική απαντά «αποδίδει
+    # ΑΥΤΗ η στάση όταν τη ρωτάμε με getStopArrivals;» — και το GPS παράγει
+    # διελεύσεις για ΚΑΘΕ στάση ανεξάρτητα από το τι απαντά το getStopArrivals.
+    # Χωρίς το φίλτρο, μια σιωπηλή αφετηρία θα φαινόταν ξαφνικά παραγωγική,
+    # ο poller θα την προήγαγε πίσω στην κύρια λίστα, και θα ξόδευε πάλι
+    # χιλιάδες κλήσεις τη μέρα σε μια στάση που δεν απαντά ποτέ.
     for r in conn.execute("""
         SELECT route_code, stop_code, COUNT(*) n FROM stop_passages
-        WHERE passed_at >= date('now', ?) GROUP BY route_code, stop_code
+        WHERE passed_at >= date('now', ?)
+          AND COALESCE(method,'disappearance') = 'disappearance'
+        GROUP BY route_code, stop_code
     """, (f"-{days} day",)):
         t = trips.get(r["route_code"], 0)
         if t >= MIN_TRIPS_FOR_YIELD:
@@ -305,7 +333,11 @@ class RateLimiter:
 
     def __init__(self, rate: float):
         self.rate = float(rate)
-        self.cap = min(self.rate, self.BURST_CAP)
+        # max(1.0, …): με cap κάτω από 1 το allowance δεν φτάνει ποτέ το
+        # κατώφλι της acquire() και ο poller παγώνει σιωπηλά. Δεν φάνηκε ως
+        # τώρα γιατί το TARGET_RATE ήταν πάντα ≥25 — αλλά τώρα ρυθμίζεται από
+        # μεταβλητή περιβάλλοντος, οπότε μια τιμή <1 είναι πλέον εφικτή.
+        self.cap = max(1.0, min(self.rate, self.BURST_CAP))
         self.allowance = self.cap
         self.last = time.monotonic()
         self.lock = threading.Lock()
@@ -542,6 +574,24 @@ def main():
     writer = threading.Thread(target=_writer_thread,
                               args=(result_q, stop_meta, stats, stop_event), daemon=True)
     writer.start()
+
+    # GPS: ξεχωριστό νήμα με ΔΙΚΟ του limiter, ώστε ο διαμοιρασμός του budget να
+    # είναι εγγυημένος. Με κοινό limiter, όποιο υποσύστημα ζητούσε πρώτο θα
+    # έτρωγε όσο ήθελε και το άλλο θα λιμοκτονούσε.
+    gps_thread = None
+    if GPS_RATE > 0:
+        import gps_tracker
+        log.info("GPS ενεργό: %.0f req/s (σύνολο με στάσεις: %.0f req/s)",
+                 GPS_RATE, GPS_RATE + TARGET_RATE)
+        if GPS_RATE + TARGET_RATE > 25:
+            log.warning("Συνολικός ρυθμός %.0f/s — πάνω από την καθαρή ζώνη "
+                        "(~20/s). Περίμενε 403 και χαμένες διελεύσεις.",
+                        GPS_RATE + TARGET_RATE)
+        gps_thread = threading.Thread(
+            target=gps_tracker.run,
+            kwargs={"rate": GPS_RATE, "stop_event": stop_event},
+            daemon=True)
+        gps_thread.start()
 
     last_log = time.time()
 
