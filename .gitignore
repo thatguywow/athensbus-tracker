@@ -18,3 +18,4 @@ gps_collection.log
 vacuum.log
 backup.log
 backups/
+gps_report_*.txt
