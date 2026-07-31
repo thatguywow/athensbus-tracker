@@ -79,11 +79,125 @@ def extract_departure_times(entries: list[dict], direction: str) -> list[tuple[s
 
 WEEKDAY_TERMS = ["ΔΕΥΤΕΡΑ -", "ΚΑΘΗΜΕΡΙΝΗ", "ΚΑΘΗΜΕΡΙΝH", "ΟΛΕΣ"]
 
+# ── Κανονικό (θεωρητικό) πρόγραμμα — «Προβλεπόμενα» ─────────────────────────
+# Ο πίνακας normal_schedule, τα get_sched_lines/get_schedule_days_masterline και
+# το σχόλιο στο schema.sql υπήρχαν εδώ και καιρό, αλλά τίποτα δεν τα γέμιζε:
+# το normal_rows ήταν σταθερά 0. Χωρίς αυτά, ένα δρομολόγιο που λείπει δεν
+# ξεχωρίζει σε «κόπηκε από τον σχεδιασμό» και «προγραμματίστηκε αλλά δεν έγινε»
+# — δύο εντελώς διαφορετικά πράγματα που μέχρι τώρα μετριούνταν ως ένα.
+
+# Ο ΟΑΣΑ γράφει τους τύπους ημέρας με ΑΝΑΜΕΙΚΤΟ αλφάβητο: «ΘΕΡΙΝΟ ΣΑΒΒΑΤΟY»
+# τελειώνει σε λατινικό Y, «ΚΑΘΗΜΕΡΙΝH» σε λατινικό H. Οπτικά ίδια, διαφορετικά
+# bytes — μια απλή σύγκριση κειμένου αστοχεί σιωπηλά και διαλέγει λάθος τύπο
+# ημέρας, δηλαδή λάθος πρόγραμμα για όλη τη μέρα.
+_LOOKALIKE = str.maketrans({
+    "A": "Α", "B": "Β", "E": "Ε", "H": "Η", "I": "Ι", "K": "Κ", "M": "Μ",
+    "N": "Ν", "O": "Ο", "P": "Ρ", "T": "Τ", "X": "Χ", "Y": "Υ", "Z": "Ζ",
+})
+
+
+def _norm_greek(s: str) -> str:
+    return (s or "").upper().translate(_LOOKALIKE)
+
+
+def pick_day_type(day_types: list[dict], weekday: int) -> str | None:
+    """
+    Διαλέγει το sdc_code που ταιριάζει στη σημερινή ημέρα.
+    weekday: 0=Δευτέρα … 5=Σάββατο, 6=Κυριακή.
+    """
+    if not day_types:
+        return None
+    if weekday == 5:
+        want, avoid = "ΣΑΒΒΑΤ", ("ΚΥΡΙΑΚ",)
+    elif weekday == 6:
+        want, avoid = "ΚΥΡΙΑΚ", ("ΣΑΒΒΑΤ",)
+    else:
+        want, avoid = "ΚΑΘΗΜΕΡΙΝ", ("ΣΑΒΒΑΤ", "ΚΥΡΙΑΚ")
+
+    for dt in day_types:
+        d = _norm_greek(dt.get("sdc_descr", ""))
+        if want in d and not any(a in d for a in avoid):
+            return str(dt.get("sdc_code") or "")
+    # Εφεδρικό: γραμμές με έναν μόνο τύπο («ΟΛΕΣ ΟΙ ΗΜΕΡΕΣ»)
+    if len(day_types) == 1:
+        return str(day_types[0].get("sdc_code") or "")
+    return None
+
+
+def sync_normal_schedule(conn, service_date: str, synced_at: str,
+                         lines_meta: dict, routes_by_line: dict,
+                         limiter) -> int:
+    """
+    Κατεβάζει το ΚΑΝΟΝΙΚΟ πρόγραμμα του τύπου ημέρας και το αποθηκεύει.
+
+    Το κανονικό πρόγραμμα αλλάζει εποχιακά, όχι καθημερινά, οπότε αν υπάρχουν
+    ήδη γραμμές για σήμερα δεν ξαναρωτάμε — η δουλειά κοστίζει ~2 κλήσεις ανά
+    γραμμή και δεν έχει νόημα να επαναλαμβάνεται κάθε ώρα.
+    """
+    have = {r["route_code"] for r in conn.execute(
+        "SELECT DISTINCT route_code FROM normal_schedule WHERE schedule_date=?",
+        (service_date,))}
+
+    weekday = date.fromisoformat(service_date).weekday()
+    total = 0
+    for line_code, meta in lines_meta.items():
+        routes = routes_by_line.get(line_code, [])
+        if not routes or all(r["route_code"] in have for r in routes):
+            continue
+        try:
+            limiter.acquire()
+            day_types = oasa.get_schedule_days_masterline(line_code)
+            sdc = pick_day_type(day_types, weekday)
+            if not sdc:
+                continue
+            limiter.acquire()
+            sched = oasa.get_sched_lines(meta["line_id"], sdc, line_code)
+        except Exception:
+            continue
+        if not isinstance(sched, dict):
+            continue
+
+        for direction_key, rtype in (("go", "1"), ("come", "2")):
+            route = next((r for r in routes if r["route_type"] == rtype), None)
+            if route is None:
+                continue
+            times = {t for _sdd, t in
+                     extract_departure_times(sched.get(direction_key) or [],
+                                             direction_key)}
+            if not times:
+                continue
+            conn.execute("DELETE FROM normal_schedule WHERE route_code=? "
+                         "AND schedule_date=?", (route["route_code"], service_date))
+            for t in sorted(times):
+                conn.execute("""
+                    INSERT INTO normal_schedule
+                        (route_code, schedule_date, departure_time, sdc_code,
+                         last_synced)
+                    VALUES (?,?,?,?,?)
+                    ON CONFLICT(route_code, schedule_date, departure_time)
+                    DO UPDATE SET sdc_code=excluded.sdc_code,
+                                  last_synced=excluded.last_synced
+                """, (route["route_code"], service_date, t, sdc, synced_at))
+                total += 1
+        conn.commit()
+    return total
+
 
 def main():
     db.ensure_schema()
     synced_at = db.now_utc_iso()
-    today = date.today().isoformat()
+
+    # ΗΜΕΡΑ ΒΑΡΔΙΑΣ, όχι ημερολογιακή. Ολόκληρο το υπόλοιπο σύστημα κλειδώνει
+    # στο db.athens_service_date() (04:00→04:00): το compute διαβάζει
+    # scheduled_trips WHERE schedule_date = service_date, και η _sched_datetimes
+    # ερμηνεύει ώρες < 04:00 ως ΤΕΛΟΣ αυτής της ημέρας βάρδιας. Εδώ όμως
+    # γραφόταν date.today() — ημερολογιακή. Από τα μεσάνυχτα ως τις 04:00 οι
+    # δύο διαφέρουν κατά μία μέρα, οπότε το sync έσβηνε και ξανάγραφε τις
+    # γραμμές της ΕΠΟΜΕΝΗΣ ημέρας βάρδιας με ό,τι επέστρεφε ο ΟΑΣΑ εκείνη τη
+    # στιγμή, ενώ το compute δούλευε ακόμη την προηγούμενη. Το πεδίο ημερομηνίας
+    # του ΟΑΣΑ δεν βοηθά να το λύσουμε αλλιώς: είναι σταθερά '1900-01-01' —
+    # καθαρός συμπληρωματικός χαρακτήρας, μόνο η ώρα έχει νόημα.
+    today = db.athens_service_date()
 
     with db.job_run("sync_schedules") as run:
         conn = db.get_connection()
@@ -104,6 +218,12 @@ def main():
             failed = []
 
             for i, line_code in enumerate(line_codes, 1):
+                # Γραμμή χωρίς διαδρομές στη βάση δεν έχει πού να αποθηκεύσει —
+                # η κλήση θα πήγαινε χαμένη. Στην πλήρη εγκατάσταση δεν αλλάζει
+                # τίποτα· σε υποσύνολο (τοπική ανάπτυξη) γλιτώνει εκατοντάδες
+                # άσκοπες κλήσεις που ανταγωνίζονται τον poller.
+                if not routes_by_line.get(line_code):
+                    continue
                 try:
                     # Pacing: the poller now runs at 55 req/s, so 476 unpaced
                     # schedule calls on top of it pushed us over OASA's limit and
@@ -193,7 +313,17 @@ def main():
 
             conn.commit()
 
+            # Κανονικό πρόγραμμα (Προβλεπόμενα) — η τρίτη πλευρά της σύγκρισης
+            # «κανονικό vs ημερήσιο vs εκτελεσμένο». Μη μοιραίο αν αποτύχει:
+            # το ημερήσιο πρόγραμμα από πάνω είναι που τροφοδοτεί το compute.
             normal_rows = 0
+            try:
+                normal_rows = sync_normal_schedule(
+                    conn, today, synced_at, lines_meta, routes_by_line,
+                    oasa._SimpleLimiter(1.0 / DAILY_PACE_SECS))
+                conn.commit()
+            except Exception as e:
+                log.warning("Κανονικό πρόγραμμα απέτυχε (μη μοιραίο): %s", e)
 
             run.detail = (
                 f"date={today} schedule_rows={total_inserted} "
