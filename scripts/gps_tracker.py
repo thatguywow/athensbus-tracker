@@ -369,6 +369,7 @@ def run(rate: float = 18.0, duration_s: float | None = None,
     started = time.time()
     i = 0
     written = 0
+    errors = {"total": 0, "forbidden": 0, "empty": 0}
     last_commit = time.time()
     last_log = time.time()
 
@@ -382,11 +383,24 @@ def run(rate: float = 18.0, duration_s: float | None = None,
             rc = active[i % len(active)]
             i += 1
             lim.acquire()
+            # ΜΕΤΡΑΜΕ τα σφάλματα αντί να τα καταπίνουμε. Μαθημένο ακριβά: ο
+            # poller του getStopArrivals τυλίγει τα πάντα σε `except Exception:
+            # pass`, οπότε το ποσοστό 403 του ήταν ΑΟΡΑΤΟ — και μια «διόρθωση»
+            # που βασίστηκε στα συμπτώματα των logs αντί σε μέτρηση έκανε 66
+            # γραμμές να αποτύχουν. Ένας μετρητής που δεν κοιτάς είναι το ίδιο
+            # με μετρητή που δεν υπάρχει.
             try:
                 fixes = oasa.get_bus_location(rc)
+            except oasa.OasaApiError as e:
+                errors["total"] += 1
+                if "rate-limited" in str(e):
+                    errors["forbidden"] += 1
+                continue
             except Exception:
+                errors["total"] += 1
                 continue
             if not fixes:
+                errors["empty"] += 1
                 continue
 
             new = tracker.ingest(rc, fixes)
@@ -415,11 +429,14 @@ def run(rate: float = 18.0, duration_s: float | None = None,
                 last_commit = time.time()
             if time.time() - last_log > 60.0:
                 s = tracker.stats
-                log.info("GPS: στίγματα=%d (διπλά=%d) διελεύσεις=%d γραμμένες=%d "
-                         "βόλτες=%d εκτός_σχήματος=%d κενά=%d οχήματα=%d",
-                         s["fixes"], s["dup"], s["passages"], written,
-                         s["laps"], s["unprojectable"], s["gap_skips"],
-                         len(tracker.state))
+                pct403 = (100.0 * errors["forbidden"] / i) if i else 0.0
+                log.info("GPS: κλήσεις=%d στίγματα=%d (διπλά=%d) διελεύσεις=%d "
+                         "γραμμένες=%d | 403=%d (%.2f%%) σφάλματα=%d κενές=%d "
+                         "| βόλτες=%d εκτός_σχήματος=%d κενά=%d οχήματα=%d",
+                         i, s["fixes"], s["dup"], s["passages"], written,
+                         errors["forbidden"], pct403, errors["total"],
+                         errors["empty"], s["laps"], s["unprojectable"],
+                         s["gap_skips"], len(tracker.state))
                 last_log = time.time()
     finally:
         try:
@@ -428,7 +445,10 @@ def run(rate: float = 18.0, duration_s: float | None = None,
         except Exception:
             pass
 
-    return {**tracker.stats, "written": written,
+    return {**tracker.stats, "written": written, "calls": i,
+            "http_403": errors["forbidden"], "api_errors": errors["total"],
+            "empty_routes": errors["empty"],
+            "pct_403": round(100.0 * errors["forbidden"] / i, 3) if i else 0.0,
             "elapsed_s": round(time.time() - started, 1)}
 
 
