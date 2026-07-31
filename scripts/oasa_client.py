@@ -158,32 +158,11 @@ def web_get_stops(route_code: str) -> list[dict]:
     return _request("webGetStops", {"p1": route_code})
 
 def get_daily_schedule(line_code: str) -> dict:
-    """
-    Ημερήσιο πρόγραμμα μιας γραμμής.
-
-    ΧΩΡΙΣ ΕΠΑΝΑΛΗΨΗ ΣΕ 403. Παρατηρημένο στην παραγωγή:
-
-        act=getDailySchedule attempt=1/4 failed (403 Forbidden, line_code=1828)
-        act=getDailySchedule attempt=2/4 failed (403 Forbidden, line_code=1828)
-
-    Ο poller τρέχει στα 55/s και το sync προσθέτει άλλα ~10/s· στα ~65/s ο ΟΑΣΑ
-    αρχίζει να απορρίπτει. Με τις προεπιλογές του _request (4 προσπάθειες,
-    retry ΚΑΙ στα 403) κάθε άρνηση γίνεται τέσσερις κλήσεις — ανεβάζουμε τον
-    ρυθμό ακριβώς τη στιγμή που ζητείται να πέσει, και οι επόμενες γραμμές
-    τρώνε κι αυτές 403. Ίδιο ακριβώς μοτίβο που «σκότωσε» το getBusLocation.
-
-    Δύο προσπάθειες για παροδικά δικτυακά σφάλματα, καμία για 403: το sync
-    ξανατρέχει ούτως ή άλλως κάθε ώρα, και η SAFETY NET 1 του sync_schedules
-    κρατά το υπάρχον πρόγραμμα όταν το feed έρθει άδειο.
-    """
-    return _request("getDailySchedule", {"line_code": line_code},
-                    retry_forbidden=False, attempts=2)
+    return _request("getDailySchedule", {"line_code": line_code})
 
 def get_schedule_days_masterline(line_code: str) -> list[dict]:
-    """Returns the available schedule day-types (sdc_code + sdc_descr) for a line.
-    Ίδια πειθαρχία με το get_daily_schedule: καμία επανάληψη σε 403."""
-    result = _request("getScheduleDaysMasterline", {"p1": line_code},
-                      retry_forbidden=False, attempts=2)
+    """Returns the available schedule day-types (sdc_code + sdc_descr) for a line."""
+    result = _request("getScheduleDaysMasterline", {"p1": line_code})
     return result if isinstance(result, list) else []
 
 def get_sched_lines(line_id: str, sdc_code: str, line_code: str) -> dict:
@@ -191,12 +170,9 @@ def get_sched_lines(line_id: str, sdc_code: str, line_code: str) -> dict:
     Returns the NORMAL (theoretical) timetable for a line on a given day-type.
     line_id is the public line number (e.g. '619'); sdc_code is the day-type
     code from getScheduleDaysMasterline; line_code is the internal code.
-
-    Καμία επανάληψη σε 403 — βλ. get_daily_schedule.
     """
     return _request("getSchedLines",
-                    {"p1": line_id, "p2": sdc_code, "p3": line_code},
-                    retry_forbidden=False, attempts=2)
+                    {"p1": line_id, "p2": sdc_code, "p3": line_code})
 
 def get_bus_location(route_code: str) -> list[dict]:
     return _request("getBusLocation", {"p1": route_code})
