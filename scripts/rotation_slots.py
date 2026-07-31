@@ -220,10 +220,21 @@ def _accumulate_segment_times(conn, route_code, service_date, computed_at,
     near-origin stops on the same trip, record the origin→stop travel time.
     Persists the median per (route, stop_order) in segment_times.
     """
-    rows = conn.execute("""
+    # Ίδια πηγή με την ανακατασκευή. Ανακατεύοντας τις δύο μεθόδους, οι
+    # «μαθημένοι» χρόνοι τμημάτων θα ήταν μείγμα δύο διαφορετικών μετρήσεων του
+    # ίδιου πράγματος — και αυτοί οι χρόνοι τροφοδοτούν κατευθείαν πίσω στην
+    # εκτίμηση αναχώρησης/άφιξης, οπότε το σφάλμα θα ανακυκλωνόταν.
+    from trip_reconstruction_passages import _passage_source
+    src = _passage_source()
+    where = {
+        "disappearance": "AND COALESCE(method,'disappearance')='disappearance'",
+        "gps":           "AND method='gps'",
+        "both":          "",
+    }[src]
+    rows = conn.execute(f"""
         SELECT vehicle_no, stop_order, passed_at, stop_type
         FROM stop_passages
-        WHERE route_code=? AND service_date=?
+        WHERE route_code=? AND service_date=? {where}
         ORDER BY vehicle_no, passed_at
     """, (route_code, service_date)).fetchall()
     if not rows:
@@ -509,12 +520,13 @@ def align_trips_to_slots(actual_deps: list[float],
 
 def assign_slots(conn, route_code: str, service_date: str,
                  slot_count: int, computed_at: str) -> dict:
-    # Οι αλλαγές βάρδιας ΞΑΝΑΫΠΟΛΟΓΙΖΟΝΤΑΙ σε κάθε πέρασμα, άρα οι παλιές πρέπει
-    # να φύγουν πρώτα. Χωρίς αυτό το compute τρέχει ~96 φορές τη μέρα και
-    # ΠΡΟΣΘΕΤΕΙ ξανά τις ίδιες εγγραφές: μετρημένο στην παραγωγή 1.505.513
-    # σειρές, 94,35% διπλές, 202 MB — το 45% ΟΛΗΣ της βάσης. Κανένα άλλο σημείο
-    # του κώδικα δεν άγγιζε ποτέ αυτόν τον πίνακα (ούτε η purge_old_data), οπότε
-    # μεγάλωνε χωρίς όριο, ~210.000 σειρές/ημέρα.
+    # Οι αλλαγές βάρδιας ΞΑΝΑΫΠΟΛΟΓΙΖΟΝΤΑΙ κάθε φορά, άρα οι παλιές πρέπει να
+    # φύγουν πρώτα. Χωρίς αυτό το DELETE, το compute τρέχει ~96 φορές τη μέρα
+    # και ΠΡΟΣΘΕΤΕΙ τις ίδιες αλλαγές σε κάθε πέρασμα: μετρημένα ~2.500
+    # εγγραφές ανά εκτέλεση × 96 = ~240.000 σειρές/ημέρα, για πάντα. Καμία
+    # άλλη διαδρομή του κώδικα δεν άγγιζε ποτέ αυτόν τον πίνακα — ούτε η
+    # reconstruct_route_day_from_passages (καθαρίζει trips/slot_assignments/
+    # vehicle_departures) ούτε η purge_old_data.
     conn.execute("DELETE FROM slot_handoffs WHERE route_code=? AND service_date=?",
                  (route_code, service_date))
 
@@ -593,8 +605,11 @@ def assign_slots(conn, route_code: str, service_date: str,
                 except Exception:
                     gap = None
                 if gap is None or gap >= MIN_HANDOFF_GAP_MINS:
+                    # OR IGNORE: ζευγάρι με το μοναδικό ευρετήριο που στήνει η
+                    # db._migrate. Το DELETE στην κορυφή κάνει ήδη τη δουλειά·
+                    # αυτό είναι το δίχτυ αν μια εκτέλεση κοπεί στη μέση.
                     conn.execute("""
-                        INSERT INTO slot_handoffs
+                        INSERT OR IGNORE INTO slot_handoffs
                             (route_code, service_date, slot_number,
                              outgoing_vehicle, incoming_vehicle,
                              handoff_time, gap_mins, computed_at)
