@@ -324,7 +324,24 @@ def _split_trips(passages: list[dict], route_duration: float | None,
         pdt = _parse(p["passed_at"])
         gap = (pdt - _parse(prev["passed_at"])).total_seconds() / 60
         regressed = p["stop_order"] <= prev["stop_order"]
-        jitter = (prev["stop_order"] - p["stop_order"]) <= ORDER_JITTER and gap <= JITTER_MINS
+        drop = prev["stop_order"] - p["stop_order"]
+        if span and span >= 20:
+            # ΠΥΚΝΑ ΔΕΔΟΜΕΝΑ: μικρή οπισθοχώρηση είναι θόρυβος ΑΝΕΞΑΡΤΗΤΑ από
+            # το πόσο στάθηκε το όχημα. Η χρονική συνθήκη εδώ έκοβε γνήσιους
+            # γύρους στα δύο.
+            #
+            # ΜΕΤΡΗΜΕΝΟ (γραμμή 619, όχημα 71363): στάση 23 → 24, παύση 364 s,
+            # μετά στάση 22 (πίσω 467 m) και κανονικά ως το 42. Η οπισθοχώρηση
+            # ήταν ΔΥΟ στάσεις — ποτέ νέος γύρος — αλλά το κενό των 6 λεπτών
+            # απέτυχε στο `gap <= JITTER_MINS`, οπότε ο γύρος 16:13→16:53
+            # έσπασε σε δύο «δρομολόγια» των 20 λεπτών το καθένα. Πάνω σε
+            # κυκλική διαδρομή 51 λεπτών αυτό βγαίνει ως φυσικά αδύνατο.
+            #
+            # Το μεγάλο κενό αντιμετωπίζεται ΧΩΡΙΣΤΑ από το `gap > gap_limit`
+            # παρακάτω· δεν χρειάζεται να διπλοκριθεί εδώ.
+            jitter = drop <= ORDER_JITTER
+        else:
+            jitter = drop <= ORDER_JITTER and gap <= JITTER_MINS
 
         # LOOP: a terminus-side point arriving while `cur` is still a young
         # origin-only cluster cannot belong to `cur` (it could not possibly
