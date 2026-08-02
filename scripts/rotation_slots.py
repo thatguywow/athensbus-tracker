@@ -306,6 +306,86 @@ def _accumulate_segment_times(conn, route_code, service_date, computed_at,
         """, (route_code, stop_order, median_mins, json.dumps(buckets), computed_at))
 
 
+def learn_segments_from_gps(conn, service_date: str, computed_at: str) -> dict:
+    """
+    Μαθαίνει χρόνους τμημάτων αφετηρία→στάση ΑΠΟ ΤΟ GPS, για χρήση από ΟΛΕΣ
+    τις μεθόδους.
+
+    ΓΙΑΤΙ: το segment_times είναι ο πίνακας που κάνει ακριβή την ΥΠΟΛΟΓΙΣΜΕΝΗ
+    αναχώρηση — όταν η αφετηρία δεν παρατηρήθηκε, η ώρα προκύπτει ως
+    «διέλευση σε στάση Ν μείον ο χρόνος αφετηρία→Ν». Στην παραγωγή ο πίνακας
+    έχει 20 σειρές για 712 διαδρομές, επειδή η _accumulate_segment_times μπορεί
+    να μάθει μόνο από δρομολόγια όπου η ΑΦΕΤΗΡΙΑ παρατηρήθηκε — κι αυτό η
+    ανίχνευση εξαφάνισης το πετυχαίνει στο 0,1% των δρομολογίων.
+
+    Το GPS τις βλέπει συνεχώς. Και ο χρόνος από την αφετηρία ως τη στάση Ν
+    είναι ΦΥΣΙΚΗ ΙΔΙΟΤΗΤΑ ΤΗΣ ΔΙΑΔΡΟΜΗΣ — δεν ανήκει σε καμία μέθοδο. Άρα
+    μετριέται με το καλύτερο διαθέσιμο όργανο και χρησιμοποιείται από όλους.
+
+    Αυτό βελτιώνει την ΠΑΛΙΑ μέθοδο, όχι τη νέα: κάθε υπολογισμένη αναχώρηση
+    που δείχνει σήμερα το dashboard στηρίζεται σε αυτόν τον πίνακα.
+    """
+    rows = conn.execute("""
+        SELECT route_code, vehicle_no, stop_order, passed_at
+        FROM stop_passages
+        WHERE service_date=? AND method='gps'
+        ORDER BY route_code, vehicle_no, passed_at""", (service_date,)).fetchall()
+    if not rows:
+        return {"routes": 0, "segments": 0}
+
+    lo_of = {r["route_code"]: r["lo"] for r in conn.execute(
+        "SELECT route_code, MIN(stop_order) lo FROM stops GROUP BY route_code")}
+
+    # (route, stop_order) → [λεπτά από την αφετηρία]
+    samples: dict[tuple, list[float]] = {}
+    cur_key = None
+    origin_t = None
+    for r in rows:
+        key = (r["route_code"], r["vehicle_no"])
+        lo = lo_of.get(r["route_code"])
+        if lo is None:
+            continue
+        if key != cur_key:
+            cur_key, origin_t = key, None
+        if r["stop_order"] == lo:
+            origin_t = datetime.fromisoformat(r["passed_at"])
+            continue
+        if origin_t is None:
+            continue
+        mins = (datetime.fromisoformat(r["passed_at"]) - origin_t).total_seconds() / 60
+        # Πάνω από 3 ώρες δεν είναι τμήμα διαδρομής· είναι επόμενος γύρος του
+        # ίδιου οχήματος όπου χάσαμε την ενδιάμεση αφετηρία.
+        if 0 < mins < 180:
+            samples.setdefault((r["route_code"], r["stop_order"]), []).append(
+                round(mins, 2))
+
+    n_seg = 0
+    routes = set()
+    for (rc, order), vals in samples.items():
+        if len(vals) < 3:            # τρία δείγματα ελάχιστο για διάμεσο
+            continue
+        row = conn.execute(
+            "SELECT samples FROM segment_times WHERE route_code=? AND stop_order=?",
+            (rc, order)).fetchone()
+        buckets = _store_buckets(_load_buckets(row["samples"] if row else None),
+                                 service_date, vals)
+        flat = _flat(buckets)
+        med = round(statistics.median(flat), 2) if flat else None
+        conn.execute("""
+            INSERT INTO segment_times
+                (route_code, stop_order, median_mins, samples, last_updated)
+            VALUES (?,?,?,?,?)
+            ON CONFLICT(route_code, stop_order) DO UPDATE SET
+                median_mins=excluded.median_mins,
+                samples=excluded.samples,
+                last_updated=excluded.last_updated""",
+            (rc, order, med, json.dumps(buckets), computed_at))
+        n_seg += 1
+        routes.add(rc)
+    log.info("Segment times από GPS: %d τμήματα σε %d διαδρομές",
+             n_seg, len(routes))
+    return {"routes": len(routes), "segments": n_seg}
+
 def update_route_rotation(conn, route_code: str, service_date: str,
                           computed_at: str) -> dict | None:
     """
