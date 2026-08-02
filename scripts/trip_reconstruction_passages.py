@@ -38,6 +38,19 @@ log = logging.getLogger("trip_reconstruction_passages")
 
 LOOP_TERMINAL_METRES = 300   # first/last stop this close ⇒ loop route
 LINFIT_MIN_SPAN = 4     # εύρος στάσεων ώστε η παλινδρόμηση να προτιμηθεί έναντι μαθημένου τμήματος
+# Με τόσα ή περισσότερα σημεία στην πλευρά της αφετηρίας, η προσαρμογή στα
+# ΣΗΜΕΡΙΝΑ σημεία κερδίζει πάντα τον μαθημένο μέσο όρο ημερών.
+#
+# ΜΕΤΡΗΜΕΝΟ: γεμίζοντας το segment_times από GPS (20 → 13.157 σειρές), τα
+# αδύνατα αποτελέσματα του GPS ανέβηκαν 1.064 → 1.764 (+66%). Η διάμεσος
+# πολλών ημερών αγνοεί τη σημερινή κίνηση· η προσαρμογή όχι.
+#
+# ΚΙΝΔΥΝΟΣ ΠΑΡΑΓΩΓΗΣ: η _accumulate_segment_times ΞΑΝΑΓΕΜΙΖΕΙ τον πίνακα σε
+# κάθε κύκλο compute. Σήμερα μένει ακίνδυνο μόνο επειδή η μέθοδος εξαφάνισης
+# βλέπει αφετηρία στο 0,1% των δρομολογίων, άρα ο πίνακας μένει στις ~20
+# σειρές. Με GPS (48%) θα γέμιζε — και θα έβλαπτε. Αυτό το κατώφλι το
+# εξουδετερώνει χωρίς να πειράξει την αραιή περίπτωση.
+DENSE_ORIGIN_POINTS = 3
 MIN_TRIP_GAP_MINUTES = 20    # #3: κάτω όριο για το κενό που σπάει δρομολόγιο
 MAX_BOUNDARY_ZONE_MINS = 45  # #6: πλαφόν ζώνης συνόρων (μισό headway, έως 45′)
 LOOP_DWELL_MINS = 3.0        # κενό στην αφετηρία κυκλικής πάνω από αυτό ⇒ στάθμευση, όχι αναχώρηση
@@ -637,7 +650,8 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
 
             if origin_hit:
                 started_dt = _parse(origin_hit["passed_at"])
-            elif (origin_side and segments.get(min(o for o, _t in origin_side))
+            elif (origin_side and len(origin_side) < DENSE_ORIGIN_POINTS
+                  and segments.get(min(o for o, _t in origin_side))
                   and not (len(origin_side) >= 2
                            and max(o for o, _t in origin_side)
                                - min(o for o, _t in origin_side) >= LINFIT_MIN_SPAN)):

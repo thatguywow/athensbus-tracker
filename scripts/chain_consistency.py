@@ -232,7 +232,6 @@ def _reassert_duration_sanity(conn, service_date: str) -> tuple[int, set]:
 
 def tighten_chain(conn, service_date: str, computed_at: str) -> dict:
     dropped_routes = _drop_contained_fragments(conn, service_date)
-    n_handover, handover_routes = _resolve_handover_overlaps(conn, service_date)
 
     # Every observed passage of every vehicle on this service day.
     # #9 CROSS-DAY: a vehicle finishing at 03:50 and starting again at 04:10
@@ -311,6 +310,15 @@ def tighten_chain(conn, service_date: str, computed_at: str) -> dict:
     if affected:
         log.info("Chain consistency: %d αναχωρήσεις, %d λήξεις σφίχτηκαν "
                  "(%d διαδρομές)", n_dep, n_arr, len(affected))
+    # ΣΕΙΡΑ: η επίλυση αλλαγών ΜΕΤΑ το σφίξιμο εκτιμήσεων, όχι πριν.
+    # Το σφίξιμο μετακινεί εκτιμώμενες αναχωρήσεις/αφίξεις, οπότε ΞΑΝΑΦΤΙΑΧΝΕΙ
+    # επικαλύψεις που είχαν ήδη λυθεί. Μετρημένο: 96 επικαλύψεις ίδιας
+    # διαδρομής επέζησαν, ΟΛΕΣ διαδοχικά ζεύγη και 95 από τις 96 μέσα στο όριο
+    # των 15 λεπτών — δηλαδή περιπτώσεις που ο κανόνας ΕΠΡΕΠΕ να είχε πιάσει.
+    # Δεν έφταιγε ο κανόνας· έφταιγε ότι έτρεχε πολύ νωρίς.
+    n_handover, handover_routes = _resolve_handover_overlaps(conn, service_date)
+    affected |= handover_routes
+
     n_sane, sane_routes = _reassert_duration_sanity(conn, service_date)
     affected |= sane_routes
 
