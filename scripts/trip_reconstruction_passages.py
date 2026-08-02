@@ -627,6 +627,24 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
         for _ti, trip in enumerate(vehicle_trips):
             if not trip:
                 continue
+
+            # ΕΝΑ ΔΡΟΜΟΛΟΓΙΟ ΠΡΟΧΩΡΑΕΙ. Αν η τελευταία διέλευση δεν είναι
+            # πιο μπροστά από την πρώτη, δεν διανύθηκε διαδρομή.
+            #
+            # ΜΕΤΡΗΜΕΝΟ στην παραγωγή: 2,9-3,6% των «δρομολογίων» δεν έχουν
+            # καμία πρόοδο, και 58 από αυτά δήλωναν κιόλας ώρα άφιξης —
+            # δηλαδή εντελώς πλασματική διάρκεια.
+            #
+            # Παράδειγμα, γραμμή 755 (92 στάσεις): διελεύσεις μόνο στις
+            # στάσεις 3→2, και αλλού 3→2→2→3. Είναι λεωφορείο που στέκεται
+            # κοντά στο τερματικό ενώ η πρόβλεψη άφιξης αναβοσβήνει, όχι
+            # όχημα σε διαδρομή.
+            #
+            # Το φίλτρο απαιτεί ΤΟΥΛΑΧΙΣΤΟΝ ΔΥΟ σημεία: με ένα μόνο σημείο δεν
+            # υπάρχει τίποτα να συγκριθεί, και αυτά τα ημιτελή τα χειρίζεται
+            # ήδη ο έλεγχος πιθανοφάνειας διάρκειας.
+            if len(trip) >= 2 and trip[-1]["stop_order"] <= trip[0]["stop_order"]:
+                continue
             # First passage of this vehicle's NEXT lap — an ESTIMATED arrival
             # may never postdate it (the bus cannot still be arriving after it
             # has been seen starting again).
