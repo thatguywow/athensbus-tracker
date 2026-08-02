@@ -222,10 +222,22 @@ def main():
                     # OASA's latest daily feed — additions, moves and removals
                     # alike, past and future. Self-healing: any bad sync is
                     # corrected by the next hourly one.
+                    # Καθαρίζουμε ΟΛΕΣ τις παραλλαγές αυτής της κατεύθυνσης,
+                    # όχι μόνο την επιλεγμένη.
+                    #
+                    # Ο επιλογέας παραλλαγής μπορεί να αλλάξει γνώμη από μέρα σε
+                    # μέρα (αλλαγή εποχής, τέλος έργων, Σαββατοκύριακο). Αν
+                    # σβήναμε μόνο τη νέα διαδρομή, οι σειρές της ΠΑΛΙΑΣ έμεναν
+                    # και το ίδιο πρόγραμμα μετριόταν ΔΥΟ ΦΟΡΕΣ — μία σε κάθε
+                    # παραλλαγή. Παρατηρήθηκε στη γραμμή 500: το πρόγραμμα
+                    # μετακινήθηκε στη διαδρομή 5909 αλλά η 1890 κράτησε τις
+                    # παλιές 5 αναχωρήσεις.
+                    same_dir = [r["route_code"] for r in routes_for_line
+                                if r["route_type"] == route["route_type"]]
                     conn.execute(
-                        "DELETE FROM scheduled_trips "
-                        "WHERE route_code=? AND schedule_date=?",
-                        (route["route_code"], today))
+                        "DELETE FROM scheduled_trips WHERE schedule_date=? "
+                        "AND route_code IN (%s)" % ",".join("?" * len(same_dir)),
+                        [today] + same_dir)
                     for sdd_code, dep_time in new_times:
                         conn.execute(
                             """
