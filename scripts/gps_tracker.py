@@ -108,6 +108,23 @@ MAX_SPEED_KMH = 100.0
 DWELL_RADIUS_M = 60.0        # πόσο κοντά σε στάση μετράει ως «σταματημένο εκεί»
 DWELL_MIN_S = 12.0           # κάτω από αυτό είναι φανάρι/κίνηση, όχι επιβίβαση
 
+# ── Πορεία οχήματος ως έλεγχος ποιότητας προβολής ───────────────────────────
+# Το VEH_HEADING υπάρχει σε ΚΑΘΕ απάντηση του getBusLocation και μέχρι τώρα το
+# αποθηκεύαμε χωρίς να το χρησιμοποιούμε. Είναι εξαιρετικά καθαρό σήμα.
+#
+# ΜΕΤΡΗΜΕΝΟ, διαφορά πορείας οχήματος από τη φορά της πολυγραμμής:
+#   κίνηση ΜΠΡΟΣΤΑ  (n=10.521): διάμεσος   6°, p90  27°, >90°:  1,6%
+#   κίνηση ΑΝΑΠΟΔΑ  (n=   326): διάμεσος 170°, p90 178°, >90°: 85,3%
+#
+# Δηλαδή ένα όχημα που «πάει ανάποδα» στην πολυγραμμή κοιτά σχεδόν ακριβώς
+# αντίθετα — δεν είναι θόρυβος GPS, είναι λεωφορείο που όντως ταξιδεύει προς
+# την άλλη κατεύθυνση: λάθος διαδρομή, ή λάθος κλάδος κυκλικής όπου η
+# πολυγραμμή περνά δύο φορές από το ίδιο σημείο.
+#
+# Το κατώφλι στις 120° αφήνει άνετο περιθώριο στις στροφές (p90 μπροστά: 27°)
+# και κόβει καθαρά τις αντιστροφές.
+MAX_HEADING_DIFF_DEG = 120.0
+
 ORIGIN_RECOVERY_M = 800.0
 FALLBACK_SPEED_MS = 5.5          # ~20 km/h, αν δεν έχουμε πρόσφατη ταχύτητα
 
@@ -223,7 +240,7 @@ class GpsTracker:
         self.state: dict[tuple[str, str], dict] = {}
         self.stats = {"fixes": 0, "dup": 0, "unprojectable": 0,
                       "passages": 0, "laps": 0, "gap_skips": 0,
-                      "impossible": 0, "origin_recovered": 0, "dwells": 0}
+                      "impossible": 0, "origin_recovered": 0, "dwells": 0, "wrong_heading": 0}
 
     def prune(self, now_mono: float):
         dead = [k for k, v in self.state.items()
@@ -256,6 +273,11 @@ class GpsTracker:
             except (KeyError, TypeError, ValueError):
                 continue
 
+            try:
+                heading = float(f.get("VEH_HEADING"))
+            except (TypeError, ValueError):
+                heading = None
+
             self.stats["fixes"] += 1
             key = (route_code, veh)
             prev = self.state.get(key)
@@ -274,6 +296,18 @@ class GpsTracker:
                 self.stats["unprojectable"] += 1
                 continue
             dist, _err = proj
+
+            # ΕΛΕΓΧΟΣ ΠΟΡΕΙΑΣ: αν το όχημα κοιτά αντίθετα από τη φορά της
+            # διαδρομής σε αυτό το σημείο, η προβολή δεν περιγράφει την
+            # πραγματική του θέση σε ΑΥΤΗ τη διαδρομή. Δεν παράγουμε διελεύσεις
+            # και δεν μετακινούμε την κατάσταση — περιμένουμε καθαρό στίγμα.
+            if heading is not None:
+                brg = g.shape.bearing_at(dist)
+                if brg is not None:
+                    diff = abs(((heading - brg + 180.0) % 360.0) - 180.0)
+                    if diff > MAX_HEADING_DIFF_DEG:
+                        self.stats["wrong_heading"] += 1
+                        continue
 
             if prev is not None:
                 gap_s = (ts - prev["ts"]).total_seconds()

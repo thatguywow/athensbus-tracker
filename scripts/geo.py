@@ -151,6 +151,23 @@ class RouteShape:
                 best_d = self.dist[i] + t * math.sqrt(seg_len2)
         return None if best_d is None else (best_d, best_err)
 
+    def bearing_at(self, dist_m: float) -> float | None:
+        """
+        Πορεία της διαδρομής (μοίρες, 0=Βορράς) στο δοσμένο σωρευτικό μήκος.
+
+        Συγκρίνεται με το VEH_HEADING του getBusLocation: αν το όχημα κοιτά
+        αντίθετα από τη φορά της διαδρομής, η προβολή είναι λάθος.
+        """
+        i = self._seg_at(dist_m)
+        j = min(i + 1, self.n - 1)
+        if i == j:
+            return None
+        dx = (self.lat[j] - self.lat[i]) * self.m_lat      # βόρεια συνιστώσα
+        dy = (self.lng[j] - self.lng[i]) * self.m_lng      # ανατολική
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            return None
+        return math.degrees(math.atan2(dy, dx)) % 360.0
+
     def _seg_at(self, dist_m: float) -> int:
         """Δείκτης τμήματος που περιέχει το δοσμένο σωρευτικό μήκος."""
         if dist_m <= 0:
