@@ -200,6 +200,52 @@ def generate_for_date(conn, service_date: str):
             "ended_at":      r["terminus_arrived_at"],  # NULL for incomplete trips
         })
 
+    # ── Δρομολόγια ΧΩΡΙΣ αντιστοίχιση καρτελακιού ────────────────────────
+    # Το ερώτημα παραπάνω κάνει INNER JOIN με slot_assignments, οπότε κάθε
+    # δρομολόγιο που δεν ταίριαξε σε προγραμματισμένη ώρα ΕΞΑΦΑΝΙΖΟΤΑΝ εντελώς
+    # από τη σελίδα. Μετρημένο (2026-08-01): 1.349 από 11.182 δρομολόγια —
+    # το 12,1% της υπηρεσίας — ήταν αόρατα.
+    #
+    # Χαρακτηριστικό: η γραμμή 500 (νυχτερινή) εκτέλεσε 22 δρομολόγια στις
+    # διαδρομές 2900/5909, αλλά επειδή το πρόγραμμα είχε προσκολληθεί στην
+    # παραλλαγή 1889, κανένα δεν ταίριαξε — και η σελίδα έδειχνε «Δεν υπάρχουν
+    # δεδομένα» για δρομολόγια που ΟΝΤΩΣ έγιναν.
+    #
+    # Ένα λεωφορείο που έτρεξε είναι γεγονός. Το ότι δεν βρήκαμε σε ποια
+    # προγραμματισμένη ώρα αντιστοιχεί είναι δικό ΜΑΣ κενό, όχι λόγος να το
+    # κρύψουμε. Εμφανίζεται με «—» στη στήλη ΠΡΟΓΡΑΜΜΑ.
+    for r in conn.execute("""
+        SELECT t.route_code, r.line_code, l.line_id, r.descr AS route_name,
+               r.route_type, t.vehicle_no, t.started_at, t.terminus_arrived_at,
+               EXISTS (
+                   SELECT 1 FROM trip_stop_times x
+                   WHERE x.trip_id = t.id
+                     AND x.stop_order <= (SELECT (MIN(stop_order)+MAX(stop_order))/2.0
+                                          FROM stops s WHERE s.route_code = t.route_code)
+               ) AS dep_observed
+        FROM trips t
+        LEFT JOIN routes r ON r.route_code = t.route_code
+        LEFT JOIN lines  l ON l.line_code  = r.line_code
+        WHERE t.service_date = ?
+          AND NOT EXISTS (SELECT 1 FROM slot_assignments sa WHERE sa.trip_id = t.id)
+        ORDER BY t.started_at
+    """, (service_date,)).fetchall():
+        dist_rows.append({
+            "route_code":    r["route_code"],
+            "line_code":     r["line_code"],
+            "line_id":       r["line_id"] or r["line_code"],
+            "route_name":    r["route_name"],
+            "direction":     "Εξερχόμενη" if r["route_type"]=="1" else "Εισερχόμενη",
+            "scheduled_dep": None,          # δεν βρέθηκε αντίστοιχη ώρα
+            "slot_number":   None,
+            "slot_label":    "—",
+            "vehicle_no":    r["vehicle_no"],
+            "deviation":     None,
+            "started_at":    r["started_at"],
+            "dep_observed":  bool(r["dep_observed"]),
+            "ended_at":      r["terminus_arrived_at"],
+        })
+
     # Add missed scheduled trips
     for r in conn.execute("""
         SELECT st.route_code, r.line_code, l.line_id,
