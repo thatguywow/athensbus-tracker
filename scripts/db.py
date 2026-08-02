@@ -103,9 +103,62 @@ def _migrate(conn):
     """)
 
 
+    # Πώς προέκυψε η κάθε διέλευση. 'disappearance' = η κλασική ανίχνευση από
+    # την εξαφάνιση πρόβλεψης στο getStopArrivals· 'gps' = προβολή στίγματος
+    # getBusLocation πάνω στη γεωμετρία της διαδρομής. Οι δύο συνυπάρχουν στον
+    # ίδιο πίνακα ώστε να συγκρίνονται στα ΙΔΙΑ δρομολόγια πριν αλλάξει
+    # οτιδήποτε στην παραγωγή. Η προεπιλογή κρατά τις υπάρχουσες σειρές σωστές.
+    add_column("stop_passages", "method", "TEXT DEFAULT 'disappearance'")
+    add_column("vehicle_pings", "heading", "INTEGER")
+    # Χρόνος στάσης στη στάση, σε δευτερόλεπτα. Προκύπτει από πάγωμα της
+    # προόδου δίπλα σε στάση — πληροφορία που ο ΟΑΣΑ δεν δημοσιεύει καθόλου.
+    add_column("stop_passages", "dwell_s", "REAL")
+
     # Loop-route fix: rebuild stop_passages if its UNIQUE key predates
     # stop_order (see _migrate_passages_unique).
     _migrate_passages_unique(conn)
+
+    # Καθάρισμα των συσσωρευμένων διπλών αλλαγών βάρδιας (βλ. assign_slots).
+    _migrate_dedup_handoffs(conn)
+
+
+def _migrate_dedup_handoffs(conn):
+    """
+    Ξεδιπλώνει το slot_handoffs και βάζει μοναδικό ευρετήριο.
+
+    Το compute τρέχει ~96 φορές τη μέρα και μέχρι τώρα ΠΡΟΣΘΕΤΕ τις ίδιες
+    αλλαγές βάρδιας σε κάθε πέρασμα (κανένα DELETE πουθενά), οπότε ο πίνακας
+    μεγάλωνε ~240.000 σειρές/ημέρα χωρίς όριο. Εδώ κρατάμε μία εγγραφή ανά
+    (διαδρομή, ημέρα, καρτελάκι, ώρα αλλαγής) και στήνουμε το ευρετήριο που
+    εμποδίζει την επανεμφάνιση. Τρέχει μία φορά: μετά, το ευρετήριο υπάρχει
+    και η συνάρτηση βγαίνει αμέσως.
+    """
+    if not conn.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name='slot_handoffs'").fetchone():
+        return
+    if conn.execute("SELECT name FROM sqlite_master WHERE type='index' "
+                    "AND name='idx_sh_unique'").fetchone():
+        return
+
+    before = conn.execute("SELECT COUNT(*) c FROM slot_handoffs").fetchone()["c"]
+    if before:
+        # Κρατάμε το ΜΙΚΡΟΤΕΡΟ rowid κάθε ομάδας — το υπόλοιπο είναι
+        # κυριολεκτικά η ίδια εγγραφή ξαναγραμμένη.
+        conn.execute("""
+            DELETE FROM slot_handoffs WHERE id NOT IN (
+                SELECT MIN(id) FROM slot_handoffs
+                GROUP BY route_code, service_date, slot_number,
+                         outgoing_vehicle, incoming_vehicle, handoff_time
+            )""")
+        after = conn.execute("SELECT COUNT(*) c FROM slot_handoffs").fetchone()["c"]
+        log.info("slot_handoffs: %d → %d σειρές (%d διπλές αφαιρέθηκαν)",
+                 before, after, before - after)
+
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_sh_unique ON slot_handoffs(
+            route_code, service_date, slot_number,
+            outgoing_vehicle, incoming_vehicle, handoff_time)""")
+    conn.commit()
 
 
 def _migrate_passages_unique(conn):

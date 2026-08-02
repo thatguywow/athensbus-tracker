@@ -220,10 +220,32 @@ def _accumulate_segment_times(conn, route_code, service_date, computed_at,
     near-origin stops on the same trip, record the origin→stop travel time.
     Persists the median per (route, stop_order) in segment_times.
     """
-    rows = conn.execute("""
+    # Ίδια πηγή με την ανακατασκευή. Ανακατεύοντας τις δύο μεθόδους, οι
+    # «μαθημένοι» χρόνοι τμημάτων θα ήταν μείγμα δύο διαφορετικών μετρήσεων του
+    # ίδιου πράγματος — και αυτοί οι χρόνοι τροφοδοτούν κατευθείαν πίσω στην
+    # εκτίμηση αναχώρησης/άφιξης, οπότε το σφάλμα θα ανακυκλωνόταν.
+    from trip_reconstruction_passages import _passage_source
+    src = _passage_source()
+    # ΜΕ GPS ΔΕΝ ΜΑΘΑΙΝΟΥΜΕ ΤΜΗΜΑΤΑ. Μετρημένο: γεμάτο segment_times ανεβάζει
+    # τα αδύνατα αποτελέσματα του GPS από 831 σε 1.509-1.764. Δύο λόγοι:
+    #   • η προσαρμογή στα σημερινά σημεία ξέρει τη σημερινή κίνηση, η διάμεσος
+    #     πολλών ημερών όχι·
+    #   • τα ίδια τα δείγματα είναι μολυσμένα — δρομολόγιο που ξεκίνησε στη μέση
+    #     (αλυσίδα παραλλαγών, 31% των περιπτώσεων «χωρίς αναχώρηση») δίνει
+    #     εντελώς λάθος χρόνο «αφετηρία→στάση».
+    # Με GPS η αναχώρηση είναι μετρημένη στο 48% και καλά εκτιμημένη αλλού, οπότε
+    # ο πίνακας δεν χρειάζεται. Η αραιή μέθοδος τον γεμίζει όπως πάντα.
+    if src == "gps":
+        return
+    where = {
+        "disappearance": "AND COALESCE(method,'disappearance')='disappearance'",
+        "gps":           "AND method='gps'",
+        "both":          "",
+    }[src]
+    rows = conn.execute(f"""
         SELECT vehicle_no, stop_order, passed_at, stop_type
         FROM stop_passages
-        WHERE route_code=? AND service_date=?
+        WHERE route_code=? AND service_date=? {where}
         ORDER BY vehicle_no, passed_at
     """, (route_code, service_date)).fetchall()
     if not rows:
@@ -294,6 +316,104 @@ def _accumulate_segment_times(conn, route_code, service_date, computed_at,
                 last_updated=excluded.last_updated
         """, (route_code, stop_order, median_mins, json.dumps(buckets), computed_at))
 
+
+def learn_segments_from_gps(conn, service_date: str, computed_at: str) -> dict:
+    """
+    Μαθαίνει χρόνους τμημάτων αφετηρία→στάση ΑΠΟ ΤΟ GPS, για χρήση από ΟΛΕΣ
+    τις μεθόδους.
+
+    ΓΙΑΤΙ: το segment_times είναι ο πίνακας που κάνει ακριβή την ΥΠΟΛΟΓΙΣΜΕΝΗ
+    αναχώρηση — όταν η αφετηρία δεν παρατηρήθηκε, η ώρα προκύπτει ως
+    «διέλευση σε στάση Ν μείον ο χρόνος αφετηρία→Ν». Στην παραγωγή ο πίνακας
+    έχει 20 σειρές για 712 διαδρομές, επειδή η _accumulate_segment_times μπορεί
+    να μάθει μόνο από δρομολόγια όπου η ΑΦΕΤΗΡΙΑ παρατηρήθηκε — κι αυτό η
+    ανίχνευση εξαφάνισης το πετυχαίνει στο 0,1% των δρομολογίων.
+
+    Το GPS τις βλέπει συνεχώς. Και ο χρόνος από την αφετηρία ως τη στάση Ν
+    είναι ΦΥΣΙΚΗ ΙΔΙΟΤΗΤΑ ΤΗΣ ΔΙΑΔΡΟΜΗΣ — δεν ανήκει σε καμία μέθοδο. Άρα
+    μετριέται με το καλύτερο διαθέσιμο όργανο και χρησιμοποιείται από όλους.
+
+    ⚠️ ΜΕΤΡΗΘΗΚΕ ΚΑΙ ΕΙΝΑΙ ΕΠΙΒΛΑΒΕΣ. ΜΗΝ ΤΟ ΚΑΛΕΣΕΙΣ ΣΤΗΝ ΠΑΡΑΓΩΓΗ.
+
+    Η ιδέα ακούγεται σωστή και είναι λάθος. Πλήρης ημέρα 2026-08-01, όλη η
+    αλυσίδα παραγωγής, αδύνατα αποτελέσματα:
+
+                              GPS            εξαφάνιση
+      χωρίς segment_times     1.064 (8,7%)   1.204 (10,0%)
+      με 13.157 σειρές        1.764 (14,5%)  1.286 (10,6%)
+
+    Δηλαδή +66% χειρότερα για το GPS. Ο λόγος: η διαδρομή «μαθημένο τμήμα»
+    ενεργοποιείται όταν ΔΕΝ υπάρχει μετρημένη αφετηρία και ΑΝΤΙΚΑΘΙΣΤΑ τη
+    γραμμική προσαρμογή πάνω στις διελεύσεις του ΣΥΓΚΕΚΡΙΜΕΝΟΥ δρομολογίου.
+    Η διάμεσος πολλών ημερών είναι πιο ΘΟΡΥΒΩΔΗΣ από την προσαρμογή στα
+    σημερινά σημεία — η προσαρμογή ξέρει τη σημερινή κίνηση, η διάμεσος όχι.
+
+    Και στη στοχευμένη μέτρηση (σφάλμα αναχώρησης έναντι 5.827 μετρημένων
+    από GPS) δεν βοήθησε καθόλου: διάμεσο 1,50′ → 1,52′, p90 4,29′ → 4,85′.
+
+    Διατηρείται ως τεκμηριωμένο ΑΡΝΗΤΙΚΟ αποτέλεσμα, ώστε να μην ξαναδοκιμαστεί
+    η ίδια εύλογη ιδέα από την αρχή.
+    """
+    rows = conn.execute("""
+        SELECT route_code, vehicle_no, stop_order, passed_at
+        FROM stop_passages
+        WHERE service_date=? AND method='gps'
+        ORDER BY route_code, vehicle_no, passed_at""", (service_date,)).fetchall()
+    if not rows:
+        return {"routes": 0, "segments": 0}
+
+    lo_of = {r["route_code"]: r["lo"] for r in conn.execute(
+        "SELECT route_code, MIN(stop_order) lo FROM stops GROUP BY route_code")}
+
+    # (route, stop_order) → [λεπτά από την αφετηρία]
+    samples: dict[tuple, list[float]] = {}
+    cur_key = None
+    origin_t = None
+    for r in rows:
+        key = (r["route_code"], r["vehicle_no"])
+        lo = lo_of.get(r["route_code"])
+        if lo is None:
+            continue
+        if key != cur_key:
+            cur_key, origin_t = key, None
+        if r["stop_order"] == lo:
+            origin_t = datetime.fromisoformat(r["passed_at"])
+            continue
+        if origin_t is None:
+            continue
+        mins = (datetime.fromisoformat(r["passed_at"]) - origin_t).total_seconds() / 60
+        # Πάνω από 3 ώρες δεν είναι τμήμα διαδρομής· είναι επόμενος γύρος του
+        # ίδιου οχήματος όπου χάσαμε την ενδιάμεση αφετηρία.
+        if 0 < mins < 180:
+            samples.setdefault((r["route_code"], r["stop_order"]), []).append(
+                round(mins, 2))
+
+    n_seg = 0
+    routes = set()
+    for (rc, order), vals in samples.items():
+        if len(vals) < 3:            # τρία δείγματα ελάχιστο για διάμεσο
+            continue
+        row = conn.execute(
+            "SELECT samples FROM segment_times WHERE route_code=? AND stop_order=?",
+            (rc, order)).fetchone()
+        buckets = _store_buckets(_load_buckets(row["samples"] if row else None),
+                                 service_date, vals)
+        flat = _flat(buckets)
+        med = round(statistics.median(flat), 2) if flat else None
+        conn.execute("""
+            INSERT INTO segment_times
+                (route_code, stop_order, median_mins, samples, last_updated)
+            VALUES (?,?,?,?,?)
+            ON CONFLICT(route_code, stop_order) DO UPDATE SET
+                median_mins=excluded.median_mins,
+                samples=excluded.samples,
+                last_updated=excluded.last_updated""",
+            (rc, order, med, json.dumps(buckets), computed_at))
+        n_seg += 1
+        routes.add(rc)
+    log.info("Segment times από GPS: %d τμήματα σε %d διαδρομές",
+             n_seg, len(routes))
+    return {"routes": len(routes), "segments": n_seg}
 
 def update_route_rotation(conn, route_code: str, service_date: str,
                           computed_at: str) -> dict | None:
@@ -509,12 +629,13 @@ def align_trips_to_slots(actual_deps: list[float],
 
 def assign_slots(conn, route_code: str, service_date: str,
                  slot_count: int, computed_at: str) -> dict:
-    # Οι αλλαγές βάρδιας ΞΑΝΑΫΠΟΛΟΓΙΖΟΝΤΑΙ σε κάθε πέρασμα, άρα οι παλιές πρέπει
-    # να φύγουν πρώτα. Χωρίς αυτό το compute τρέχει ~96 φορές τη μέρα και
-    # ΠΡΟΣΘΕΤΕΙ ξανά τις ίδιες εγγραφές: μετρημένο στην παραγωγή 1.505.513
-    # σειρές, 94,35% διπλές, 202 MB — το 45% ΟΛΗΣ της βάσης. Κανένα άλλο σημείο
-    # του κώδικα δεν άγγιζε ποτέ αυτόν τον πίνακα (ούτε η purge_old_data), οπότε
-    # μεγάλωνε χωρίς όριο, ~210.000 σειρές/ημέρα.
+    # Οι αλλαγές βάρδιας ΞΑΝΑΫΠΟΛΟΓΙΖΟΝΤΑΙ κάθε φορά, άρα οι παλιές πρέπει να
+    # φύγουν πρώτα. Χωρίς αυτό το DELETE, το compute τρέχει ~96 φορές τη μέρα
+    # και ΠΡΟΣΘΕΤΕΙ τις ίδιες αλλαγές σε κάθε πέρασμα: μετρημένα ~2.500
+    # εγγραφές ανά εκτέλεση × 96 = ~240.000 σειρές/ημέρα, για πάντα. Καμία
+    # άλλη διαδρομή του κώδικα δεν άγγιζε ποτέ αυτόν τον πίνακα — ούτε η
+    # reconstruct_route_day_from_passages (καθαρίζει trips/slot_assignments/
+    # vehicle_departures) ούτε η purge_old_data.
     conn.execute("DELETE FROM slot_handoffs WHERE route_code=? AND service_date=?",
                  (route_code, service_date))
 
@@ -593,8 +714,11 @@ def assign_slots(conn, route_code: str, service_date: str,
                 except Exception:
                     gap = None
                 if gap is None or gap >= MIN_HANDOFF_GAP_MINS:
+                    # OR IGNORE: ζευγάρι με το μοναδικό ευρετήριο που στήνει η
+                    # db._migrate. Το DELETE στην κορυφή κάνει ήδη τη δουλειά·
+                    # αυτό είναι το δίχτυ αν μια εκτέλεση κοπεί στη μέση.
                     conn.execute("""
-                        INSERT INTO slot_handoffs
+                        INSERT OR IGNORE INTO slot_handoffs
                             (route_code, service_date, slot_number,
                              outgoing_vehicle, incoming_vehicle,
                              handoff_time, gap_mins, computed_at)
@@ -694,10 +818,31 @@ def compute_all_slots(conn, service_date: str, computed_at: str,
         rc = r["route_code"]
         try:
             rot = update_route_rotation(conn, rc, service_date, computed_at)
-            if not rot:
-                continue
-            n_patterns += 1
-            slot_count = rot["slot_count"]
+            if rot:
+                n_patterns += 1
+                slot_count = rot["slot_count"]
+            else:
+                # ΔΕΝ ΜΕΤΡΗΘΗΚΕ ΣΥΧΝΟΤΗΤΑ — αλλά αυτό ΔΕΝ σημαίνει «καμία
+                # ανάθεση». Η measure_headway χρειάζεται ΔΥΟ αναχωρήσεις για να
+                # βγάλει διάστημα, οπότε κάθε διαδρομή με ΜΙΑ προγραμματισμένη
+                # αναχώρηση επέστρεφε None και παρακάμπτονταν ΟΛΟΚΛΗΡΗ: το
+                # δρομολόγιο εκτελούνταν, καταγραφόταν, αλλά δεν αντιστοιχιζόταν
+                # ποτέ — και η σελίδα έδειχνε «0 από 1 εκτελέστηκαν».
+                #
+                # ΜΕΤΡΗΜΕΝΟ (2026-08-01): 110 διαδρομές με μία μόνο αναχώρηση,
+                # 110 αναχωρήσεις που δεν μπορούσαν ΠΟΤΕ να ταιριάξουν, και 69
+                # δρομολόγια που όντως έγιναν αλλά έμεναν αταίριαστα. Αυτές
+                # είναι ακριβώς οι «εξαιρέσεις»: Α7 [ΕΩΣ ΣΤΑΣΗ 2η ΚΡΥΟΝΕΡΙΟΥ],
+                # Α2 [ΕΩΣ ΕΚΚΛΗΣΙΑ ΒΑΡΗΣ] και δεκάδες άλλες.
+                #
+                # Με μία αναχώρηση δεν υπάρχει περιστροφή: ένα καρτελάκι αρκεί.
+                n_sched = conn.execute(
+                    "SELECT COUNT(*) c FROM scheduled_trips "
+                    "WHERE route_code=? AND schedule_date=?",
+                    (rc, service_date)).fetchone()["c"]
+                if not n_sched:
+                    continue
+                slot_count = 1
             result = assign_slots(conn, rc, service_date, slot_count, computed_at)
             n_assigned += result["assigned"]
             n_handoffs += result["handoffs"]

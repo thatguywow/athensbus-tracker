@@ -80,6 +80,44 @@ def extract_departure_times(entries: list[dict], direction: str) -> list[tuple[s
 WEEKDAY_TERMS = ["ΔΕΥΤΕΡΑ -", "ΚΑΘΗΜΕΡΙΝΗ", "ΚΑΘΗΜΕΡΙΝH", "ΟΛΕΣ"]
 
 
+def _pick_variant(conn, routes_for_line, route_type: str):
+    """
+    Ποια παραλλαγή διαδρομής παίρνει το πρόγραμμα αυτής της κατεύθυνσης.
+
+    Πολλές γραμμές έχουν ΠΟΛΛΕΣ διαδρομές ίδιας κατεύθυνσης: κανονική,
+    Σαββάτου-Κυριακής, νυχτερινή, «προσωρινή λόγω έργων», κοντή εκδοχή. Ο
+    κώδικας έπαιρνε την ΠΡΩΤΗ που τύχαινε (`next(...)`), οπότε το πρόγραμμα
+    μπορούσε να προσγειωθεί σε παραλλαγή που δεν κυκλοφορεί σήμερα.
+
+    ΜΕΤΡΗΜΕΝΟ (2026-08-01, Σάββατο): 86 κατευθύνσεις έχουν >1 παραλλαγή· σε 9
+    το πρόγραμμα κάθισε σε ΑΛΛΗ παραλλαγή από εκείνη που έτρεχαν τα οχήματα —
+    116 προγραμματισμένες αναχωρήσεις σε λάθος διαδρομή. Χαρακτηριστικό
+    παράδειγμα η γραμμή 500 (νυχτερινή): πρόγραμμα 9 αναχωρήσεων στη διαδρομή
+    1889, ενώ τα λεωφορεία έτρεχαν τη σαββατοκύριακη 2900 με 716 διελεύσεις.
+    Αποτέλεσμα: η μία κατεύθυνση δείχνει 0% κάλυψη και η άλλη κανένα πρόγραμμα.
+
+    Επιλογή με ΔΕΔΟΜΕΝΑ: κερδίζει η παραλλαγή με τις περισσότερες διελεύσεις
+    τις τελευταίες ημέρες — δηλαδή αυτή που όντως κυκλοφορεί. Αυτοδιορθώνεται
+    όταν αλλάζει η εποχή ή τελειώνουν τα έργα. Χωρίς ιστορικό (νέα διαδρομή),
+    διατηρείται η παλιά συμπεριφορά.
+    """
+    cands = [r for r in routes_for_line if r["route_type"] == route_type]
+    if len(cands) <= 1:
+        return cands[0] if cands else None
+    best, best_n = None, -1
+    for r in cands:
+        try:
+            n = conn.execute(
+                "SELECT COUNT(*) c FROM stop_passages WHERE route_code=? "
+                "AND service_date >= date('now', '-7 day')",
+                (r["route_code"],)).fetchone()["c"]
+        except Exception:
+            n = 0
+        if n > best_n:
+            best, best_n = r, n
+    return best if best_n > 0 else cands[0]
+
+
 def main():
     db.ensure_schema()
     synced_at = db.now_utc_iso()
@@ -116,12 +154,8 @@ def main():
                     continue
 
                 routes_for_line = routes_by_line.get(line_code, [])
-                come_route = next(
-                    (r for r in routes_for_line if r["route_type"] == "2"), None
-                )
-                go_route = next(
-                    (r for r in routes_for_line if r["route_type"] == "1"), None
-                )
+                come_route = _pick_variant(conn, routes_for_line, "2")
+                go_route = _pick_variant(conn, routes_for_line, "1")
 
                 for direction_key, route in (("come", come_route), ("go", go_route)):
                     if route is None:

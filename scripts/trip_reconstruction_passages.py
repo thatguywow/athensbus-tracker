@@ -38,6 +38,19 @@ log = logging.getLogger("trip_reconstruction_passages")
 
 LOOP_TERMINAL_METRES = 300   # first/last stop this close ⇒ loop route
 LINFIT_MIN_SPAN = 4     # εύρος στάσεων ώστε η παλινδρόμηση να προτιμηθεί έναντι μαθημένου τμήματος
+# Με τόσα ή περισσότερα σημεία στην πλευρά της αφετηρίας, η προσαρμογή στα
+# ΣΗΜΕΡΙΝΑ σημεία κερδίζει πάντα τον μαθημένο μέσο όρο ημερών.
+#
+# ΜΕΤΡΗΜΕΝΟ: γεμίζοντας το segment_times από GPS (20 → 13.157 σειρές), τα
+# αδύνατα αποτελέσματα του GPS ανέβηκαν 1.064 → 1.764 (+66%). Η διάμεσος
+# πολλών ημερών αγνοεί τη σημερινή κίνηση· η προσαρμογή όχι.
+#
+# ΚΙΝΔΥΝΟΣ ΠΑΡΑΓΩΓΗΣ: η _accumulate_segment_times ΞΑΝΑΓΕΜΙΖΕΙ τον πίνακα σε
+# κάθε κύκλο compute. Σήμερα μένει ακίνδυνο μόνο επειδή η μέθοδος εξαφάνισης
+# βλέπει αφετηρία στο 0,1% των δρομολογίων, άρα ο πίνακας μένει στις ~20
+# σειρές. Με GPS (48%) θα γέμιζε — και θα έβλαπτε. Αυτό το κατώφλι το
+# εξουδετερώνει χωρίς να πειράξει την αραιή περίπτωση.
+DENSE_ORIGIN_POINTS = 3
 MIN_TRIP_GAP_MINUTES = 20    # #3: κάτω όριο για το κενό που σπάει δρομολόγιο
 MAX_BOUNDARY_ZONE_MINS = 45  # #6: πλαφόν ζώνης συνόρων (μισό headway, έως 45′)
 LOOP_DWELL_MINS = 3.0        # κενό στην αφετηρία κυκλικής πάνω από αυτό ⇒ στάθμευση, όχι αναχώρηση
@@ -224,8 +237,42 @@ def _boundary_owner_is_this_day(conn, route_code: str, started_dt: datetime,
     return mine < theirs
 
 
+def _enforce_no_overlap(trips: list[list[dict]]) -> list[list[dict]]:
+    """
+    Ένα όχημα δεν μπορεί να τρέχει δύο δρομολόγια ταυτόχρονα.
+
+    Με πυκνά δεδομένα, κοντά στο τερματικό οι διελεύσεις της ΟΥΡΑΣ του γύρου Α
+    και της ΚΕΦΑΛΗΣ του γύρου Β μπερδεύονται χρονικά: το τελευταίο σημείο του Α
+    πέφτει ΜΕΤΑ το πρώτο σημείο του Β. Μετρημένο στην πλήρη ημέρα: 633 από τις
+    1.385 επικαλύψεις είναι ακριβώς αυτό — ίδια διαδρομή, επικάλυψη λίγων λεπτών.
+
+    Εδώ μεταφέρουμε τα σημεία που «ξεχειλίζουν»: κάθε σημείο του Α που συνέβη
+    μετά την έναρξη του Β ανήκει στο Β. Καμία μέτρηση δεν χάνεται — αλλάζει μόνο
+    σε ποιον γύρο αποδίδεται.
+    """
+    if len(trips) < 2:
+        return trips
+    out = [list(trips[0])]
+    for nxt in trips[1:]:
+        if not nxt:
+            continue
+        cur = out[-1]
+        if cur:
+            b_start = _parse(nxt[0]["passed_at"])
+            keep, moved = [], []
+            for p in cur:
+                (moved if _parse(p["passed_at"]) >= b_start else keep).append(p)
+            if keep and moved:
+                out[-1] = keep
+                nxt = sorted(moved + list(nxt),
+                             key=lambda q: (q["passed_at"], -q["stop_order"]))
+        out.append(list(nxt))
+    return [t for t in out if t]
+
+
 def _split_trips(passages: list[dict], route_duration: float | None,
-                 loop_mid: float | None = None) -> list[list[dict]]:
+                 loop_mid: float | None = None,
+                 span: int | None = None) -> list[list[dict]]:
     """
     Chain one vehicle's passages (already sorted by passed_at) into trips.
 
@@ -255,6 +302,14 @@ def _split_trips(passages: list[dict], route_duration: float | None,
 
     JITTER_MINS = 3.0        # tiny regressions within this window are noise…
     ORDER_JITTER = 3         # …if the order drop stays inside the edge cluster
+    # ΠΥΚΝΑ ΔΕΔΟΜΕΝΑ: με ~35 σημεία ανά δρομολόγιο (GPS) αντί για ~4,6
+    # (εξαφάνιση), οι διαδοχικές διελεύσεις απέχουν 1 θέση και δευτερόλεπτα.
+    # Ένα σταθερό ORDER_JITTER=3 είναι τότε ΠΟΛΥ σφιχτό: μια στιγμιαία
+    # αναταραχή προβολής σπάει το δρομολόγιο στη μέση. Το κατώφλι κλιμακώνεται
+    # με το μήκος της διαδρομής — πραγματικός νέος γύρος σημαίνει επιστροφή
+    # ΚΟΝΤΑ ΣΤΗΝ ΑΡΧΗ, όχι υποχώρηση δύο στάσεων.
+    if span and span >= 20:
+        ORDER_JITTER = max(3, int(span * 0.25))
     TERMINAL_CLUSTER = 8.0   # minutes: arrival stragglers / dwell-ghost window
     young_limit = (route_duration * 0.5) if route_duration else 20.0
     mature_mins = (route_duration * 0.5) if route_duration else 20.0
@@ -269,7 +324,24 @@ def _split_trips(passages: list[dict], route_duration: float | None,
         pdt = _parse(p["passed_at"])
         gap = (pdt - _parse(prev["passed_at"])).total_seconds() / 60
         regressed = p["stop_order"] <= prev["stop_order"]
-        jitter = (prev["stop_order"] - p["stop_order"]) <= ORDER_JITTER and gap <= JITTER_MINS
+        drop = prev["stop_order"] - p["stop_order"]
+        if span and span >= 20:
+            # ΠΥΚΝΑ ΔΕΔΟΜΕΝΑ: μικρή οπισθοχώρηση είναι θόρυβος ΑΝΕΞΑΡΤΗΤΑ από
+            # το πόσο στάθηκε το όχημα. Η χρονική συνθήκη εδώ έκοβε γνήσιους
+            # γύρους στα δύο.
+            #
+            # ΜΕΤΡΗΜΕΝΟ (γραμμή 619, όχημα 71363): στάση 23 → 24, παύση 364 s,
+            # μετά στάση 22 (πίσω 467 m) και κανονικά ως το 42. Η οπισθοχώρηση
+            # ήταν ΔΥΟ στάσεις — ποτέ νέος γύρος — αλλά το κενό των 6 λεπτών
+            # απέτυχε στο `gap <= JITTER_MINS`, οπότε ο γύρος 16:13→16:53
+            # έσπασε σε δύο «δρομολόγια» των 20 λεπτών το καθένα. Πάνω σε
+            # κυκλική διαδρομή 51 λεπτών αυτό βγαίνει ως φυσικά αδύνατο.
+            #
+            # Το μεγάλο κενό αντιμετωπίζεται ΧΩΡΙΣΤΑ από το `gap > gap_limit`
+            # παρακάτω· δεν χρειάζεται να διπλοκριθεί εδώ.
+            jitter = drop <= ORDER_JITTER
+        else:
+            jitter = drop <= ORDER_JITTER and gap <= JITTER_MINS
 
         # LOOP: a terminus-side point arriving while `cur` is still a young
         # origin-only cluster cannot belong to `cur` (it could not possibly
@@ -326,7 +398,7 @@ def _split_trips(passages: list[dict], route_duration: float | None,
                     continue   # parked-at-terminal noise → drop
             kept.append(t)
         trips = kept
-    return trips
+    return _enforce_no_overlap(trips)
 
 
 def passage_query_window(service_date: str) -> tuple[str, str]:
@@ -354,9 +426,76 @@ def boundary_zone_windows(service_date: str) -> list[tuple[str, str]]:
             ((de - bz).isoformat(), (de + bz).isoformat())]
 
 
+def _passage_source() -> str:
+    """
+    Ποια μέθοδο διελεύσεων διαβάζει η ανακατασκευή.
+
+    Από τη στιγμή που γράφουν ΚΑΙ οι δύο μέθοδοι στον ίδιο πίνακα, το φιλτράρισμα
+    παύει να είναι προαιρετικό: χωρίς αυτό, κάθε στάση εμφανίζεται δύο φορές με
+    ελαφρώς διαφορετική ώρα, ο splitter βλέπει το stop_order να «μην προχωρά»
+    και σπάει το δρομολόγιο στη μέση. Προεπιλογή: η ΥΠΑΡΧΟΥΣΑ συμπεριφορά, ώστε
+    τίποτα να μην αλλάζει μέχρι να το ζητήσει ρητά κάποιος.
+
+      disappearance  (προεπιλογή) — μόνο η κλασική μέθοδος
+      gps                          — μόνο διελεύσεις από στίγματα
+      both                         — και οι δύο, με προτεραιότητα στο GPS
+    """
+    import os
+    v = (os.environ.get("ATHENSBUS_PASSAGE_SOURCE") or "disappearance").lower()
+    return v if v in ("disappearance", "gps", "both") else "disappearance"
+
+
+def passage_method_sql(alias: str = "") -> str:
+    """
+    Το κομμάτι WHERE που περιορίζει στις διελεύσεις της ενεργής πηγής.
+
+    Κοινό, ώστε κάθε σημείο που διαβάζει stop_passages να συμφωνεί με την
+    ανακατασκευή. Ένα ξεχασμένο σημείο δεν βγάζει σφάλμα — απλώς μετράει
+    διελεύσεις που κανείς δεν χρησιμοποιεί, και οι αποφάσεις που παίρνει
+    (τι είναι μπαγιάτικο, ποια στάση αποδίδει) γίνονται λάθος στα σιωπηλά.
+    """
+    p = f"{alias}." if alias else ""
+    src = _passage_source()
+    if src == "gps":
+        return f"AND {p}method='gps'"
+    if src == "both":
+        return ""
+    return f"AND COALESCE({p}method,'disappearance')='disappearance'"
+
+
+# Δύο διελεύσεις της ίδιας στάσης/οχήματος πιο κοντά από αυτό είναι η ΙΔΙΑ
+# φυσική διέλευση ιδωμένη από τις δύο μεθόδους — όχι δύο περάσματα.
+_DEDUP_WINDOW_S = 900.0
+
+
+def _dedup_prefer_gps(rows: list[dict]) -> list[dict]:
+    """Κρατά τη GPS εκδοχή όταν οι δύο μέθοδοι περιγράφουν την ίδια διέλευση."""
+    gps = [r for r in rows if r.get("method") == "gps"]
+    if not gps:
+        return rows
+    by_key: dict[tuple, list[datetime]] = defaultdict(list)
+    for r in gps:
+        by_key[(r["vehicle_no"], r["stop_order"])].append(_parse(r["passed_at"]))
+
+    out = []
+    for r in rows:
+        if r.get("method") == "gps":
+            out.append(r)
+            continue
+        t = _parse(r["passed_at"])
+        near = by_key.get((r["vehicle_no"], r["stop_order"]), ())
+        if any(abs((t - g).total_seconds()) <= _DEDUP_WINDOW_S for g in near):
+            continue          # το GPS ήδη περιγράφει αυτή τη διέλευση
+        out.append(r)
+    out.sort(key=lambda r: (r["vehicle_no"], r["passed_at"], -r["stop_order"]))
+    return out
+
+
 def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str,
-                                        computed_at: str) -> dict:
+                                        computed_at: str,
+                                        source: str | None = None) -> dict:
     """Reconstruct trips for one route/day from stop_passages. Idempotent."""
+    source = source or _passage_source()
     # ── cleanup (same contract as GPS version) ──
     old_ids = [r["id"] for r in conn.execute(
         "SELECT id FROM trips WHERE route_code=? AND service_date=?",
@@ -453,10 +592,18 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
     # e.g. 03:55 can be assembled whole here too, in case the schedule assigns
     # it to this day).
     query_start, query_end = passage_query_window(service_date)
-    rows = conn.execute("""
-        SELECT vehicle_no, stop_code, stop_order, passed_at
+    # COALESCE: οι σειρές που γράφτηκαν πριν προστεθεί η στήλη `method` έχουν
+    # NULL και είναι, εξ ορισμού, της κλασικής μεθόδου.
+    method_sql = {
+        "disappearance": "AND COALESCE(method,'disappearance')='disappearance'",
+        "gps":           "AND method='gps'",
+        "both":          "",
+    }[source]
+    rows = conn.execute(f"""
+        SELECT vehicle_no, stop_code, stop_order, passed_at,
+               COALESCE(method,'disappearance') AS method
         FROM stop_passages
-        WHERE route_code=? AND passed_at>=? AND passed_at<?
+        WHERE route_code=? AND passed_at>=? AND passed_at<? {method_sql}
         -- Tie-break on stop_order DESC: on a loop route the arrival (order N)
         -- and the next lap's presence at the same physical stop (order 1) are
         -- written with the SAME timestamp. Reading the arrival first lets it
@@ -464,17 +611,19 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
         ORDER BY vehicle_no, passed_at, stop_order DESC
     """, (route_code, query_start, query_end)).fetchall()
 
+    rows = [dict(r) for r in rows if r["stop_order"] is not None]
+    if source == "both":
+        rows = _dedup_prefer_gps(rows)
+
     by_vehicle: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
-        if r["stop_order"] is None:
-            continue
-        by_vehicle[r["vehicle_no"]].append(dict(r))
+        by_vehicle[r["vehicle_no"]].append(r)
 
     n_trips = n_departures = 0
     distinct_vehicles = set()
 
     for vehicle_no, plist in by_vehicle.items():
-        vehicle_trips = _split_trips(plist, route_duration, loop_mid)
+        vehicle_trips = _split_trips(plist, route_duration, loop_mid, span=hi - lo)
         for _ti, trip in enumerate(vehicle_trips):
             if not trip:
                 continue
@@ -518,7 +667,8 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
 
             if origin_hit:
                 started_dt = _parse(origin_hit["passed_at"])
-            elif (origin_side and segments.get(min(o for o, _t in origin_side))
+            elif (origin_side and len(origin_side) < DENSE_ORIGIN_POINTS
+                  and segments.get(min(o for o, _t in origin_side))
                   and not (len(origin_side) >= 2
                            and max(o for o, _t in origin_side)
                                - min(o for o, _t in origin_side) >= LINFIT_MIN_SPAN)):

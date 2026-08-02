@@ -95,6 +95,141 @@ def _drop_contained_fragments(conn, service_date: str) -> set[str]:
     return affected
 
 
+
+# Πάνω από αυτό, η επικάλυψη δεν είναι αλλαγή κατεύθυνσης στο τερματικό αλλά
+# πραγματική ανωμαλία — και πρέπει να ΜΕΙΝΕΙ σημαδεμένη, όχι να συμμαζευτεί.
+HANDOVER_MAX_OVERLAP_MINS = 15.0
+
+
+def _resolve_handover_overlaps(conn, service_date: str) -> tuple[int, set]:
+    """
+    Ένα όχημα δεν αναχωρεί πριν φτάσει.
+
+    ΜΕΤΡΗΜΕΝΟ στην πλήρη ημέρα 2026-08-01: 515 επικαλύψεις όπου το ΙΔΙΟ όχημα
+    «τρέχει» δύο διαδρομές ΤΗΣ ΙΔΙΑΣ ΓΡΑΜΜΗΣ ταυτόχρονα. Οι 501 από αυτές είναι
+    εναλλαγή κατεύθυνσης (εξερχόμενη→εισερχόμενη ή αντίστροφα), και οι δύο με
+    πυκνά δεδομένα (31-33 σημεία η καθεμιά). Διάμεση επικάλυψη: 1,4 λεπτά.
+
+    Δεν είναι σφάλμα μέτρησης — είναι ΓΕΩΓΡΑΦΙΑ. Το τέρμα της μιας κατεύθυνσης
+    και η αφετηρία της άλλης είναι το ΙΔΙΟ φυσικό σημείο, οπότε το στίγμα του
+    οχήματος προβάλλεται και στις δύο διαδρομές και οι δύο διελεύσεις
+    μπλέκονται χρονικά.
+
+    Η λύση δεν είναι να διαλέξουμε νικητή: και οι δύο μετρήσεις είναι σωστές
+    ξεχωριστά. Είναι να τοποθετήσουμε την ΑΛΛΑΓΗ στο μέσο της αμφισβητούμενης
+    ζώνης — η άφιξη της πρώτης και η αναχώρηση της δεύτερης γίνονται η ίδια
+    στιγμή, που είναι ούτως ή άλλως η φυσική αλήθεια σε ένα τερματικό.
+
+    Μεγάλες επικαλύψεις ΔΕΝ αγγίζονται: εκεί κάτι άλλο συμβαίνει και ο έλεγχος
+    ποιότητας πρέπει να συνεχίσει να το βλέπει.
+    """
+    from datetime import datetime
+
+    rows = conn.execute("""
+        SELECT id, route_code, vehicle_no, started_at, terminus_arrived_at
+        FROM trips WHERE service_date=? AND terminus_arrived_at IS NOT NULL
+        ORDER BY vehicle_no, started_at""", (service_date,)).fetchall()
+
+    by_veh: dict[str, list] = {}
+    for r in rows:
+        by_veh.setdefault(r["vehicle_no"], []).append(dict(r))
+
+    fixed, affected = 0, set()
+    for trips in by_veh.values():
+        for a, b in zip(trips, trips[1:]):
+            arr, dep = a["terminus_arrived_at"], b["started_at"]
+            if not arr or not dep or arr <= dep:
+                continue
+            try:
+                ta, tb = datetime.fromisoformat(arr), datetime.fromisoformat(dep)
+            except (ValueError, TypeError):
+                continue
+            overlap = (ta - tb).total_seconds() / 60.0
+            if overlap <= 0 or overlap > HANDOVER_MAX_OVERLAP_MINS:
+                continue
+            # ΜΟΝΟ η αναχώρηση της ΕΠΟΜΕΝΗΣ μετακινείται, όχι η άφιξη της
+            # προηγούμενης. Η άφιξη κλείνει μια διαδρομή που παρατηρήθηκε από
+            # την αρχή ως το τέλος — είναι η πιο σίγουρη τιμή που έχουμε. Η
+            # αναχώρηση της επόμενης είναι η αμφίσημη: το όχημα στέκεται ακόμη
+            # στο τερματικό και το στίγμα του ταιριάζει και στις δύο διαδρομές.
+            # (Δοκιμάστηκε και η λύση «μέσο σημείο»: έλυνε εξίσου τις
+            # επικαλύψεις αλλά κόντυνε ΚΑΙ ΤΑ ΔΥΟ δρομολόγια, εκτοξεύοντας το
+            # duration_too_short από 36 σε 289.)
+            conn.execute("UPDATE trips SET started_at=? WHERE id=?",
+                         (arr, b["id"]))
+            conn.execute("UPDATE vehicle_departures SET departed_at=? "
+                         "WHERE trip_id=?", (arr, b["id"]))
+            b["started_at"] = arr
+            fixed += 1
+            affected.add(a["route_code"])
+            affected.add(b["route_code"])
+    if fixed:
+        log.info("Chain consistency: %d αλλαγές κατεύθυνσης στο τερματικό "
+                 "ευθυγραμμίστηκαν (%d διαδρομές)", fixed, len(affected))
+    return fixed, affected
+
+
+
+# Ελάχιστο κλάσμα της τυπικής διάρκειας κάτω από το οποίο μια διάρκεια δεν
+# είναι «γρήγορο δρομολόγιο» αλλά αδύνατη. Ίδια τιμή με το
+# MIN_DURATION_FRACTION της ανακατασκευής — είναι ο ΙΔΙΟΣ κανόνας, που εδώ
+# απλώς ξαναεπιβάλλεται.
+MIN_DURATION_FRACTION = 0.3
+
+
+def _reassert_duration_sanity(conn, service_date: str) -> tuple[int, set]:
+    """
+    Ξαναεπιβάλλει τον κανόνα πιθανοφάνειας που έσπασε το ίδιο το tighten_chain.
+
+    Η ανακατασκευή ελέγχει ήδη ότι μια άφιξη δεν υπονοεί διάρκεια μικρότερη από
+    MIN_DURATION_FRACTION της τυπικής. Το σφίξιμο όμως τρέχει ΜΕΤΑ και μπορεί να
+    μετακινήσει την ΕΚΤΙΜΩΜΕΝΗ αναχώρηση πολύ μπροστά — οπότε ο έλεγχος που
+    πέρασε τη στιγμή της κατασκευής παύει να ισχύει.
+
+    ΜΕΤΡΗΜΕΝΟ (2026-08-01): 289 δρομολόγια με «αδύνατα μικρή διάρκεια», εκ των
+    οποίων το 95% καλύπτει λιγότερο από το 60% της διαδρομής και η διάμεση
+    κάλυψη είναι 9%. Χαρακτηριστικό δείγμα: ΜΙΑ διέλευση στη στάση 100 από 100,
+    διάρκεια 1,1′ έναντι τυπικής 89′. Δεν είναι δρομολόγιο — είναι η ουρά ενός
+    γύρου που δεν είδαμε από την αρχή, συνήθως επειδή ο ΟΑΣΑ μετέθεσε το όχημα
+    σε αυτή τη διαδρομή τη στιγμή που τελείωνε.
+
+    Η τιμή που ΞΕΡΟΥΜΕ είναι η άφιξη· αυτή που δεν ξέρουμε είναι η αναχώρηση.
+    Το να δηλώνουμε διάρκεια 1 λεπτού είναι χειρότερο από το να μη δηλώνουμε
+    καμία. Οπότε: η άφιξη μηδενίζεται (το δρομολόγιο μένει «ημιτελές»), και η
+    μέτρηση δεν μολύνει καμία στατιστική διάρκειας.
+
+    ΔΕΝ αγγίζονται δρομολόγια με ΜΕΤΡΗΜΕΝΗ αναχώρηση: εκεί και οι δύο άκρες
+    είναι παρατηρημένες και μια σύντομη διάρκεια είναι πραγματικό γεγονός.
+    """
+    rows = conn.execute("""
+        SELECT t.id, t.route_code,
+               (julianday(t.terminus_arrived_at) - julianday(t.started_at)) * 1440 dur,
+               rr.median_trip_duration_mins med,
+               EXISTS (SELECT 1 FROM trip_stop_times x
+                        WHERE x.trip_id = t.id AND x.method='passage'
+                          AND x.stop_order = (SELECT MIN(stop_order) FROM stops s
+                                              WHERE s.route_code = t.route_code)) dep_measured
+        FROM trips t
+        JOIN route_rotation rr ON rr.route_code = t.route_code
+        WHERE t.service_date = ? AND t.terminus_arrived_at IS NOT NULL
+          AND rr.median_trip_duration_mins IS NOT NULL
+          AND rr.median_trip_duration_mins > 0""", (service_date,)).fetchall()
+
+    fixed, affected = 0, set()
+    for r in rows:
+        if r["dep_measured"] or r["dur"] is None:
+            continue
+        if r["dur"] >= MIN_DURATION_FRACTION * r["med"]:
+            continue
+        conn.execute("UPDATE trips SET terminus_arrived_at=NULL WHERE id=?", (r["id"],))
+        fixed += 1
+        affected.add(r["route_code"])
+    if fixed:
+        log.info("Chain consistency: %d αδύνατα σύντομες διάρκειες σημάνθηκαν "
+                 "ημιτελείς (%d διαδρομές)", fixed, len(affected))
+    return fixed, affected
+
+
 def tighten_chain(conn, service_date: str, computed_at: str) -> dict:
     dropped_routes = _drop_contained_fragments(conn, service_date)
 
@@ -175,6 +310,18 @@ def tighten_chain(conn, service_date: str, computed_at: str) -> dict:
     if affected:
         log.info("Chain consistency: %d αναχωρήσεις, %d λήξεις σφίχτηκαν "
                  "(%d διαδρομές)", n_dep, n_arr, len(affected))
-    return {"routes": affected | dropped_routes,
+    # ΣΕΙΡΑ: η επίλυση αλλαγών ΜΕΤΑ το σφίξιμο εκτιμήσεων, όχι πριν.
+    # Το σφίξιμο μετακινεί εκτιμώμενες αναχωρήσεις/αφίξεις, οπότε ΞΑΝΑΦΤΙΑΧΝΕΙ
+    # επικαλύψεις που είχαν ήδη λυθεί. Μετρημένο: 96 επικαλύψεις ίδιας
+    # διαδρομής επέζησαν, ΟΛΕΣ διαδοχικά ζεύγη και 95 από τις 96 μέσα στο όριο
+    # των 15 λεπτών — δηλαδή περιπτώσεις που ο κανόνας ΕΠΡΕΠΕ να είχε πιάσει.
+    # Δεν έφταιγε ο κανόνας· έφταιγε ότι έτρεχε πολύ νωρίς.
+    n_handover, handover_routes = _resolve_handover_overlaps(conn, service_date)
+    affected |= handover_routes
+
+    n_sane, sane_routes = _reassert_duration_sanity(conn, service_date)
+    affected |= sane_routes
+
+    return {"routes": affected | dropped_routes | handover_routes,
             "departures": n_dep, "arrivals": n_arr,
-            "dropped": len(dropped_routes)}
+            "dropped": len(dropped_routes), "handovers": n_handover}

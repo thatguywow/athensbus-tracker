@@ -17,7 +17,21 @@ import db
 
 OUT_DIR      = os.path.join(os.path.dirname(__file__), "..", "docs", "data")
 HISTORY_DAYS = 90   # kept in DB
-SITE_DAYS    = 3    # days available on the site
+
+# Πόσες ημέρες βλέπει ο χρήστης στο site.
+#
+# Το κόστος είναι ~6,4 MB JSON ανά ημέρα (κυρίως το schedule_distribution).
+# 30 ημέρες ≈ 190 MB στον δίσκο — ασήμαντο μπροστά στα 13 GB ελεύθερα.
+#
+# Το ΠΡΑΓΜΑΤΙΚΟ κόστος δεν ήταν ο δίσκος αλλά ο ΧΡΟΝΟΣ: η generate ξανάγραφε
+# ΟΛΕΣ τις ημέρες σε ΚΑΘΕ κύκλο (κάθε 15 λεπτά). Με 30 ημέρες αυτό είναι 10×
+# δουλειά σε μονοπύρηνο VPS, ξανά και ξανά, για δεδομένα που δεν αλλάζουν.
+#
+# Οι παλιές ημέρες ΔΕΝ αλλάζουν: μόλις κλείσει το παράθυρο παράδοσης (04:00-07:00
+# της επόμενης) τα στατιστικά είναι σταθερά. Άρα ξαναγράφονται μόνο οι
+# τελευταίες FRESH_DAYS· οι υπόλοιπες μένουν όπως είναι και απλώς σερβίρονται.
+SITE_DAYS    = int(os.environ.get("ATHENSBUS_SITE_DAYS", "30"))
+FRESH_DAYS   = 2    # πόσες ξαναϋπολογίζονται σε κάθε κύκλο
 
 
 def write_json(path: str, payload):
@@ -223,6 +237,18 @@ def generate_for_date(conn, service_date: str):
     # not run today (rare exceptions with one trip, seasonal or event-only
     # branches). The dropdown is built from THIS, so a variant is always
     # selectable; if it had no service its table is simply empty.
+    # ΜΟΝΟ οι διαδρομές που αφορούν ΑΥΤΗ την ημέρα: όσες έχουν πρόγραμμα Ή
+    # έτρεξαν. Ο κατάλογος έδειχνε και τις 712 πάντα, οπότε το μενού γέμιζε με
+    # παραλλαγές που δεν κυκλοφορούν καθόλου εκείνη τη μέρα (μετρημένο για
+    # 2026-08-01: 121 από 712 άσχετες).
+    #
+    # ΕΝΩΣΗ, όχι τομή — και τα δύο σκέλη χρειάζονται:
+    #   • έτρεξε ΧΩΡΙΣ πρόγραμμα (43 διαδρομές): πραγματική κίνηση, πρέπει να φαίνεται
+    #   • πρόγραμμα ΧΩΡΙΣ δρομολόγια (77): η αποτυχία είναι η ΠΛΗΡΟΦΟΡΙΑ, δείχνει 0%
+    #
+    # Το φίλτρο είναι ΑΝΑ ΗΜΕΡΑ και γράφεται μέσα στο JSON της ημέρας, οπότε μια
+    # γραμμή που τρέχει μόνο Κυριακή παραμένει ορατή στη σελίδα της Κυριακής
+    # ακόμη κι αν τη δει κανείς τη Δευτέρα. Δεν πειράζεται τίποτα αναδρομικά.
     catalogue = [{
         "line_id":    r["line_id"],
         "line_code":  r["line_code"],
@@ -233,8 +259,12 @@ def generate_for_date(conn, service_date: str):
     } for r in conn.execute("""
         SELECT r.route_code, r.line_code, r.descr, l.line_id
         FROM routes r JOIN lines l ON l.line_code = r.line_code
+        WHERE r.route_code IN (
+            SELECT route_code FROM scheduled_trips WHERE schedule_date = ?
+            UNION
+            SELECT route_code FROM trips WHERE service_date = ?)
         ORDER BY l.line_id, r.route_code
-    """)]
+    """, (service_date, service_date))]
     # Direction comes from the trips when known, so reuse it where available.
     dir_by_route = {t["route_code"]: t["direction"] for t in dist_rows if t.get("direction")}
     for row in catalogue:
@@ -331,13 +361,22 @@ def main():
 
     # Write the available dates list for the date picker
     available = []
-    for d in dates_to_generate:
+    regenerated = reused = 0
+    for i, d in enumerate(dates_to_generate):
         has_data = conn.execute(
             "SELECT 1 FROM daily_route_stats WHERE service_date=? LIMIT 1", (d,)
         ).fetchone()
-        if has_data:
-            available.append(d)
-            generate_for_date(conn, d)
+        if not has_data:
+            continue
+        available.append(d)
+        # Ημέρα που έχει ήδη γραφτεί και δεν μπορεί πια να αλλάξει: μένει ως έχει.
+        if i >= FRESH_DAYS and os.path.exists(
+                os.path.join(day_dir(d), "summary.json")):
+            reused += 1
+            continue
+        generate_for_date(conn, d)
+        regenerated += 1
+    print(f"  {regenerated} ημέρες ξαναγράφτηκαν, {reused} επαναχρησιμοποιήθηκαν")
 
     write_json(os.path.join(OUT_DIR, "available_dates.json"), {
         "dates": available,

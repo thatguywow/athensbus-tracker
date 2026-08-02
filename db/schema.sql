@@ -333,6 +333,47 @@ CREATE TABLE IF NOT EXISTS stop_terminals (
     last_synced  TEXT NOT NULL
 );
 
+-- ── Route geometry: the actual driven path ──────────────────────────────────
+-- From webGetRoutesDetailsAndStops (`details` array: routed_x/routed_y/
+-- routed_order). Until now the only geometry we had was the stop coordinates,
+-- and _stop_distances approximated the route as straight lines BETWEEN stops —
+-- which under-measures every curve and every one-way detour. That approximation
+-- is the x-axis of every linear fit and every distance-weighted estimate, so
+-- its error propagates into departure/arrival times everywhere.
+--
+-- dist_m is the cumulative along-shape distance, precomputed at sync time: the
+-- projection runs on every GPS fix, so it must not recompute the whole
+-- polyline each call.
+CREATE TABLE IF NOT EXISTS route_shapes (
+    route_code  TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    lat         REAL NOT NULL,
+    lng         REAL NOT NULL,
+    dist_m      REAL NOT NULL,
+    last_synced TEXT NOT NULL,
+    PRIMARY KEY (route_code, seq)
+);
+
+-- Where each stop sits ALONG that shape. This is the join that makes GPS
+-- useful: a ping projects to a scalar "metres travelled", and a stop is just
+-- another scalar, so the passage time is a linear interpolation between the
+-- two fixes that straddle it — no guessing which stop a bus is "near".
+--
+-- snap_err_m records how far the stop was from the polyline. A large value
+-- means the shape and the stop list disagree (stale sync, or OASA returned a
+-- detour shape with the normal stop list); the GPS derivation skips those
+-- routes rather than emitting confident nonsense.
+CREATE TABLE IF NOT EXISTS stop_shape_offsets (
+    route_code  TEXT NOT NULL,
+    stop_order  INTEGER NOT NULL,
+    stop_code   TEXT NOT NULL,
+    dist_m      REAL NOT NULL,
+    snap_err_m  REAL,
+    last_synced TEXT NOT NULL,
+    PRIMARY KEY (route_code, stop_order)
+);
+CREATE INDEX IF NOT EXISTS idx_sso_route ON stop_shape_offsets(route_code);
+
 -- ── Scout promotions (#8) ─────────────────────────────────────────────────
 -- A demoted origin stop is polled once every SCOUT_EVERY cycles, so its
 -- measured yield is ~10× lower than a normally polled stop and it would never

@@ -175,7 +175,40 @@ def get_sched_lines(line_id: str, sdc_code: str, line_code: str) -> dict:
                     {"p1": line_id, "p2": sdc_code, "p3": line_code})
 
 def get_bus_location(route_code: str) -> list[dict]:
-    return _request("getBusLocation", {"p1": route_code})
+    """
+    Θέσεις GPS όλων των οχημάτων μιας διαδρομής.
+
+    Πεδία: VEH_NO, CS_DATE, CS_LAT, CS_LNG, ROUTE_CODE και VEH_HEADING
+    (η πορεία σε μοίρες — ΔΕΝ είναι στην τεκμηρίωση, αλλά επιστρέφεται πάντα
+    και ξεχωρίζει κατεύθυνση σε κοινό τερματικό).
+
+    ΙΔΙΑ ΠΕΙΘΑΡΧΙΑ ΜΕ ΤΟ get_stop_arrivals: attempts=1, χωρίς retry σε 403,
+    σύντομο timeout. Ο λόγος είναι μετρημένος — το παλιό GPS μονοπάτι καλούσε
+    με τις προεπιλογές (4 προσπάθειες, retry ΚΑΙ στα 403, timeout 20 s) και
+    χωρίς κανένα όριο ρυθμού στο batch_get_bus_locations. Ένα 403 γινόταν
+    τέσσερα, ο worker κρατιόταν ~35 s, και ο ρυθμός ανέβαινε ακριβώς τη στιγμή
+    που ο server ζητούσε να πέσει. Το probe (scripts/probe_rate_limits.py)
+    δείχνει ότι στον ΙΔΙΟ ρυθμό τα δύο endpoints έχουν το ίδιο ποσοστό 403 —
+    το πρόβλημα ήταν ο τρόπος κλήσης, όχι το endpoint.
+    """
+    result = _request("getBusLocation", {"p1": route_code},
+                      timeout=8, retry_forbidden=False, attempts=1)
+    if result is None:
+        return []
+    return result if isinstance(result, list) else []
+
+
+def web_get_routes_details_and_stops(route_code: str) -> dict:
+    """
+    Γεωμετρία διαδρομής + στάσεις σε μία κλήση.
+
+    Επιστρέφει {"details": [{routed_x, routed_y, routed_order}, ...],
+                "stops": [...]}. Το `details` είναι η ΠΡΑΓΜΑΤΙΚΗ διαδρομμένη
+    πολυγραμμή — όχι ευθείες μεταξύ στάσεων — και είναι ο άξονας πάνω στον
+    οποίο προβάλλονται τα στίγματα GPS (βλ. geo.py).
+    """
+    result = _request("webGetRoutesDetailsAndStops", {"p1": route_code})
+    return result if isinstance(result, dict) else {}
 
 def get_stop_arrivals(stop_code: str) -> list[dict]:
     """
@@ -192,6 +225,37 @@ def get_stop_arrivals(stop_code: str) -> list[dict]:
 
 # ── Batch helpers ─────────────────────────────────────────────────────────────
 
+class _SimpleLimiter:
+    """Token bucket ίδιας λογικής με τον RateLimiter του local_poller."""
+
+    __slots__ = ("rate", "cap", "allowance", "last", "lock")
+
+    def __init__(self, rate: float, burst_cap: float = 5.0):
+        self.rate = float(rate)
+        # Το πλαφόν ΔΕΝ επιτρέπεται να πέσει κάτω από 1: η acquire() περιμένει
+        # allowance >= 1.0, οπότε με cap < 1 το κουπόνι δεν φτάνει ΠΟΤΕ το
+        # κατώφλι και ο καλών κολλάει για πάντα. Εμφανίζεται μόνο σε ρυθμούς
+        # κάτω από 1 κλήση/δευτ. — δηλαδή ακριβώς στις αραιές, «ευγενικές»
+        # ρυθμίσεις που θέλει κανείς σε δοκιμές ή σε μικρό σύνολο διαδρομών.
+        self.cap = max(1.0, min(self.rate, burst_cap))
+        self.allowance = self.cap
+        self.last = time.monotonic()
+        self.lock = threading.Lock()
+
+    def acquire(self):
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                self.allowance += (now - self.last) * self.rate
+                self.last = now
+                if self.allowance > self.cap:
+                    self.allowance = self.cap
+                if self.allowance >= 1.0:
+                    self.allowance -= 1.0
+                    return
+            time.sleep(0.01)
+
+
 @dataclass
 class BatchResult:
     ok:     dict[str, Any] = field(default_factory=dict)
@@ -204,10 +268,22 @@ class BatchResult:
 
 
 def batch_get_bus_locations(route_codes: list[str],
-                            max_workers: int = 16) -> BatchResult:
+                            max_workers: int = 16,
+                            rate: float | None = None) -> BatchResult:
+    """
+    ΠΡΟΣΟΧΗ ΣΤΟΝ ΡΥΘΜΟ: αυτή η συνάρτηση έριχνε παλιά όλες τις διαδρομές στο
+    pool χωρίς κανένα φράγμα — 715 κλήσεις όσο γρήγορα προλάβαιναν 16 νήματα,
+    δηλαδή κορυφές πολύ πάνω από ό,τι ανέχεται ο ΟΑΣΑ. Μαζί με το τότε
+    retry-σε-403 του get_bus_location, αυτό ήταν η γεννήτρια των 403 που
+    οδήγησε στην εγκατάλειψη του GPS. Δώσε `rate` (κλήσεις/δευτ.) και τα
+    αιτήματα βγαίνουν ομαλά.
+    """
     result = BatchResult()
+    limiter = _SimpleLimiter(rate) if rate else None
 
     def fetch_one(code: str):
+        if limiter is not None:
+            limiter.acquire()
         return code, get_bus_location(code)
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
