@@ -131,11 +131,19 @@
   .btn-export:focus-visible{outline:none;box-shadow:var(--focus);}
 
   /* ── tables ── */
-  #vehicle-table-wrap,#schedule-table-wrap{
+  #vehicle-table-wrap,#schedule-table-wrap,#stray-table-wrap{
     background:var(--bg2);border:1px solid var(--line);border-radius:var(--radius);
     overflow-x:auto;-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;
     box-shadow:var(--shadow);
   }
+  /* ΞΕΧΩΡΙΣΤΟ πλαίσιο: δρομολόγια που ΕΚΤΕΛΕΣΤΗΚΑΝ αλλά δεν αντιστοιχούν σε
+     καμία ώρα του δημοσιευμένου προγράμματος. Κρατιούνται ΕΚΤΟΣ του κυρίως
+     πίνακα ώστε να μη μολύνουν τα ποσοστά εκτέλεσης. */
+  #stray-table-wrap{margin-top:1rem;border-color:rgba(232,160,85,.28);}
+  #stray-table-wrap:empty{display:none;}
+  .stray-head{padding:.7rem .8rem;border-bottom:1px solid var(--line);}
+  .stray-title{font-size:.8rem;font-weight:600;color:var(--amber);letter-spacing:.02em;}
+  .stray-note{font-size:.73rem;color:var(--slate);margin-top:.25rem;line-height:1.45;}
   .data-table{width:100%;border-collapse:collapse;font-size:.84rem;min-width:520px;}
   /* εκτιμώμενη (μη παρατηρημένη) αναχώρηση */
   .est{color:var(--muted);cursor:help;}   /* εκτιμώμενη αναχώρηση: μόνο «~» + tooltip */
@@ -263,6 +271,7 @@
       </div>
     </div>
     <div id="schedule-table-wrap"><div class="empty-state">Επιλέξτε γραμμή.</div></div>
+    <div id="stray-table-wrap"></div>
   </div>
 
 

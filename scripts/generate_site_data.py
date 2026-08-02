@@ -31,6 +31,11 @@ HISTORY_DAYS = 90   # kept in DB
 # της επόμενης) τα στατιστικά είναι σταθερά. Άρα ξαναγράφονται μόνο οι
 # τελευταίες FRESH_DAYS· οι υπόλοιπες μένουν όπως είναι και απλώς σερβίρονται.
 SITE_DAYS    = int(os.environ.get("ATHENSBUS_SITE_DAYS", "30"))
+
+# Πόσο της διαδρομής πρέπει να έχει διανύσει ένα ΑΤΑΙΡΙΑΣΤΟ δρομολόγιο για να
+# εμφανιστεί. Κάτω από αυτό είναι απόσπασμα — συνήθως όχημα που φάνηκε στιγμιαία
+# κοντά στο τερματικό — και δεν προσθέτει πληροφορία.
+UNMATCHED_MIN_COVERAGE = 0.6
 FRESH_DAYS   = 2    # πόσες ξαναϋπολογίζονται σε κάθε κύκλο
 
 
@@ -217,6 +222,16 @@ def generate_for_date(conn, service_date: str):
     for r in conn.execute("""
         SELECT t.route_code, r.line_code, l.line_id, r.descr AS route_name,
                r.route_type, t.vehicle_no, t.started_at, t.terminus_arrived_at,
+               -- πόσο ΠΡΑΓΜΑΤΙΚΑ διένυσε: από την πρώτη ως την τελευταία
+               -- παρατηρημένη στάση, ως κλάσμα του μήκους της διαδρομής
+               ((SELECT MAX(x.stop_order) FROM trip_stop_times x WHERE x.trip_id=t.id)
+                - (SELECT MIN(x.stop_order) FROM trip_stop_times x WHERE x.trip_id=t.id))
+               * 1.0 / MAX(1, (SELECT MAX(stop_order)-MIN(stop_order) FROM stops s
+                               WHERE s.route_code=t.route_code)) AS coverage,
+               -- ΥΠΑΡΧΕΙ καν πρόγραμμα για τη διαδρομή αυτή τη μέρα;
+               EXISTS (SELECT 1 FROM scheduled_trips st
+                       WHERE st.route_code = t.route_code
+                         AND st.schedule_date = t.service_date) AS has_schedule,
                EXISTS (
                    SELECT 1 FROM trip_stop_times x
                    WHERE x.trip_id = t.id
@@ -230,6 +245,22 @@ def generate_for_date(conn, service_date: str):
           AND NOT EXISTS (SELECT 1 FROM slot_assignments sa WHERE sa.trip_id = t.id)
         ORDER BY t.started_at
     """, (service_date,)).fetchall():
+        # «Εκτός προγράμματος» έχει νόημα ΜΟΝΟ αν υπάρχει πρόγραμμα να είσαι
+        # εκτός του. Αν η διαδρομή δεν έχει ΚΑΜΙΑ δημοσιευμένη ώρα σήμερα, το
+        # κενό είναι ΔΙΚΟ ΜΑΣ — δεν ξέρουμε το πρόγραμμα, δεν είναι υπεράριθμο
+        # το δρομολόγιο. Αυτό κρατά ολόκληρες γραμμές έξω από το πλαίσιο των
+        # αδέσποτων: η 500 (νυχτερινή, ξεκινά μετά τα μεσάνυχτα) δεν έχει
+        # πρόγραμμα μέχρι να το φέρει ο ωριαίος συγχρονισμός, και ΧΩΡΙΣ αυτόν
+        # τον έλεγχο και τα 22 δρομολόγιά της θα κατέληγαν στο πλαίσιο των
+        # αδέσποτων με τον κύριο πίνακα να λέει «Δεν υπάρχουν δεδομένα».
+        is_stray = bool(r["has_schedule"])
+
+        # ΜΟΝΟ ΟΥΣΙΑΣΤΙΚΑ ΑΔΕΣΠΟΤΑ. Τα αποσπασματικά (λίγες στάσεις, συχνά
+        # μια στιγμιαία θέαση κοντά στο τερματικό) γεμίζουν τη σελίδα χωρίς να
+        # λένε κάτι. Το φίλτρο μπαίνει ΜΟΝΟ στα αδέσποτα: για διαδρομή χωρίς
+        # πρόγραμμα κρατάμε ό,τι δείχναμε πάντα, για να μη χαθεί υπηρεσία.
+        if is_stray and (r["coverage"] or 0) < UNMATCHED_MIN_COVERAGE:
+            continue
         dist_rows.append({
             "route_code":    r["route_code"],
             "line_code":     r["line_code"],
@@ -244,6 +275,12 @@ def generate_for_date(conn, service_date: str):
             "started_at":    r["started_at"],
             "dep_observed":  bool(r["dep_observed"]),
             "ended_at":      r["terminus_arrived_at"],
+            # Σημαία για τη σελίδα: μπαίνει σε ΞΕΧΩΡΙΣΤΟ πλαίσιο, όχι στο
+            # κυρίως πρόγραμμα. Υπολογίζεται ΑΠΟ ΤΗΝ ΑΡΧΗ σε κάθε κύκλο: αν ο
+            # επόμενος ωριαίος συγχρονισμός φέρει την ώρα που λείπει, το
+            # δρομολόγιο ταιριάζει και επιστρέφει μόνο του στον κύριο πίνακα.
+            "unmatched":     is_stray,
+            "coverage":      round(r["coverage"] or 0, 2),
         })
 
     # Add missed scheduled trips

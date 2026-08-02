@@ -83,6 +83,9 @@ async function loadDay(d){
   document.getElementById("date-select").value = d;
   document.getElementById("schedule-table-wrap").innerHTML =
     '<div class="empty-state">Επιλέξτε γραμμή.</div>';
+  // Αλλιώς το πλαίσιο «εκτός προγράμματος» κρατούσε τα αδέσποτα της
+  // ΠΡΟΗΓΟΥΜΕΝΗΣ ημέρας κάτω από ένα άδειο πρόγραμμα.
+  document.getElementById("stray-table-wrap").innerHTML = "";
   document.getElementById("sched-route-select").style.display="none";
 
   try{
@@ -299,9 +302,29 @@ function depSortKey(s){
 // ── schedule distribution ──────────────────────────────────────────────────
 function renderScheduleTable(routeCode){
   const wrap = document.getElementById("schedule-table-wrap");
-  const trips = (schedData&&schedData.trips||[])
-    .filter(t=>t.route_code===routeCode)
+  const all = (schedData&&schedData.trips||[]).filter(t=>t.route_code===routeCode);
+
+  // ΔΥΟ ΞΕΧΩΡΙΣΤΑ ΠΡΑΓΜΑΤΑ, ΔΥΟ ΞΕΧΩΡΙΣΤΑ ΠΛΑΙΣΙΑ.
+  //
+  // Το κυρίως πρόγραμμα είναι το ΔΗΜΟΣΙΕΥΜΕΝΟ πρόγραμμα: μία σειρά ανά
+  // προγραμματισμένη ώρα, εκτελεσμένη ή όχι. Τα «αδέσποτα» είναι δρομολόγια
+  // που ΟΝΤΩΣ έτρεξαν χωρίς να αντιστοιχούν σε καμία ώρα — υπεράριθμα
+  // δρομολόγια που ο ΟΑΣΑ έβγαλε αλλά δεν δημοσίευσε.
+  //
+  // Η διάκριση γίνεται ΑΠΟΚΛΕΙΣΤΙΚΑ από τη σημαία `unmatched` που βάζει η
+  // γεννήτρια, ΟΧΙ από το αν λείπει η ώρα προγράμματος. Αυτό προστατεύει
+  // γραμμές όπως η 500, που ξεκινούν μετά τα μεσάνυχτα: αν το ωριαίο sync
+  // δεν έχει φέρει ακόμη το πρόγραμμά τους, τα δρομολόγιά τους ΔΕΝ έχουν
+  // σημανθεί ως αδέσποτα και μένουν στον κύριο πίνακα εκεί που ανήκουν.
+  // Επιπλέον, το `unmatched` ξαναϋπολογίζεται σε κάθε κύκλο: μόλις ο επόμενος
+  // συγχρονισμός φέρει την ώρα που λείπει, το δρομολόγιο ταιριάζει και
+  // επιστρέφει ΜΟΝΟ ΤΟΥ στο κυρίως πρόγραμμα.
+  const trips = all.filter(t=>!t.unmatched)
     .sort((a,b)=>depSortKey(a.scheduled_dep)-depSortKey(b.scheduled_dep));
+  const strays = all.filter(t=>t.unmatched)
+    .sort((a,b)=>String(a.started_at||"").localeCompare(String(b.started_at||"")));
+
+  renderStrayTable(strays);
 
   if(!trips.length){
     wrap.innerHTML='<div class="empty-state">Δεν υπάρχουν δεδομένα.</div>'; return;
@@ -336,6 +359,39 @@ function renderScheduleTable(routeCode){
     </tr>`;
   });
   wrap.innerHTML=html+'</tbody></table>';
+}
+
+// Υπεράριθμα δρομολόγια: εκτελέστηκαν, δεν αντιστοιχούν σε ώρα προγράμματος.
+// Δικό τους πλαίσιο, κάτω από το πρόγραμμα, ΕΚΤΟΣ των ποσοστών εκτέλεσης.
+function renderStrayTable(strays){
+  const box = document.getElementById("stray-table-wrap");
+  if(!box) return;
+  if(!strays.length){ box.innerHTML=""; return; }
+
+  let html=`<div class="stray-head">
+      <div class="stray-title">Εκτός προγράμματος — ${strays.length} ${strays.length===1?"δρομολόγιο":"δρομολόγια"}</div>
+      <div class="stray-note">Εκτελέστηκαν αλλά δεν αντιστοιχούν σε δημοσιευμένη ώρα:
+        συνήθως υπεράριθμα δρομολόγια, ή ώρα που λείπει ακόμη από το πρόγραμμα.
+        Δεν προσμετρώνται στο ποσοστό εκτέλεσης.</div>
+    </div>`;
+  html+='<table class="data-table"><thead><tr>'+
+    '<th>Αναχώρηση</th><th>Λήξη</th><th>Διάρκεια</th><th>Διαδρομή</th><th>Όχημα</th>'+
+    '</tr></thead><tbody>';
+
+  strays.forEach(t=>{
+    const incomplete = !t.ended_at;
+    const cov = t.coverage==null ? "—" : Math.round(t.coverage*100)+"%";
+    html+=`<tr>
+      <td class="mono">${t.dep_observed===false
+          ? `<span class="est" title="Υπολογισμένη: η αναχώρηση δεν παρατηρήθηκε">~${fmtTime(t.started_at)}</span>`
+          : fmtTime(t.started_at)}</td>
+      <td class="mono">${incomplete?"—":fmtTime(t.ended_at)}</td>
+      <td class="mono">${incomplete?"—":fmtDur(t.started_at,t.ended_at)}</td>
+      <td class="mono" title="Ποσοστό της διαδρομής που καταγράφηκε">${cov}</td>
+      <td><span class="veh-no">${t.vehicle_no||"—"}</span></td>
+    </tr>`;
+  });
+  box.innerHTML=html+'</tbody></table>';
 }
 
 // ── pipeline health ────────────────────────────────────────────────────────
