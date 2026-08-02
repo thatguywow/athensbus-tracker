@@ -224,8 +224,42 @@ def _boundary_owner_is_this_day(conn, route_code: str, started_dt: datetime,
     return mine < theirs
 
 
+def _enforce_no_overlap(trips: list[list[dict]]) -> list[list[dict]]:
+    """
+    Ένα όχημα δεν μπορεί να τρέχει δύο δρομολόγια ταυτόχρονα.
+
+    Με πυκνά δεδομένα, κοντά στο τερματικό οι διελεύσεις της ΟΥΡΑΣ του γύρου Α
+    και της ΚΕΦΑΛΗΣ του γύρου Β μπερδεύονται χρονικά: το τελευταίο σημείο του Α
+    πέφτει ΜΕΤΑ το πρώτο σημείο του Β. Μετρημένο στην πλήρη ημέρα: 633 από τις
+    1.385 επικαλύψεις είναι ακριβώς αυτό — ίδια διαδρομή, επικάλυψη λίγων λεπτών.
+
+    Εδώ μεταφέρουμε τα σημεία που «ξεχειλίζουν»: κάθε σημείο του Α που συνέβη
+    μετά την έναρξη του Β ανήκει στο Β. Καμία μέτρηση δεν χάνεται — αλλάζει μόνο
+    σε ποιον γύρο αποδίδεται.
+    """
+    if len(trips) < 2:
+        return trips
+    out = [list(trips[0])]
+    for nxt in trips[1:]:
+        if not nxt:
+            continue
+        cur = out[-1]
+        if cur:
+            b_start = _parse(nxt[0]["passed_at"])
+            keep, moved = [], []
+            for p in cur:
+                (moved if _parse(p["passed_at"]) >= b_start else keep).append(p)
+            if keep and moved:
+                out[-1] = keep
+                nxt = sorted(moved + list(nxt),
+                             key=lambda q: (q["passed_at"], -q["stop_order"]))
+        out.append(list(nxt))
+    return [t for t in out if t]
+
+
 def _split_trips(passages: list[dict], route_duration: float | None,
-                 loop_mid: float | None = None) -> list[list[dict]]:
+                 loop_mid: float | None = None,
+                 span: int | None = None) -> list[list[dict]]:
     """
     Chain one vehicle's passages (already sorted by passed_at) into trips.
 
@@ -255,6 +289,14 @@ def _split_trips(passages: list[dict], route_duration: float | None,
 
     JITTER_MINS = 3.0        # tiny regressions within this window are noise…
     ORDER_JITTER = 3         # …if the order drop stays inside the edge cluster
+    # ΠΥΚΝΑ ΔΕΔΟΜΕΝΑ: με ~35 σημεία ανά δρομολόγιο (GPS) αντί για ~4,6
+    # (εξαφάνιση), οι διαδοχικές διελεύσεις απέχουν 1 θέση και δευτερόλεπτα.
+    # Ένα σταθερό ORDER_JITTER=3 είναι τότε ΠΟΛΥ σφιχτό: μια στιγμιαία
+    # αναταραχή προβολής σπάει το δρομολόγιο στη μέση. Το κατώφλι κλιμακώνεται
+    # με το μήκος της διαδρομής — πραγματικός νέος γύρος σημαίνει επιστροφή
+    # ΚΟΝΤΑ ΣΤΗΝ ΑΡΧΗ, όχι υποχώρηση δύο στάσεων.
+    if span and span >= 20:
+        ORDER_JITTER = max(3, int(span * 0.25))
     TERMINAL_CLUSTER = 8.0   # minutes: arrival stragglers / dwell-ghost window
     young_limit = (route_duration * 0.5) if route_duration else 20.0
     mature_mins = (route_duration * 0.5) if route_duration else 20.0
@@ -326,7 +368,7 @@ def _split_trips(passages: list[dict], route_duration: float | None,
                     continue   # parked-at-terminal noise → drop
             kept.append(t)
         trips = kept
-    return trips
+    return _enforce_no_overlap(trips)
 
 
 def passage_query_window(service_date: str) -> tuple[str, str]:
@@ -551,7 +593,7 @@ def reconstruct_route_day_from_passages(conn, route_code: str, service_date: str
     distinct_vehicles = set()
 
     for vehicle_no, plist in by_vehicle.items():
-        vehicle_trips = _split_trips(plist, route_duration, loop_mid)
+        vehicle_trips = _split_trips(plist, route_duration, loop_mid, span=hi - lo)
         for _ti, trip in enumerate(vehicle_trips):
             if not trip:
                 continue
