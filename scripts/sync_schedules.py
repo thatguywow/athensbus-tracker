@@ -80,7 +80,7 @@ def extract_departure_times(entries: list[dict], direction: str) -> list[tuple[s
 WEEKDAY_TERMS = ["ΔΕΥΤΕΡΑ -", "ΚΑΘΗΜΕΡΙΝΗ", "ΚΑΘΗΜΕΡΙΝH", "ΟΛΕΣ"]
 
 
-def _pick_variant(conn, routes_for_line, route_type: str):
+def _pick_variant(conn, routes_for_line, route_type: str, target_date: str):
     """
     Ποια παραλλαγή διαδρομής παίρνει το πρόγραμμα αυτής της κατεύθυνσης.
 
@@ -121,14 +121,44 @@ def _pick_variant(conn, routes_for_line, route_type: str):
     #
     # Δεν υπάρχει κυκλική εξάρτηση: τα δρομολόγια προκύπτουν από διελεύσεις,
     # ποτέ από το πρόγραμμα.
+    # ΤΟ ΠΑΡΑΘΥΡΟ ΠΡΕΠΕΙ ΝΑ ΣΥΓΚΡΙΝΕΙ ΟΜΟΙΑ ΜΕ ΟΜΟΙΑ.
+    #
+    # Επίπεδο παράθυρο 7 ημερών περιέχει 5 καθημερινές και 2 ημέρες
+    # σαββατοκύριακου. Άρα μια παραλλαγή ΚΑΘΗΜΕΡΙΝΗΣ σχεδόν πάντα νικά μια
+    # παραλλαγή ΣΑΒΒΑΤΟΚΥΡΙΑΚΟΥ — ακόμη και το ίδιο το σαββατοκύριακο, όταν
+    # εκείνη τρέχει κι αυτή είναι σταματημένη. Δομική μεροληψία, όχι ατυχία.
+    #
+    # ΜΕΤΡΗΜΕΝΟ στον VPS, Κυριακή 2026-08-02, γραμμή 500 κατεύθυνση 2:
+    #     1889 [ΝΥΧΤΕΡΙΝΗ, καθημερινές]  Δε8 Τρ7 Τε6 Πε6 Πα2  = 32 δρομολόγια
+    #     2900 [ΝΥΧΤΕΡΙΝΗ ΣΑΒΒΑΤΟΚΥΡΙΑΚΟ] Σα11 Κυ6 Σα7 Κυ4    = 26 δρομολόγια
+    # Κέρδιζε το 1889 με 0 δρομολόγια εκείνη τη μέρα, ενώ το 2900 έτρεχε 6.
+    # Το πρόγραμμα πήγαινε στη σταματημένη παραλλαγή και η κατεύθυνση έδειχνε
+    # 0% εκτέλεση, με τα πραγματικά δρομολόγια χωρίς πρόγραμμα να ταιριάξουν.
+    #
+    # Μετράμε λοιπόν ΜΟΝΟ ημέρες ίδιου τύπου με τη μέρα-στόχο: Κυριακή με
+    # Κυριακές, Σάββατο με Σάββατα, καθημερινή με καθημερινές. Το παράθυρο
+    # ανοίγει σε 28 ημέρες ώστε να υπάρχουν 4 συγκρίσιμες ημέρες ακόμη και για
+    # παραλλαγές που τρέχουν μία φορά την εβδομάδα. Το strftime('%w') δίνει
+    # 0=Κυριακή, 6=Σάββατο· οι αργίες δεν διακρίνονται, αλλά αυτό είναι
+    # ΗΕΥΡΙΣΤΙΚΟ ΕΠΙΛΟΓΗΣ παραλλαγής, όχι το ίδιο το πρόγραμμα.
+    dow = conn.execute("SELECT strftime('%w', ?) d", (target_date,)).fetchone()["d"]
+    if dow == "0":
+        same_day = "strftime('%w', service_date) = '0'"
+    elif dow == "6":
+        same_day = "strftime('%w', service_date) = '6'"
+    else:
+        same_day = "strftime('%w', service_date) NOT IN ('0','6')"
+
     def _score(rc):
         try:
             t = conn.execute(
-                "SELECT COUNT(*) c FROM trips WHERE route_code=? "
-                "AND service_date >= date('now', '-7 day')", (rc,)).fetchone()["c"]
+                f"SELECT COUNT(*) c FROM trips WHERE route_code=? "
+                f"AND service_date >= date(?, '-28 day') AND {same_day}",
+                (rc, target_date)).fetchone()["c"]
             p = conn.execute(
-                "SELECT COUNT(*) c FROM stop_passages WHERE route_code=? "
-                "AND service_date >= date('now', '-7 day')", (rc,)).fetchone()["c"]
+                f"SELECT COUNT(*) c FROM stop_passages WHERE route_code=? "
+                f"AND service_date >= date(?, '-28 day') AND {same_day}",
+                (rc, target_date)).fetchone()["c"]
         except Exception:
             return (0, 0)
         return (t, p)
@@ -175,8 +205,8 @@ def main():
                     continue
 
                 routes_for_line = routes_by_line.get(line_code, [])
-                come_route = _pick_variant(conn, routes_for_line, "2")
-                go_route = _pick_variant(conn, routes_for_line, "1")
+                come_route = _pick_variant(conn, routes_for_line, "2", today)
+                go_route = _pick_variant(conn, routes_for_line, "1", today)
 
                 for direction_key, route in (("come", come_route), ("go", go_route)):
                     if route is None:
