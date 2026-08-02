@@ -79,6 +79,22 @@ MIN_ADVANCE_M = 5.0
 # να κόβουν τα σφάλματα προβολής, που εμφανίζονται με εκατοντάδες ή χιλιάδες.
 MAX_SPEED_KMH = 100.0
 
+# ── Ανάκτηση αφετηρίας μετά από νέο γύρο ────────────────────────────────────
+# ΜΕΤΡΗΜΕΝΟ (2026-08-01): μόνο το 47,7% των δρομολογίων GPS έχει μετρημένη
+# αναχώρηση — αλλά το 18,3% χάνει την αφετηρία κατά ΜΙΑ ΜΟΝΟ στάση και άλλο
+# 9,9% κατά δύο-τρεις. Δηλαδή το όχημα ΕΙΧΕ ήδη ξεκινήσει όταν το πιάσαμε.
+#
+# Αιτία: στο κλείσιμο γύρου (ή στη ραφή κυκλικής) δεν παράγαμε ΚΑΜΙΑ διέλευση.
+# Όταν όμως εντοπίζεται ο νέος γύρος, το όχημα βρίσκεται συχνά ήδη 100-400 m
+# μέσα στη διαδρομή — άρα έχει ΣΙΓΟΥΡΑ περάσει την αφετηρία, κι εμείς την
+# πετάγαμε. Χάναμε ακριβώς τη μέτρηση που αξίζει περισσότερο απ' όλες.
+#
+# Εδώ, αν η νέα θέση είναι κοντά στην αρχή, οι στάσεις από το 0 ως αυτήν
+# καταγράφονται, με χρόνο υπολογισμένο ΑΝΑΔΡΟΜΙΚΑ από την πρόσφατη ταχύτητα
+# του ίδιου οχήματος. Μικρή απόσταση + φρέσκια ταχύτητα = μικρό σφάλμα.
+ORIGIN_RECOVERY_M = 800.0
+FALLBACK_SPEED_MS = 5.5          # ~20 km/h, αν δεν έχουμε πρόσφατη ταχύτητα
+
 # ── Αφετηρία και τερματικό: οι δύο στάσεις που έχουν πραγματικά σημασία ──────
 # Η αφετηρία κάθεται στο dist_m = 0 της πολυγραμμής. Ο κανόνας διέλευσης απαιτεί
 # prev_dist < stop_dist <= dist, που στο μηδέν ΔΕΝ ΜΠΟΡΕΙ να ισχύσει ποτέ: δεν
@@ -191,7 +207,7 @@ class GpsTracker:
         self.state: dict[tuple[str, str], dict] = {}
         self.stats = {"fixes": 0, "dup": 0, "unprojectable": 0,
                       "passages": 0, "laps": 0, "gap_skips": 0,
-                      "impossible": 0}
+                      "impossible": 0, "origin_recovered": 0}
 
     def prune(self, now_mono: float):
         dead = [k for k, v in self.state.items()
@@ -248,7 +264,34 @@ class GpsTracker:
                 advance = dist - prev["dist"]
                 kmh = (abs(advance) / gap_s * 3.6) if gap_s > 0 else 0.0
 
-                if advance < -LAP_RESET_M or advance > g.shape.total / 2:
+                # ΡΑΦΗ vs ΠΡΑΓΜΑΤΙΚΗ ΚΙΝΗΣΗ: το «άλμα > μισή διαδρομή» ΔΕΝ
+                # αρκεί από μόνο του — με μεγάλο κενό στιγμάτων ένα όχημα
+                # μπορεί κάλλιστα να διανύσει μισή διαδρομή κανονικά. Αυτό που
+                # ξεχωρίζει την αναδίπλωση ραφής είναι ότι απαιτεί ΑΔΥΝΑΤΗ
+                # ταχύτητα. Χωρίς τον έλεγχο χρόνου, γνήσια κίνηση κατατασσόταν
+                # ως νέος γύρος και οι διελεύσεις της χάνονταν.
+                seam_wrap = advance > g.shape.total / 2 and kmh > MAX_SPEED_KMH
+                if advance < -LAP_RESET_M or seam_wrap:
+                    # ΝΕΟΣ ΓΥΡΟΣ. Αν το όχημα έχει ήδη προχωρήσει λίγο μέσα στη
+                    # διαδρομή, οι στάσεις που μεσολαβούν έχουν ΣΙΓΟΥΡΑ περαστεί.
+                    if 0 < dist <= ORIGIN_RECOVERY_M:
+                        spd = prev.get("speed_ms") or FALLBACK_SPEED_MS
+                        t_end = ts.timestamp()
+                        for order, code, sd_ in g.stops_between(-1.0, dist):
+                            # πόσο πριν από ΤΩΡΑ περάστηκε αυτή η στάση
+                            back = max(0.0, (dist - sd_) / max(spd, 0.5))
+                            if back > MAX_INTERP_GAP_S:
+                                continue        # πολύ πίσω για να το ισχυριστούμε
+                            out.append({
+                                "route_code": route_code,
+                                "stop_code":  code,
+                                "stop_order": order,
+                                "vehicle_no": veh,
+                                "passed_at":  datetime.fromtimestamp(
+                                    t_end - back, tz=timezone.utc),
+                            })
+                            self.stats["passages"] += 1
+                            self.stats["origin_recovered"] += 1
                     # Επέστρεψε στην αρχή ⇒ νέα βόλτα. Καμία διέλευση δεν
                     # παράγεται «προς τα πίσω».
                     #
@@ -261,7 +304,7 @@ class GpsTracker:
                     # μισή διαδρομή είναι πάντα αναδίπλωση ραφής, ποτέ πραγματική
                     # κίνηση.
                     self.stats["laps"] += 1
-                elif kmh > MAX_SPEED_KMH:
+                elif kmh > MAX_SPEED_KMH:   # σφάλμα προβολής, όχι ραφή
                     # Ό,τι δεν έπιασε ο έλεγχος ραφής: σφάλμα προβολής, GPS που
                     # ξεφεύγει, ή όχημα που άλλαξε διαδρομή. Δεν παράγουμε
                     # διελεύσεις — απλώς επαναπροσδιορίζουμε τη θέση.
@@ -284,7 +327,14 @@ class GpsTracker:
                         })
                         self.stats["passages"] += 1
 
-            self.state[key] = {"dist": dist, "ts": ts, "seen": now_mono}
+            spd = None
+            if prev is not None:
+                _gap = (ts - prev["ts"]).total_seconds()
+                _adv = dist - prev["dist"]
+                if _gap > 0 and 0 < _adv < g.shape.total / 2:
+                    spd = _adv / _gap
+            self.state[key] = {"dist": dist, "ts": ts, "seen": now_mono,
+                               "speed_ms": spd or (prev or {}).get("speed_ms")}
 
         if len(self.state) > 5000:
             self.prune(now_mono)

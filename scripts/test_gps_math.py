@@ -107,9 +107,12 @@ def test_tracker_end_to_end():
     print("\n5) Πλήρης ροή: στίγματα → διελεύσεις με γνωστές ώρες")
     lat0 = 38.0
     _m_lat, m_lng = geo.latlng_scale(lat0)
-    pts = [(lat0, 23.7), (lat0, 23.8)]
-    total = 0.1 * m_lng                      # ~8783 m
-    # Στάσεις ανά ~1/4 της διαδρομής
+    # ΡΕΑΛΙΣΤΙΚΗ ΚΛΙΜΑΚΑ: 0,01 μοίρες ≈ 878 m. Με 0,1 μοίρες η δοκιμή έβαζε το
+    # λεωφορείο να διανύει 5,3 km σε 40 s — 474 km/h — και ο (σωστός) έλεγχος
+    # MAX_SPEED_KMH το απέρριπτε. Το τεστ ήταν λάθος, όχι ο κώδικας.
+    SPAN = 0.01
+    pts = [(lat0, 23.7), (lat0, 23.7 + SPAN)]
+    total = SPAN * m_lng                     # ~878 m
     stops = [(1, "S1", 0.0), (2, "S2", total * 0.25),
              (3, "S3", total * 0.50), (4, "S4", total * 0.75),
              (5, "S5", total)]
@@ -122,7 +125,7 @@ def test_tracker_end_to_end():
         return {"VEH_NO": "12345",
                 "CS_DATE": (base + timedelta(seconds=secs))
                            .astimezone(_athens()).strftime("%b %d %Y %I:%M:%S:000%p"),
-                "CS_LAT": str(lat0), "CS_LNG": str(23.7 + 0.1 * frac)}
+                "CS_LAT": str(lat0), "CS_LNG": str(23.7 + SPAN * frac)}
 
     def _athens():
         from zoneinfo import ZoneInfo
@@ -191,13 +194,17 @@ def test_duplicate_and_lap():
 
     tr.ingest("TEST", [fix(0.9, 600)])        # προχώρησε
     before = tr.stats["passages"]
-    tr.ingest("TEST", [fix(0.02, 900)])       # γύρισε στην αρχή ⇒ νέα βόλτα
-    lap_ok = tr.stats["laps"] == 1 and tr.stats["passages"] == before
-    print(f"  {'ΟΚ  ' if lap_ok else 'ΛΑΘΟΣ'} νέα βόλτα χωρίς ψεύτικες "
-          f"διελεύσεις (laps={tr.stats['laps']}, "
-          f"νέες διελεύσεις={tr.stats['passages']-before})")
+    out = tr.ingest("TEST", [fix(0.02, 900)])  # γύρισε στην αρχή ⇒ νέα βόλτα
+    # Ο νέος γύρος ΔΕΝ παράγει διελεύσεις «προς τα πίσω», αλλά ΑΝΑΚΤΑ την
+    # αφετηρία: το όχημα βρίσκεται 176 m μέσα στη διαδρομή, άρα την πέρασε.
+    codes = [p["stop_code"] for p in out]
+    lap_ok = tr.stats["laps"] == 1 and codes == ["S1"]
+    print(f"  {'ΟΚ  ' if lap_ok else 'ΛΑΘΟΣ'} νέα βόλτα: μόνο ανάκτηση "
+          f"αφετηρίας (laps={tr.stats['laps']}, νέες={codes})")
     if not lap_ok:
         FAILS.append("lap reset")
+    if tr.stats.get("origin_recovered"):
+        print(f"  ΟΚ   ανακτήθηκαν {tr.stats['origin_recovered']} αφετηρίες")
 
 
 def test_origin_terminus_emitted():
