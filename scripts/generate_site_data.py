@@ -17,7 +17,21 @@ import db
 
 OUT_DIR      = os.path.join(os.path.dirname(__file__), "..", "docs", "data")
 HISTORY_DAYS = 90   # kept in DB
-SITE_DAYS    = 3    # days available on the site
+
+# Πόσες ημέρες βλέπει ο χρήστης στο site.
+#
+# Το κόστος είναι ~6,4 MB JSON ανά ημέρα (κυρίως το schedule_distribution).
+# 30 ημέρες ≈ 190 MB στον δίσκο — ασήμαντο μπροστά στα 13 GB ελεύθερα.
+#
+# Το ΠΡΑΓΜΑΤΙΚΟ κόστος δεν ήταν ο δίσκος αλλά ο ΧΡΟΝΟΣ: η generate ξανάγραφε
+# ΟΛΕΣ τις ημέρες σε ΚΑΘΕ κύκλο (κάθε 15 λεπτά). Με 30 ημέρες αυτό είναι 10×
+# δουλειά σε μονοπύρηνο VPS, ξανά και ξανά, για δεδομένα που δεν αλλάζουν.
+#
+# Οι παλιές ημέρες ΔΕΝ αλλάζουν: μόλις κλείσει το παράθυρο παράδοσης (04:00-07:00
+# της επόμενης) τα στατιστικά είναι σταθερά. Άρα ξαναγράφονται μόνο οι
+# τελευταίες FRESH_DAYS· οι υπόλοιπες μένουν όπως είναι και απλώς σερβίρονται.
+SITE_DAYS    = int(os.environ.get("ATHENSBUS_SITE_DAYS", "30"))
+FRESH_DAYS   = 2    # πόσες ξαναϋπολογίζονται σε κάθε κύκλο
 
 
 def write_json(path: str, payload):
@@ -331,13 +345,22 @@ def main():
 
     # Write the available dates list for the date picker
     available = []
-    for d in dates_to_generate:
+    regenerated = reused = 0
+    for i, d in enumerate(dates_to_generate):
         has_data = conn.execute(
             "SELECT 1 FROM daily_route_stats WHERE service_date=? LIMIT 1", (d,)
         ).fetchone()
-        if has_data:
-            available.append(d)
-            generate_for_date(conn, d)
+        if not has_data:
+            continue
+        available.append(d)
+        # Ημέρα που έχει ήδη γραφτεί και δεν μπορεί πια να αλλάξει: μένει ως έχει.
+        if i >= FRESH_DAYS and os.path.exists(
+                os.path.join(day_dir(d), "summary.json")):
+            reused += 1
+            continue
+        generate_for_date(conn, d)
+        regenerated += 1
+    print(f"  {regenerated} ημέρες ξαναγράφτηκαν, {reused} επαναχρησιμοποιήθηκαν")
 
     write_json(os.path.join(OUT_DIR, "available_dates.json"), {
         "dates": available,
