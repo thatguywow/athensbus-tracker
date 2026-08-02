@@ -104,18 +104,39 @@ def _pick_variant(conn, routes_for_line, route_type: str):
     cands = [r for r in routes_for_line if r["route_type"] == route_type]
     if len(cands) <= 1:
         return cands[0] if cands else None
-    best, best_n = None, -1
-    for r in cands:
+
+    # ΚΡΙΤΗΡΙΟ: ΔΡΟΜΟΛΟΓΙΑ, όχι σκέτες διελεύσεις.
+    #
+    # Πρώτη εκδοχή μετρούσε διελεύσεις και διάλεγε ΛΑΘΟΣ. Μετρημένο στον VPS,
+    # γραμμή 500 κατεύθυνση 2:
+    #     1889  διελεύσεις/7ημ = 133  δρομολόγια = 0
+    #     2900  διελεύσεις/7ημ =  88  δρομολόγια = 7
+    # Το 1889 έχει περισσότερες διελεύσεις αλλά ΜΗΔΕΝ δρομολόγια: σκόρπιες
+    # ανιχνεύσεις που δεν συνθέτουν ποτέ διαδρομή. Τα λεωφορεία τρέχουν στο 2900.
+    #
+    # Ένα ολοκληρωμένο δρομολόγιο είναι πολύ ισχυρότερη ένδειξη «αυτή η
+    # παραλλαγή κυκλοφορεί» από μεμονωμένες διελεύσεις, που μπορεί να προέρχονται
+    # από κοινές στάσεις με άλλη παραλλαγή. Οι διελεύσεις μένουν ως δεύτερο
+    # κριτήριο για νέες διαδρομές που δεν έχουν χτίσει ακόμη δρομολόγια.
+    #
+    # Δεν υπάρχει κυκλική εξάρτηση: τα δρομολόγια προκύπτουν από διελεύσεις,
+    # ποτέ από το πρόγραμμα.
+    def _score(rc):
         try:
-            n = conn.execute(
+            t = conn.execute(
+                "SELECT COUNT(*) c FROM trips WHERE route_code=? "
+                "AND service_date >= date('now', '-7 day')", (rc,)).fetchone()["c"]
+            p = conn.execute(
                 "SELECT COUNT(*) c FROM stop_passages WHERE route_code=? "
-                "AND service_date >= date('now', '-7 day')",
-                (r["route_code"],)).fetchone()["c"]
+                "AND service_date >= date('now', '-7 day')", (rc,)).fetchone()["c"]
         except Exception:
-            n = 0
-        if n > best_n:
-            best, best_n = r, n
-    return best if best_n > 0 else cands[0]
+            return (0, 0)
+        return (t, p)
+
+    scored = [(r, _score(r["route_code"])) for r in cands]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    best, (t, p) = scored[0]
+    return best if (t or p) else cands[0]
 
 
 def main():
