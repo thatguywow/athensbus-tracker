@@ -92,6 +92,22 @@ MAX_SPEED_KMH = 100.0
 # Εδώ, αν η νέα θέση είναι κοντά στην αρχή, οι στάσεις από το 0 ως αυτήν
 # καταγράφονται, με χρόνο υπολογισμένο ΑΝΑΔΡΟΜΙΚΑ από την πρόσφατη ταχύτητα
 # του ίδιου οχήματος. Μικρή απόσταση + φρέσκια ταχύτητα = μικρό σφάλμα.
+# ── Ανίχνευση στάσης (dwell) ────────────────────────────────────────────────
+# Η ΜΕΓΑΛΥΤΕΡΗ εναπομείνασα πηγή σφάλματος χρόνου είναι η υπόθεση σταθερής
+# ταχύτητας ανάμεσα σε δύο στίγματα (μετρημένο άνω φράγμα: 11,2 s διάμεσος).
+# Αλλά τα λεωφορεία ΔΕΝ κινούνται ομοιόμορφα — ΣΤΑΜΑΤΟΥΝ, ακριβώς πάνω στις
+# στάσεις που θέλουμε να χρονομετρήσουμε.
+#
+# Όταν η πρόοδος παγώνει κοντά σε στάση, αυτό ΔΕΝ είναι θόρυβος: είναι η ίδια
+# η άφιξη στη στάση. Η σωστή ώρα διέλευσης είναι η στιγμή που το όχημα
+# ΣΤΑΜΑΤΗΣΕ — όχι μια παρεμβολή μέσα στο επόμενο διάστημα κίνησης, που πέφτει
+# συστηματικά ΑΡΓΟΤΕΡΑ.
+#
+# Επιπλέον, ο χρόνος στάσης είναι ΝΕΑ πληροφορία: πόσο κρατάει η επιβίβαση σε
+# κάθε στάση. Ο ΟΑΣΑ δεν το δημοσιεύει πουθενά.
+DWELL_RADIUS_M = 60.0        # πόσο κοντά σε στάση μετράει ως «σταματημένο εκεί»
+DWELL_MIN_S = 12.0           # κάτω από αυτό είναι φανάρι/κίνηση, όχι επιβίβαση
+
 ORIGIN_RECOVERY_M = 800.0
 FALLBACK_SPEED_MS = 5.5          # ~20 km/h, αν δεν έχουμε πρόσφατη ταχύτητα
 
@@ -207,7 +223,7 @@ class GpsTracker:
         self.state: dict[tuple[str, str], dict] = {}
         self.stats = {"fixes": 0, "dup": 0, "unprojectable": 0,
                       "passages": 0, "laps": 0, "gap_skips": 0,
-                      "impossible": 0, "origin_recovered": 0}
+                      "impossible": 0, "origin_recovered": 0, "dwells": 0}
 
     def prune(self, now_mono: float):
         dead = [k for k, v in self.state.items()
@@ -311,12 +327,37 @@ class GpsTracker:
                     self.stats["impossible"] += 1
                 elif gap_s > MAX_INTERP_GAP_S:
                     self.stats["gap_skips"] += 1
+                elif advance < MIN_ADVANCE_M:
+                    # ΑΚΙΝΗΤΟ: ξεκινά (ή συνεχίζει) στάση. Κρατάμε ΠΟΤΕ άρχισε.
+                    if prev.get("stall_since") is None:
+                        prev["stall_since"] = prev["ts"]
+                        prev["stall_dist"] = prev["dist"]
                 elif advance >= MIN_ADVANCE_M:
                     t0 = prev["ts"].timestamp()
                     t1 = ts.timestamp()
+                    stall_since = prev.get("stall_since")
+                    stall_dist = prev.get("stall_dist")
                     for order, code, sd in g.stops_between(prev["dist"], dist):
                         secs = geo.interpolate_crossing(
                             prev["dist"], t0, dist, t1, sd)
+                        dwell_s = None
+                        # Αν το όχημα ήταν ΣΤΑΜΑΤΗΜΕΝΟ δίπλα σε αυτή τη στάση,
+                        # η άφιξη είναι η στιγμή που ακινητοποιήθηκε — όχι μια
+                        # παρεμβολή μέσα στο διάστημα που ξαναξεκίνησε.
+                        # ΠΟΤΕ στην ΑΦΕΤΗΡΙΑ. Εκεί το ζητούμενο είναι η ώρα
+                        # ΑΝΑΧΩΡΗΣΗΣ, όχι άφιξης — ένα λεωφορείο σταθμευμένο
+                        # στην αφετηρία επί 20 λεπτά θα έπαιρνε ως «αναχώρηση»
+                        # τη στιγμή που πάρκαρε. Στο τερματικό ισχύει το
+                        # αντίθετο: εκεί η ακινητοποίηση ΕΙΝΑΙ η άφιξη.
+                        is_origin = (order == g.stop_orders[0])
+                        if (not is_origin
+                                and stall_since is not None and stall_dist is not None
+                                and abs(sd - stall_dist) <= DWELL_RADIUS_M):
+                            d_s = (prev["ts"] - stall_since).total_seconds()
+                            if d_s >= DWELL_MIN_S:
+                                secs = stall_since.timestamp()
+                                dwell_s = round(d_s, 1)
+                                self.stats["dwells"] += 1
                         passed = datetime.fromtimestamp(secs, tz=timezone.utc)
                         out.append({
                             "route_code":  route_code,
@@ -324,9 +365,13 @@ class GpsTracker:
                             "stop_order":  order,
                             "vehicle_no":  veh,
                             "passed_at":   passed,
+                            "dwell_s":     dwell_s,
                         })
                         self.stats["passages"] += 1
 
+            moved = prev is not None and (dist - prev["dist"]) >= MIN_ADVANCE_M
+            carry_since = None if (prev is None or moved) else prev.get("stall_since")
+            carry_dist = None if (prev is None or moved) else prev.get("stall_dist")
             spd = None
             if prev is not None:
                 _gap = (ts - prev["ts"]).total_seconds()
@@ -334,7 +379,9 @@ class GpsTracker:
                 if _gap > 0 and 0 < _adv < g.shape.total / 2:
                     spd = _adv / _gap
             self.state[key] = {"dist": dist, "ts": ts, "seen": now_mono,
-                               "speed_ms": spd or (prev or {}).get("speed_ms")}
+                               "speed_ms": spd or (prev or {}).get("speed_ms"),
+                               "stall_since": carry_since,
+                               "stall_dist": carry_dist}
 
         if len(self.state) > 5000:
             self.prune(now_mono)
@@ -387,11 +434,12 @@ def write_passages(conn, passages: list[dict], bounds: dict,
             c = conn.execute("""
                 INSERT OR IGNORE INTO stop_passages
                     (route_code, stop_code, stop_type, stop_order, vehicle_no,
-                     passed_at, service_date, recorded_at, method)
-                VALUES (?,?,?,?,?,?,?,?,'gps')
+                     passed_at, service_date, recorded_at, method, dwell_s)
+                VALUES (?,?,?,?,?,?,?,?,'gps',?)
             """, (p["route_code"], p["stop_code"], stype, p["stop_order"],
                   p["vehicle_no"], passed_iso,
-                  db.athens_service_date(p["passed_at"]), recorded_at))
+                  db.athens_service_date(p["passed_at"]), recorded_at,
+                  p.get("dwell_s")))
             n += c.rowcount
         except Exception as e:
             log.debug("write_passages: %s", e)

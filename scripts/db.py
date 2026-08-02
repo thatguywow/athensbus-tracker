@@ -110,6 +110,9 @@ def _migrate(conn):
     # οτιδήποτε στην παραγωγή. Η προεπιλογή κρατά τις υπάρχουσες σειρές σωστές.
     add_column("stop_passages", "method", "TEXT DEFAULT 'disappearance'")
     add_column("vehicle_pings", "heading", "INTEGER")
+    # Χρόνος στάσης στη στάση, σε δευτερόλεπτα. Προκύπτει από πάγωμα της
+    # προόδου δίπλα σε στάση — πληροφορία που ο ΟΑΣΑ δεν δημοσιεύει καθόλου.
+    add_column("stop_passages", "dwell_s", "REAL")
 
     # Loop-route fix: rebuild stop_passages if its UNIQUE key predates
     # stop_order (see _migrate_passages_unique).
