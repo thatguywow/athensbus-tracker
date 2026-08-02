@@ -237,6 +237,18 @@ def generate_for_date(conn, service_date: str):
     # not run today (rare exceptions with one trip, seasonal or event-only
     # branches). The dropdown is built from THIS, so a variant is always
     # selectable; if it had no service its table is simply empty.
+    # ΜΟΝΟ οι διαδρομές που αφορούν ΑΥΤΗ την ημέρα: όσες έχουν πρόγραμμα Ή
+    # έτρεξαν. Ο κατάλογος έδειχνε και τις 712 πάντα, οπότε το μενού γέμιζε με
+    # παραλλαγές που δεν κυκλοφορούν καθόλου εκείνη τη μέρα (μετρημένο για
+    # 2026-08-01: 121 από 712 άσχετες).
+    #
+    # ΕΝΩΣΗ, όχι τομή — και τα δύο σκέλη χρειάζονται:
+    #   • έτρεξε ΧΩΡΙΣ πρόγραμμα (43 διαδρομές): πραγματική κίνηση, πρέπει να φαίνεται
+    #   • πρόγραμμα ΧΩΡΙΣ δρομολόγια (77): η αποτυχία είναι η ΠΛΗΡΟΦΟΡΙΑ, δείχνει 0%
+    #
+    # Το φίλτρο είναι ΑΝΑ ΗΜΕΡΑ και γράφεται μέσα στο JSON της ημέρας, οπότε μια
+    # γραμμή που τρέχει μόνο Κυριακή παραμένει ορατή στη σελίδα της Κυριακής
+    # ακόμη κι αν τη δει κανείς τη Δευτέρα. Δεν πειράζεται τίποτα αναδρομικά.
     catalogue = [{
         "line_id":    r["line_id"],
         "line_code":  r["line_code"],
@@ -247,8 +259,12 @@ def generate_for_date(conn, service_date: str):
     } for r in conn.execute("""
         SELECT r.route_code, r.line_code, r.descr, l.line_id
         FROM routes r JOIN lines l ON l.line_code = r.line_code
+        WHERE r.route_code IN (
+            SELECT route_code FROM scheduled_trips WHERE schedule_date = ?
+            UNION
+            SELECT route_code FROM trips WHERE service_date = ?)
         ORDER BY l.line_id, r.route_code
-    """)]
+    """, (service_date, service_date))]
     # Direction comes from the trips when known, so reuse it where available.
     dir_by_route = {t["route_code"]: t["direction"] for t in dist_rows if t.get("direction")}
     for row in catalogue:
