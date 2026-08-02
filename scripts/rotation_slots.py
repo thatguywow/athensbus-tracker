@@ -79,6 +79,26 @@ EARLY_PENALTY      = 4.0   # cost multiplier for leaving early beyond grace
 # διαδρομή, όχι που αρχίζει. Μια εφευρημένη ώρα αναχώρησης δεν μπορεί να είναι
 # μαρτυρία για την ακρίβεια μιας αναχώρησης.
 #
+# ΛΥΣΗ ΙΣΟΠΑΛΙΩΝ. Το match_cost δίνει ΤΟ ΙΔΙΟ κόστος σε δύο δρομολόγια που
+# ξεκίνησαν την ίδια στιγμή, οπότε η θέση έπεφτε σε όποιο τύχαινε — ακόμη κι
+# αν το ένα ολοκλήρωσε τη διαδρομή και το άλλο το χάσαμε μετά από τρεις
+# στάσεις. Η σειρά της θέσης δείχνει ΚΑΙ άφιξη και διάρκεια· σε ισοπαλία πρέπει
+# να την πάρει το δρομολόγιο που μπορεί να τις γεμίσει.
+#
+# ΜΕΤΡΗΜΕΝΟ, γραμμή Χ95 2026-08-02, θέση 13:00 — απόσταση 15 δευτερολέπτων:
+#   12:58:30  κάλυψη 11%  3 στάσεις  ΧΩΡΙΣ άφιξη  κόστος 1,500  → έπαιρνε τη θέση
+#   12:58:15  κάλυψη 94%  6 στάσεις  ΜΕ άφιξη     κόστος 1,750  → έμενε αδέσποτο
+#
+# Είναι ΛΥΣΗ ΙΣΟΠΑΛΙΑΣ, ΟΧΙ φραγή: η ποινή είναι το πολύ μισό λεπτό, οπότε
+# ποτέ δεν ανατρέπει ουσιαστική διαφορά ώρας. Ένα ημιτελές δρομολόγιο που
+# όντως ξεκίνησε πιο κοντά στην ώρα του κρατά τη θέση — η θέση αφορά ΑΝΑΧΩΡΗΣΗ,
+# και η ώρα αναχώρησης παραμένει το κύριο κριτήριο.
+#
+# ΜΕΤΡΗΜΕΝΟ σε όλο το δίκτυο: 2026-08-01 άλλαξε 1 θέση, 2026-08-02 άλλαξαν 3.
+# ΟΛΕΣ πήγαν σε ολοκληρωμένο δρομολόγιο, ΚΑΜΙΑ δεν έχασε. Ο συνολικός αριθμός
+# γεμάτων θέσεων μένει ίδιος — αλλάζει μόνο ΠΟΙΟΣ τις κρατά.
+QUALITY_TIEBREAK_MINS = 0.5
+
 # ΓΙΑΤΙ ΟΧΙ ΦΡΑΓΗ ΣΕ ΚΑΛΥΨΗ: δοκιμάστηκε και κόβει υπερβολικά. Τα αποσπάσματα
 # χωρίζονται σχεδόν στα δύο (2026-08-01): 418 με παρατηρημένη αναχώρηση, 418
 # με εκτιμώμενη. Τα πρώτα είναι λεωφορεία που ΟΝΤΩΣ τα είδαμε να ξεκινούν και
@@ -583,7 +603,8 @@ def build_slot_grid(conn, route_code: str, service_date: str,
 # ── Phase 3: order-preserving DP alignment ───────────────────────────────────
 
 def align_trips_to_slots(actual_deps: list[float],
-                         scheduled: list[float]) -> list[int | None]:
+                         scheduled: list[float],
+                         penalties: list[float] | None = None) -> list[int | None]:
     """
     Order-preserving alignment of actual departures to scheduled departures.
 
@@ -601,6 +622,11 @@ def align_trips_to_slots(actual_deps: list[float],
     n, m = len(actual_deps), len(scheduled)
     if n == 0 or m == 0:
         return [None]*n
+
+    # Μικρή προσαύξηση κόστους ανά δρομολόγιο, για να ΛΥΝΕΙ ΙΣΟΠΑΛΙΕΣ. Δύο
+    # δρομολόγια που ξεκίνησαν πρακτικά την ίδια στιγμή έχουν το ΙΔΙΟ κόστος
+    # και η θέση έπεφτε σε όποιο τύχαινε. Βλ. QUALITY_TIEBREAK_MINS.
+    pen = penalties if penalties is not None else [0.0]*n
 
     INF = float("inf")
     SKIP_ACTUAL_COST = MAX_LATE_MINS + 1   # cost of leaving an actual unmatched
@@ -640,7 +666,7 @@ def align_trips_to_slots(actual_deps: list[float],
             # Option B: match actual i-1 to scheduled j-1 (asymmetric cost)
             cost = match_cost(actual_deps[i-1], scheduled[j-1])
             if cost != INF:
-                c = dp[i-1][j-1] + cost
+                c = dp[i-1][j-1] + cost + pen[i-1]
                 if c < dp[i][j]:
                     dp[i][j] = c
                     back[i][j] = ("match", i-1, j-1)
@@ -702,6 +728,12 @@ def assign_slots(conn, route_code: str, service_date: str,
     # was) and are dropped if the estimate lands absurdly far from the slot.
     trip_rows = conn.execute("""
         SELECT t.id, t.vehicle_no, t.started_at, t.ended_at,
+               t.terminus_arrived_at,
+               -- πόσο της διαδρομής παρακολουθήσαμε (για τη λύση ισοπαλιών)
+               ((SELECT MAX(x.stop_order) FROM trip_stop_times x WHERE x.trip_id=t.id)
+                - (SELECT MIN(x.stop_order) FROM trip_stop_times x WHERE x.trip_id=t.id))
+               * 1.0 / MAX(1, (SELECT MAX(stop_order)-MIN(stop_order) FROM stops s
+                               WHERE s.route_code=t.route_code)) AS coverage,
                EXISTS (
                    SELECT 1 FROM trip_stop_times x
                    WHERE x.trip_id = t.id
@@ -730,7 +762,18 @@ def assign_slots(conn, route_code: str, service_date: str,
 
     actual_mins = [_iso_to_mins_since_midnight(t["started_at"])
                    for t in trips_for_slots]
-    assignment  = align_trips_to_slots(actual_mins, sched_mins)
+
+    # Ποιότητα = πόσο της διαδρομής παρακολουθήσαμε, με ταβάνι 0,5 όταν δεν
+    # έχουμε άφιξη: ένα δρομολόγιο χωρίς τέλος δεν είναι ποτέ «πλήρης γνώση»,
+    # όσες στάσεις κι αν πιάσαμε. Η ποινή μεγαλώνει όσο πέφτει η ποιότητα.
+    penalties = []
+    for t in trips_for_slots:
+        q = t["coverage"] or 0.0
+        if t["terminus_arrived_at"] is None:
+            q = min(q, 0.5)
+        penalties.append(QUALITY_TIEBREAK_MINS * (1.0 - q))
+
+    assignment  = align_trips_to_slots(actual_mins, sched_mins, penalties)
 
     n_assigned = n_handoffs = 0
     last_vehicle_per_slot: dict[int, tuple[str, str]] = {}
