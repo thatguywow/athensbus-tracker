@@ -818,10 +818,31 @@ def compute_all_slots(conn, service_date: str, computed_at: str,
         rc = r["route_code"]
         try:
             rot = update_route_rotation(conn, rc, service_date, computed_at)
-            if not rot:
-                continue
-            n_patterns += 1
-            slot_count = rot["slot_count"]
+            if rot:
+                n_patterns += 1
+                slot_count = rot["slot_count"]
+            else:
+                # ΔΕΝ ΜΕΤΡΗΘΗΚΕ ΣΥΧΝΟΤΗΤΑ — αλλά αυτό ΔΕΝ σημαίνει «καμία
+                # ανάθεση». Η measure_headway χρειάζεται ΔΥΟ αναχωρήσεις για να
+                # βγάλει διάστημα, οπότε κάθε διαδρομή με ΜΙΑ προγραμματισμένη
+                # αναχώρηση επέστρεφε None και παρακάμπτονταν ΟΛΟΚΛΗΡΗ: το
+                # δρομολόγιο εκτελούνταν, καταγραφόταν, αλλά δεν αντιστοιχιζόταν
+                # ποτέ — και η σελίδα έδειχνε «0 από 1 εκτελέστηκαν».
+                #
+                # ΜΕΤΡΗΜΕΝΟ (2026-08-01): 110 διαδρομές με μία μόνο αναχώρηση,
+                # 110 αναχωρήσεις που δεν μπορούσαν ΠΟΤΕ να ταιριάξουν, και 69
+                # δρομολόγια που όντως έγιναν αλλά έμεναν αταίριαστα. Αυτές
+                # είναι ακριβώς οι «εξαιρέσεις»: Α7 [ΕΩΣ ΣΤΑΣΗ 2η ΚΡΥΟΝΕΡΙΟΥ],
+                # Α2 [ΕΩΣ ΕΚΚΛΗΣΙΑ ΒΑΡΗΣ] και δεκάδες άλλες.
+                #
+                # Με μία αναχώρηση δεν υπάρχει περιστροφή: ένα καρτελάκι αρκεί.
+                n_sched = conn.execute(
+                    "SELECT COUNT(*) c FROM scheduled_trips "
+                    "WHERE route_code=? AND schedule_date=?",
+                    (rc, service_date)).fetchone()["c"]
+                if not n_sched:
+                    continue
+                slot_count = 1
             result = assign_slots(conn, rc, service_date, slot_count, computed_at)
             n_assigned += result["assigned"]
             n_handoffs += result["handoffs"]
