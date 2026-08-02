@@ -255,6 +255,7 @@ def reconstruct_comparison(conn, service_date: str):
     """
     from trip_reconstruction_passages import reconstruct_route_day_from_passages
     from audit_day import run_audit
+    from chain_consistency import tighten_chain
 
     print("\n" + "=" * 78)
     print("5) ΑΝΑΚΑΤΑΣΚΕΥΗ ΔΡΟΜΟΛΟΓΙΩΝ ανά πηγή διελεύσεων")
@@ -272,6 +273,16 @@ def reconstruct_comparison(conn, service_date: str):
             except Exception as e:
                 print(f"   {rc} ({source}): {e}")
         conn.commit()
+
+        # ΒΗΜΑ ΠΑΡΑΓΩΓΗΣ που έλειπε: το compute_daily_report τρέχει ΠΑΝΤΑ
+        # tighten_chain μετά την ανακατασκευή. Χωρίς αυτό, η σύγκριση μετρούσε
+        # μια κατάσταση που δεν φτάνει ποτέ στην οθόνη — και το αποτέλεσμα
+        # άλλαζε ουσιωδώς (GPS: 2.272 «αδύνατα» χωρίς αυτό, 1.240 με αυτό).
+        try:
+            tighten_chain(conn, service_date, computed_at)
+            conn.commit()
+        except Exception as e:
+            print(f"   tighten_chain: {e}")
 
         row = conn.execute("""
             SELECT COUNT(*) n,
