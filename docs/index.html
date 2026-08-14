@@ -244,6 +244,10 @@
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
           Excel
         </button>
+        <button type="button" class="btn-export" id="veh-export-full" title="Πλήρες ιστορικό οχημάτων ανά γραμμή, όλες οι διαθέσιμες ημέρες σε ένα αρχείο">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Full Excel
+        </button>
       </div>
     </div>
     <div id="vehicle-table-wrap"><div class="empty-state">Φόρτωση…</div></div>
@@ -266,6 +270,7 @@
     <div class="panel-head">
       <div class="panel-title">Κατανομή Δρομολογίων</div>
       <div class="controls">
+        <input type="search" id="sched-search" placeholder="Αναζήτηση γραμμής…">
         <select class="ctrl" id="sched-line-select"><option value="">— Γραμμή —</option></select>
         <select class="ctrl" id="sched-route-select" style="display:none"><option value="">— Διαδρομή —</option></select>
       </div>

@@ -8,6 +8,8 @@ let vehicleData   = null;
 let schedData     = null;
 let depotData     = null;
 let availDates    = [];
+let schedLinesMap = {};      // line_id → line_id, for the schedule search box
+let schedOnLineSelect = null; // callback used when (re)building the line select
 
 // ── utils ──────────────────────────────────────────────────────────────────
 function pctClass(p){ return p==null?"neutral":p>=90?"good":p>=70?"warn":"bad"; }
@@ -42,6 +44,13 @@ function fmtDateGr(iso){
     return new Date(iso+"T00:00:00").toLocaleDateString("el-GR",
       {day:"numeric",month:"long",year:"numeric"});
   }catch(e){return iso;}
+}
+
+// Greek-friendly normalize: case-fold + strip accents (τόνοι, διαλυτικά), so a
+// search for "χ95" matches "Χ95" and "αγ" matches "Άγ.".
+function grNorm(s){
+  return (s==null?"":s.toString()).toLowerCase()
+    .normalize("NFD").replace(/[̀-ͯ]/g,"");
 }
 
 async function loadJSON(p){
@@ -194,6 +203,65 @@ function exportVehiclesXlsx(){
   setTimeout(()=>{URL.revokeObjectURL(a.href); a.remove();},500);
 }
 
+// Full history export: one file, ALL available days at once.
+//   Column A  = every line (line_id), in the Κατανομή Δρομολογίων order.
+//   Row 1 B…  = every available date, as DD/MM/YYYY.
+//   Cell      = the vehicle numbers that served that line on that day.
+async function exportFullXlsx(){
+  const btn = document.getElementById("veh-export-full");
+  const restore = btn.innerHTML;
+  btn.disabled = true; btn.innerHTML = "Φόρτωση…";
+  try{
+    const dates = (availDates||[]).slice().sort();      // ascending: oldest left
+    const perDate = {};                                 // date → {line_id → Set(veh)}
+    const lineSet = {};
+    await Promise.all(dates.map(async d=>{
+      try{
+        const va = await loadJSON(`data/${d}/vehicle_activity.json`);
+        const m = {};
+        (va.vehicles||[]).forEach(v=>{
+          const line = v.line_id || v.line_code;
+          const veh  = v.vehicle_no;
+          if(!line || !veh) return;
+          (m[line] = m[line] || new Set()).add(veh);
+          lineSet[line] = line;
+        });
+        perDate[d] = m;
+      }catch(_){ perDate[d] = {}; }
+    }));
+    // Same ordering as the schedule dropdown (locale-aware Greek).
+    const lines = Object.keys(lineSet).sort((a,b)=>a.localeCompare(b,"el"));
+    const fmtD  = d=>{ const p=d.split("-"); return `${p[2]}/${p[1]}/${p[0]}`; };
+    const rows = [["Γραμμή", ...dates.map(fmtD)]];
+    lines.forEach(line=>{
+      const row = [line];
+      dates.forEach(d=>{
+        const set = (perDate[d]||{})[line];
+        row.push(set ? Array.from(set).sort((a,b)=>parseInt(a)-parseInt(b)).join(", ") : "");
+      });
+      rows.push(row);
+    });
+    const base = `oximata_full_${dates.length}d`;
+    if(typeof XLSX !== "undefined"){
+      const ws = XLSX.utils.aoa_to_sheet(rows);
+      ws["!cols"] = [{wch:10}, ...dates.map(()=>({wch:22}))];
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, "Ιστορικό");
+      XLSX.writeFile(wb, base+".xlsx");
+    } else {
+      const csv = "﻿" + rows.map(r=>
+        r.map(c=>`"${(c||"").toString().replace(/"/g,'""')}"`).join(";")).join("\r\n");
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([csv],{type:"text/csv;charset=utf-8"}));
+      a.download = base+".csv";
+      document.body.appendChild(a); a.click();
+      setTimeout(()=>{URL.revokeObjectURL(a.href); a.remove();},500);
+    }
+  } finally {
+    btn.disabled = false; btn.innerHTML = restore;
+  }
+}
+
 function renderVehicles(data, filter){
   const wrap = document.getElementById("vehicle-table-wrap");
   let rows = (data&&data.vehicles)||[];
@@ -243,10 +311,38 @@ function buildLineSelectors(sched){
   const source = (sched.routes && sched.routes.length) ? sched.routes : (sched.trips||[]);
   const schedLines={};
   source.forEach(t=>{ const id=t.line_id||t.line_code; if(id) schedLines[id]=id; });
-  buildSelect("sched-line-select", schedLines, id=>{
+  // Remember the full line set + the selection callback so the search box can
+  // rebuild the dropdown from a filtered subset without losing behaviour.
+  schedLinesMap = schedLines;
+  schedOnLineSelect = id=>{
     populateRouteSelect("sched-route-select", id, source, rc=>renderScheduleTable(rc));
-  });
+  };
+  const term = document.getElementById("sched-search");
+  filterSchedLines(term ? term.value : "");
+}
 
+// Rebuild the line dropdown from schedLinesMap, keeping only lines whose label
+// matches the (accent/case-insensitive) search term. If exactly one line
+// matches, select it automatically for convenience.
+function filterSchedLines(term){
+  const q = grNorm(term);
+  const filtered = {};
+  Object.keys(schedLinesMap).forEach(id=>{
+    if(!q || grNorm(id).includes(q) || grNorm("Γραμμή "+id).includes(q))
+      filtered[id] = id;
+  });
+  buildSelect("sched-line-select", filtered, schedOnLineSelect);
+  const sel = document.getElementById("sched-line-select");
+  const opts = [...sel.options].filter(o=>o.value);
+  if(q && opts.length===1){
+    sel.value = opts[0].value;
+    sel.dispatchEvent(new Event("change"));
+  } else if(!opts.length){
+    document.getElementById("sched-route-select").style.display="none";
+    document.getElementById("schedule-table-wrap").innerHTML =
+      '<div class="empty-state">Καμία γραμμή δεν ταιριάζει.</div>';
+    document.getElementById("stray-table-wrap").innerHTML = "";
+  }
 }
 
 function buildSelect(id, linesMap, onLineSelect){
@@ -414,6 +510,10 @@ document.getElementById("veh-search").addEventListener("input",e=>{
   if(vehicleData) renderVehicles(vehicleData, e.target.value);
 });
 document.getElementById("veh-export").addEventListener("click", exportVehiclesXlsx);
+document.getElementById("veh-export-full").addEventListener("click", exportFullXlsx);
+document.getElementById("sched-search").addEventListener("input", e=>{
+  filterSchedLines(e.target.value);
+});
 
 // ── Αμαξοστάσια / Τύπος Οχήματος ────────────────────────────────────────────
 function renderDepots(data){

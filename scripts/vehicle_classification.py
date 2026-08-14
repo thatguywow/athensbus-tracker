@@ -86,7 +86,7 @@ BASE_RANGES = [
     (6139, 6141, "Citaro 12m leasing 2020"),
     (6143, 6151, "MAN 12m leasing 2020"),
     (6154, 6154, "Citaro 12m leasing 2020"),
-    (6171, 6175, "Citaro leasing 2020"),
+    (6171, 6175, "Citaro 12m leasing 2020"),
     (6183, 6191, "Solaris Urbino 18m"),
     (6192, 6196, "Citaro 18m leasing 2020"),
     (6198, 6203, "Solaris Urbino 18m"),
