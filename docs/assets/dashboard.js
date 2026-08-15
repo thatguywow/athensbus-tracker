@@ -203,41 +203,42 @@ function exportVehiclesXlsx(){
   setTimeout(()=>{URL.revokeObjectURL(a.href); a.remove();},500);
 }
 
-// Full history export: one file, ALL available days at once.
-//   Column A  = every line (line_id), in the Κατανομή Δρομολογίων order.
+// Full history export: one file, ALL available days at once. Same shape as the
+// per-day Οχήματα sheet (vehicle → its lines), but a column per day.
+//   A1        = empty.
+//   A2…       = every vehicle number (numeric order).
 //   Row 1 B…  = every available date, as DD/MM/YYYY.
-//   Cell      = the vehicle numbers that served that line on that day.
+//   Cell      = the lines that vehicle served on that day (comma-joined).
 async function exportFullXlsx(){
   const btn = document.getElementById("veh-export-full");
   const restore = btn.innerHTML;
   btn.disabled = true; btn.innerHTML = "Φόρτωση…";
   try{
     const dates = (availDates||[]).slice().sort();      // ascending: oldest left
-    const perDate = {};                                 // date → {line_id → Set(veh)}
-    const lineSet = {};
+    const perDate = {};                                 // date → {veh → Set(line)}
+    const vehSet = {};
     await Promise.all(dates.map(async d=>{
       try{
         const va = await loadJSON(`data/${d}/vehicle_activity.json`);
         const m = {};
         (va.vehicles||[]).forEach(v=>{
-          const line = v.line_id || v.line_code;
           const veh  = v.vehicle_no;
-          if(!line || !veh) return;
-          (m[line] = m[line] || new Set()).add(veh);
-          lineSet[line] = line;
+          const line = v.line_id || v.line_code;
+          if(!veh || !line) return;
+          (m[veh] = m[veh] || new Set()).add(line);
+          vehSet[veh] = veh;
         });
         perDate[d] = m;
       }catch(_){ perDate[d] = {}; }
     }));
-    // Same ordering as the schedule dropdown (locale-aware Greek).
-    const lines = Object.keys(lineSet).sort((a,b)=>a.localeCompare(b,"el"));
-    const fmtD  = d=>{ const p=d.split("-"); return `${p[2]}/${p[1]}/${p[0]}`; };
-    const rows = [["Γραμμή", ...dates.map(fmtD)]];
-    lines.forEach(line=>{
-      const row = [line];
+    const vehicles = Object.keys(vehSet).sort((a,b)=>parseInt(a)-parseInt(b));
+    const fmtD = d=>{ const p=d.split("-"); return `${p[2]}/${p[1]}/${p[0]}`; };
+    const rows = [["", ...dates.map(fmtD)]];            // A1 empty, dates across
+    vehicles.forEach(veh=>{
+      const row = [veh];
       dates.forEach(d=>{
-        const set = (perDate[d]||{})[line];
-        row.push(set ? Array.from(set).sort((a,b)=>parseInt(a)-parseInt(b)).join(", ") : "");
+        const set = (perDate[d]||{})[veh];
+        row.push(set ? Array.from(set).sort((a,b)=>a.localeCompare(b,"el")).join(", ") : "");
       });
       rows.push(row);
     });
