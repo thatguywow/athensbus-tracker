@@ -346,6 +346,21 @@ function filterSchedLines(term){
   }
 }
 
+// Enter (incl. the phone "Go/Search" key) opens the best match immediately,
+// even when several lines still match — no need to pick from the dropdown.
+// Exact line match wins; otherwise the first (top of the sorted list).
+function openSchedSearchMatch(term){
+  const q = grNorm(term);
+  if(!q) return;                       // empty (e.g. the clear ✕) opens nothing
+  const sel = document.getElementById("sched-line-select");
+  const opts = [...sel.options].filter(o=>o.value);
+  if(!opts.length) return;
+  const pick = opts.find(o=>grNorm(o.value)===q) || opts[0];
+  sel.value = pick.value;
+  sel.dispatchEvent(new Event("change"));
+  document.getElementById("sched-search").blur();   // dismiss the phone keyboard
+}
+
 function buildSelect(id, linesMap, onLineSelect){
   const sel = document.getElementById(id);
   sel.innerHTML='<option value="">— Γραμμή —</option>';
@@ -514,6 +529,13 @@ document.getElementById("veh-export").addEventListener("click", exportVehiclesXl
 document.getElementById("veh-export-full").addEventListener("click", exportFullXlsx);
 document.getElementById("sched-search").addEventListener("input", e=>{
   filterSchedLines(e.target.value);
+});
+document.getElementById("sched-search").addEventListener("keydown", e=>{
+  if(e.key==="Enter"){ e.preventDefault(); openSchedSearchMatch(e.target.value); }
+});
+// Mobile virtual keyboards fire "search" on the Go/Search key (not always Enter).
+document.getElementById("sched-search").addEventListener("search", e=>{
+  openSchedSearchMatch(e.target.value);
 });
 
 // ── Αμαξοστάσια / Τύπος Οχήματος ────────────────────────────────────────────

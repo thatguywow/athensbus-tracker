@@ -1,8 +1,8 @@
 """
 generate_site_data.py — generates JSON files for the GitHub Pages dashboard.
 
-Rolling 3-day history: generates dated JSON files under docs/data/YYYY-MM-DD/
-and removes any dates older than 3 days. The dashboard uses a date picker
+Rolling SITE_DAYS history: generates dated JSON files under docs/data/YYYY-MM-DD/
+and removes any dates older than SITE_DAYS. The dashboard uses a date picker
 to switch between days, defaulting to today.
 """
 
@@ -30,7 +30,7 @@ HISTORY_DAYS = 90   # kept in DB
 # Οι παλιές ημέρες ΔΕΝ αλλάζουν: μόλις κλείσει το παράθυρο παράδοσης (04:00-07:00
 # της επόμενης) τα στατιστικά είναι σταθερά. Άρα ξαναγράφονται μόνο οι
 # τελευταίες FRESH_DAYS· οι υπόλοιπες μένουν όπως είναι και απλώς σερβίρονται.
-SITE_DAYS    = int(os.environ.get("ATHENSBUS_SITE_DAYS", "30"))
+SITE_DAYS    = int(os.environ.get("ATHENSBUS_SITE_DAYS", "32"))
 
 # Πόσο της διαδρομής πρέπει να έχει διανύσει ένα ΑΤΑΙΡΙΑΣΤΟ δρομολόγιο για να
 # εμφανιστεί. Κάτω από αυτό είναι απόσπασμα — συνήθως όχημα που φάνηκε στιγμιαία
